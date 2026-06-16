@@ -257,6 +257,7 @@ async def forgot_password(payload: ForgotPasswordRequest):
 
     # Generate 6-digit OTP
     otp = f"{sys_random.randint(100000, 999999)}"
+    logger.info(f"*** DEBUG: Generated Student Reset Password OTP for {email}: {otp} ***")
     otp_hash = hashlib.sha256(otp.encode("utf-8")).hexdigest()
     
     # Set expiration (10 minutes)

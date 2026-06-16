@@ -55,6 +55,7 @@ async def admin_password_login(payload: AdminLoginRequest, request: Request):
 
     # Credentials valid, generate OTP
     otp = f"{sys_random.randint(100000, 999999)}"
+    logger.info(f"*** DEBUG: Generated Admin Login OTP for {email}: {otp} ***")
     otp_hash = hashlib.sha256(otp.encode("utf-8")).hexdigest()
     expires_at = datetime.utcnow() + timedelta(minutes=10)
 
