@@ -39,14 +39,14 @@ async def init_db():
         logger.info("MongoDB indexes created successfully.")
 
         # Ensure only the specified super admin exists: delete other admins
-        delete_result = await admins_collection.delete_many({"email": {"$ne": "team.lcoding@gmail.com"}})
+        delete_result = await admins_collection.delete_many({"email": {"$ne": settings.super_admin_email}})
         if delete_result.deleted_count > 0:
             logger.info(f"Deleted {delete_result.deleted_count} other admin accounts to maintain super admin exclusivity.")
 
         from auth_handler import get_password_hash
         from datetime import datetime
-        super_email = "team.lcoding@gmail.com"
-        super_pass = "Admin@123"
+        super_email = settings.super_admin_email
+        super_pass = settings.super_admin_password
         hashed_pass = get_password_hash(super_pass)
 
         super_admin = await admins_collection.find_one({"email": super_email})
