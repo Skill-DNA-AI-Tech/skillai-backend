@@ -18,6 +18,7 @@ class User(MongoBaseModel):
     hashed_password: Optional[str] = None
     google_id: Optional[str] = None
     role: str = "student"
+    is_verified: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class Admin(MongoBaseModel):

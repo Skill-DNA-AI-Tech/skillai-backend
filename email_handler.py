@@ -44,6 +44,9 @@ async def send_otp_email(to_email: str, otp: str, purpose: str) -> bool:
     elif purpose == "admin_login":
         title_text = "Admin Secure Login"
         instruction_text = "A login attempt was made for your Admin account. Use the security code below to complete the authentication:"
+    elif purpose == "email_verification":
+        title_text = "Email Verification"
+        instruction_text = "Thank you for joining SkillDNA Tech AI. Use the verification code below to complete your registration:"
     else:
         title_text = "Security Verification"
         instruction_text = "Use the verification code below to verify your identity:"

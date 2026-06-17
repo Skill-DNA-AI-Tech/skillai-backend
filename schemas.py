@@ -68,3 +68,12 @@ class AdminTokenResponse(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    otp: str = Field(..., min_length=6, max_length=6)
+
+class RegisterResponse(BaseModel):
+    message: str
+    requires_verification: bool
+    email: EmailStr

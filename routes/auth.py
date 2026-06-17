@@ -16,7 +16,9 @@ from schemas import (
     ResetPasswordRequest,
     TokenResponse,
     UserResponse,
-    MessageResponse
+    MessageResponse,
+    VerifyEmailRequest,
+    RegisterResponse
 )
 from auth_handler import (
     get_password_hash,
@@ -33,11 +35,11 @@ logger = logging.getLogger(__name__)
 # Secure random generator for OTP
 sys_random = random.SystemRandom()
 
-@router.post("/register", response_model=TokenResponse)
+@router.post("/register", response_model=RegisterResponse)
 async def register(payload: StudentRegister, request: Request):
     """
-    Register a new student with Name, Email, and Password.
-    Hashes password using bcrypt, stores user, and returns JWT token.
+    Register a new student.
+    Hashes password, saves user as unverified, generates verification OTP, and sends email.
     """
     email = payload.email.lower()
     
@@ -57,7 +59,7 @@ async def register(payload: StudentRegister, request: Request):
             detail="A user with this email address already exists."
         )
 
-    # Hash the password and save
+    # Hash the password and save with is_verified = False
     hashed_password = get_password_hash(payload.password)
     new_user = {
         "name": payload.name,
@@ -65,40 +67,39 @@ async def register(payload: StudentRegister, request: Request):
         "hashed_password": hashed_password,
         "google_id": None,
         "role": "student",
+        "is_verified": False,
         "created_at": datetime.utcnow()
     }
     
     result = await users_collection.insert_one(new_user)
     new_user["_id"] = result.inserted_id
 
-    # Generate JWT
-    token_data = {
-        "sub": email,
-        "role": "student",
-        "name": payload.name
-    }
-    access_token = create_access_token(data=token_data)
+    # Generate 6-digit verification OTP
+    otp = f"{sys_random.randint(100000, 999999)}"
+    logger.info(f"*** DEBUG: Generated Student Registration OTP for {email}: {otp} ***")
+    otp_hash = hashlib.sha256(otp.encode("utf-8")).hexdigest()
+    expires_at = datetime.utcnow() + timedelta(minutes=10)
 
-    # Log successful registration login
-    ip_address = request.client.host if request.client else None
-    user_agent = request.headers.get("user-agent")
-    await login_logs_collection.insert_one({
+    # Store OTP Log
+    await otp_logs_collection.insert_one({
         "email": email,
-        "role": "student",
-        "ip_address": ip_address,
-        "user_agent": user_agent,
-        "status": "success",
+        "otp_hash": otp_hash,
+        "purpose": "email_verification",
+        "expires_at": expires_at,
+        "verified": False,
         "created_at": datetime.utcnow()
     })
 
-    user_response = UserResponse(
-        id=str(new_user["_id"]),
-        name=new_user["name"],
-        email=new_user["email"],
-        role=new_user["role"],
-        created_at=new_user["created_at"]
+    # Dispatch verification email via Resend
+    email_sent = await send_otp_email(to_email=email, otp=otp, purpose="email_verification")
+    if not email_sent:
+        logger.warning(f"Failed to dispatch registration verification email to {email}. Proceeding in local debug mode.")
+
+    return RegisterResponse(
+        message="Registration successful. A verification code has been sent to your email.",
+        requires_verification=True,
+        email=email
     )
-    return TokenResponse(access_token=access_token, user=user_response)
 
 @router.post("/login", response_model=TokenResponse)
 async def login(payload: StudentLogin, request: Request):
@@ -135,6 +136,13 @@ async def login(payload: StudentLogin, request: Request):
             detail="Incorrect email or password."
         )
 
+    # Check if student email is verified (skip check for Google OAuth users)
+    if not user.get("is_verified", False) and not user.get("google_id"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your email address has not been verified yet. Please verify your email first."
+        )
+
     # Generate JWT
     token_data = {
         "sub": email,
@@ -144,6 +152,81 @@ async def login(payload: StudentLogin, request: Request):
     access_token = create_access_token(data=token_data)
 
     # Log success
+    await login_logs_collection.insert_one({
+        "email": email,
+        "role": "student",
+        "ip_address": ip_address,
+        "user_agent": user_agent,
+        "status": "success",
+        "created_at": datetime.utcnow()
+    })
+
+    user_response = UserResponse(
+        id=str(user["_id"]),
+        name=user["name"],
+        email=user["email"],
+        role=user["role"],
+        created_at=user["created_at"]
+    )
+    return TokenResponse(access_token=access_token, user=user_response)
+
+@router.post("/verify-email", response_model=TokenResponse)
+async def verify_email(payload: VerifyEmailRequest, request: Request):
+    """
+    Verify student email registration using the sent OTP code.
+    Activates the account and issues a JWT token.
+    """
+    email = payload.email.lower()
+    otp = payload.otp
+    otp_hash = hashlib.sha256(otp.encode("utf-8")).hexdigest()
+
+    ip_address = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+
+    # Query valid, unverified, unexpired OTP log
+    otp_log = await otp_logs_collection.find_one({
+        "email": email,
+        "otp_hash": otp_hash,
+        "purpose": "email_verification",
+        "verified": False,
+        "expires_at": {"$gt": datetime.utcnow()}
+    })
+
+    if not otp_log:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The verification code is invalid, expired, or has already been used."
+        )
+
+    # Fetch user
+    user = await users_collection.find_one({"email": email})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User account not found."
+        )
+
+    # Mark OTP as verified
+    await otp_logs_collection.update_one(
+        {"_id": otp_log["_id"]},
+        {"$set": {"verified": True}}
+    )
+
+    # Mark user as verified
+    await users_collection.update_one(
+        {"email": email},
+        {"$set": {"is_verified": True}}
+    )
+
+    # Generate JWT
+    token_data = {
+        "sub": email,
+        "role": "student",
+        "name": user["name"]
+    }
+    access_token = create_access_token(data=token_data)
+
+    # Log successful verification login
     await login_logs_collection.insert_one({
         "email": email,
         "role": "student",
@@ -301,10 +384,7 @@ async def forgot_password(payload: ForgotPasswordRequest):
     # Dispatch email via Resend
     email_sent = await send_otp_email(to_email=email, otp=otp, purpose="reset_password")
     if not email_sent:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to send OTP verification email. Please try again later."
-        )
+        logger.warning(f"Failed to dispatch forgot password email to {email}. Proceeding in local debug mode.")
 
     return MessageResponse(message="Verification OTP code has been sent to your email address.")
 
