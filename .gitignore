@@ -1,13 +1,11 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Environment variables
+node_modules
+.dist
+build
 .env
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
+.env.*
+uploads
+*.log
+python-services/venv
+python-services/__pycache__
+__pycache__
+dist/

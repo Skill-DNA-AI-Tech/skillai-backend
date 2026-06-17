@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: skilldna-backend
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: AI_SERVICE_URL
+        sync: false
+      - key: APP_BASE_URL
+        sync: false
+
+  - type: web
+    name: skilldna-python
+    runtime: node
+    plan: free
+    rootDir: python-services
+    buildCommand: npm install && npm run build
+    startCommand: npm start -- -p $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.1-8b-instant
