@@ -7,7 +7,7 @@ import requests
 from fastapi import APIRouter, HTTPException, status, Depends, Request
 from fastapi.concurrency import run_in_threadpool
 
-from database import users_collection, otp_logs_collection, login_logs_collection
+from database import users_collection, otp_logs_collection, login_logs_collection, admins_collection
 from schemas import (
     StudentRegister,
     StudentLogin,
@@ -40,6 +40,14 @@ async def register(payload: StudentRegister, request: Request):
     Hashes password using bcrypt, stores user, and returns JWT token.
     """
     email = payload.email.lower()
+    
+    # Check if this email is an admin
+    is_admin = await admins_collection.find_one({"email": email})
+    if is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This account is registered as an administrator. Please log in through the Admin Portal."
+        )
     
     # Check if user already exists
     existing_user = await users_collection.find_one({"email": email})
@@ -101,6 +109,14 @@ async def login(payload: StudentLogin, request: Request):
     email = payload.email.lower()
     ip_address = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
+
+    # Check if this email is an admin
+    is_admin = await admins_collection.find_one({"email": email})
+    if is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This account is registered as an administrator. Please log in through the Admin Portal."
+        )
 
     user = await users_collection.find_one({"email": email})
     
@@ -184,6 +200,15 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
         )
 
     email = token_info.get("email").lower()
+    
+    # Check if this email is an admin
+    is_admin = await admins_collection.find_one({"email": email})
+    if is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This account is registered as an administrator. Please log in through the Admin Portal."
+        )
+
     name = token_info.get("name", email.split("@")[0])
     google_id = token_info.get("sub")
 

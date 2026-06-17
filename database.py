@@ -64,5 +64,10 @@ async def init_db():
                 {"$set": {"hashed_password": hashed_pass}}
             )
             logger.info(f"Verified and updated super admin password: {super_email}")
+
+        # Clean up super admin email from users collection to prevent role overlap
+        clean_user = await users_collection.delete_many({"email": super_email})
+        if clean_user.deleted_count > 0:
+            logger.info(f"Removed conflicting student account for super admin: {super_email}")
     except Exception as e:
         logger.error(f"Error initializing database / seeding admin: {e}")
