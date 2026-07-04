@@ -9,7 +9,12 @@ client = AsyncIOMotorClient(settings.mongodb_uri)
 
 # Select Database
 # Extract database name from URI if present, default to 'skilldna_auth'
-db_name = client.get_default_database().name if client.get_default_database() else 'skilldna_auth'
+try:
+    default_db = client.get_default_database()
+    db_name = default_db.name if default_db else 'skilldna_auth'
+except Exception:
+    db_name = 'skilldna_auth'
+
 if db_name == 'admin' or not db_name:
     db_name = 'skilldna_auth'
 
