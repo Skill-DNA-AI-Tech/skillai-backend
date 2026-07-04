@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     mongodb_uri: str
     jwt_secret: str
-    google_client_id: str
+    google_client_id: str = "849754791910-kvubjul5bnqi8un3c38on96bdengsn37.apps.googleusercontent.com"
     resend_api_key: str
     super_admin_email: str = "team.lcoding@gmail.com"
     super_admin_password: str = "Admin@123"

@@ -306,20 +306,28 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
             "google_id": google_id,
             "hashed_password": None,
             "role": "student",
+            "is_verified": True,
             "created_at": datetime.utcnow()
         }
         result = await users_collection.insert_one(user)
         user["_id"] = result.inserted_id
         logger.info(f"Automatically registered Google user: {email}")
     else:
-        # User exists; verify or link Google ID
+        # User exists; verify/link Google ID and ensure is_verified is True
+        update_fields = {}
         if not user.get("google_id"):
+            update_fields["google_id"] = google_id
+            user["google_id"] = google_id
+        if not user.get("is_verified", False):
+            update_fields["is_verified"] = True
+            user["is_verified"] = True
+        
+        if update_fields:
             await users_collection.update_one(
                 {"_id": user["_id"]},
-                {"$set": {"google_id": google_id}}
+                {"$set": update_fields}
             )
-            user["google_id"] = google_id
-            logger.info(f"Linked Google account for existing user: {email}")
+            logger.info(f"Updated Google credentials/verification for user: {email}")
 
     # Generate JWT
     token_data = {
