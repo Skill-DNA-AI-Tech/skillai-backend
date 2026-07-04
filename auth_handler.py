@@ -42,14 +42,32 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 def decode_access_token(token: str) -> Optional[dict]:
     """Decode a JWT access token and return the payload if valid."""
+    # 1. Attempt to decode using Supabase client secret (HS256 key)
+    supabase_secret = getattr(settings, "supabase_client_secret", None)
+    if supabase_secret:
+        try:
+            # Supabase tokens are signed with client secret and have 'authenticated' or similar audience
+            payload = jwt.decode(token, supabase_secret, algorithms=["HS256"], options={"verify_aud": False})
+            
+            # Map Supabase claims to the custom claims expected by backend
+            user_metadata = payload.get("user_metadata", {})
+            mapped_payload = {
+                "sub": payload.get("email") or payload.get("sub"),
+                "email": payload.get("email"),
+                "role": user_metadata.get("role") or payload.get("role") or "student",
+                "name": user_metadata.get("name")
+            }
+            if mapped_payload["role"] == "authenticated":
+                mapped_payload["role"] = "student"
+            return mapped_payload
+        except Exception:
+            pass
+
+    # 2. Fallback to custom JWT secret
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
         return payload
-    except jwt.ExpiredSignatureError:
-        # Expired token
-        return None
-    except jwt.InvalidTokenError:
-        # Invalid token
+    except Exception:
         return None
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security_scheme)) -> dict:
