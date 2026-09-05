@@ -39,7 +39,7 @@ const certificateSchema = new Schema<ICertificate>(
     careerPath: { type: String, required: true },
     certificateId: { type: String, required: true, unique: true, index: true },
     issueDate: { type: Date, default: () => new Date() },
-    expiryDate: { type: Date, required: true },
+    expiryDate: { type: Date, default: () => new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) },
     technicalScore: { type: Number, required: true, min: 0, max: 100 },
     communicationScore: { type: Number, required: true, min: 0, max: 100 },
     problemSolvingScore: { type: Number, required: true, min: 0, max: 100 },

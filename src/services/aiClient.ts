@@ -1,6 +1,7 @@
 import { env } from '../config/env';
 import { calculateJobMatch, calculateSkillDNA } from './scoring';
 import { groqRequest } from './groqClient';
+import { evaluateInterviewTranscript } from './interviewEvaluator';
 
 const callAi = async <T>(path: string, payload: unknown, fallback: () => T): Promise<T> => {
   if (!env.aiServiceUrl) {
@@ -36,25 +37,7 @@ export const aiClient = {
       difficulty: payload.recentScore > 80 ? 'advanced' : payload.recentScore > 55 ? 'intermediate' : 'foundation',
     })),
   interview: (payload: any) => {
-    const baseScore = 48 + (payload.confidenceLevel ?? 5) * 5;
-    const eyeContactScore = Math.min(100, 45 + (payload.eyeContactLevel ?? 5) * 6);
-    const speakingClarityScore = Math.min(100, 40 + (payload.wordsPerMinute ?? 110) / 2);
-    const grammarScore = Math.min(100, 55 + (payload.confidenceLevel ?? 5) * 4);
-    const hesitationScore = Math.min(100, 50 + (payload.confidenceLevel ?? 5) * 5);
-    const bodyLanguageScore = Math.min(100, 45 + (payload.eyeContactLevel ?? 5) * 6);
-    
-    return callAi<any>('/interview', payload, () => ({
-      interviewScore: Math.min(100, baseScore),
-      communicationScore: speakingClarityScore,
-      confidenceScore: Math.min(100, 38 + (payload.confidenceLevel ?? 5) * 6),
-      technicalDepthScore: Math.min(100, 50 + (payload.domainKeywords?.length ?? 2) * 8),
-      eyeContactScore,
-      speakingClarityScore,
-      grammarScore,
-      hesitationScore,
-      bodyLanguageScore,
-      tips: ['Maintain eye contact', 'Reduce filler words', 'Use STAR structure', 'End answers with measurable impact'],
-    }));
+    return callAi<any>('/interview', payload, () => evaluateInterviewTranscript(payload));
   },
   resume: (payload: any) =>
     callAi<any>('/resume/analyze', payload, () => ({

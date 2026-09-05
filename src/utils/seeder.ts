@@ -421,17 +421,33 @@ const defaultQuestions = [
   }
 ];
 
+import { multiDomainQuestions } from './multiDomainQuestions';
+
 export async function seedQuestions() {
   try {
-    const count = await QuestionBank.countDocuments({});
-    if (count > 0) {
-      console.log(`[seeder] Database already populated with ${count} questions. Skipping seed.`);
-      return;
+    const allQuestions = [...defaultQuestions, ...multiDomainQuestions];
+    let insertedCount = 0;
+
+    for (const q of allQuestions) {
+      const res = await QuestionBank.updateOne(
+        { question: q.question },
+        { 
+          $setOnInsert: {
+            ...q,
+            status: 'Active',
+            approved: true,
+            source: 'Verified Seeder',
+          }
+        },
+        { upsert: true }
+      );
+      if (res.upsertedCount > 0) {
+        insertedCount += 1;
+      }
     }
 
-    console.log('[seeder] Empty QuestionBank detected. Seeding starter pack...');
-    await QuestionBank.insertMany(defaultQuestions);
-    console.log(`[seeder] Seeded ${defaultQuestions.length} premium Technical and HR questions successfully!`);
+    const totalCount = await QuestionBank.countDocuments({});
+    console.log(`[seeder] Multi-domain question bank synchronized. ${insertedCount} new questions added. Total active questions: ${totalCount}.`);
   } catch (error) {
     console.error('[seeder] Error seeding question bank:', error);
   }

@@ -24,4 +24,5 @@ export const env = {
   mongodbUri: process.env.MONGODB_URI ?? 'mongodb://127.0.0.1:27017/skilldna',
   nodeEnv: process.env.NODE_ENV ?? 'development',
   port: numberFromEnv(process.env.PORT, 5000),
+  registrationMode: (process.env.REGISTRATION_MODE || 'ADMIN_ONLY').toUpperCase(),
 };

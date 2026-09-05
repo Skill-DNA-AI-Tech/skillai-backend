@@ -53,7 +53,12 @@ const dynamicInterviewSchema = new Schema(
 
 const careerTwinMemorySchema = new Schema(
   {
-    userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, unique: true, index: true },
+    userId: { type: Schema.Types.ObjectId, ref: 'User', index: true },
+    user: { type: Schema.Types.ObjectId, ref: 'User', index: true },
+    domain: { type: String, default: '' },
+    targetRole: { type: String, default: '' },
+    benchmarks: { type: Schema.Types.Mixed, default: () => ({}) },
+    weakAreas: { type: [String], default: [] },
     overallScore: { type: Number, default: 0 },
     technicalScore: { type: Number, default: 0 },
     strengths: { type: [String], default: [] },
@@ -74,8 +79,18 @@ const careerTwinMemorySchema = new Schema(
     dynamicInterview: { type: dynamicInterviewSchema, default: () => ({}) },
     generatedAt: { type: Date, default: Date.now },
   },
-  { timestamps: true, collection: 'career_twin_memories' },
+  { timestamps: true, collection: 'career_twin_memories', strict: false },
 );
+
+careerTwinMemorySchema.pre('save', function (next) {
+  if (!this.userId && this.user) {
+    this.userId = this.user;
+  }
+  if (!this.user && this.userId) {
+    this.user = this.userId;
+  }
+  next();
+});
 
 careerTwinMemorySchema.index({ overallScore: -1 });
 careerTwinMemorySchema.index({ generatedAt: -1 });

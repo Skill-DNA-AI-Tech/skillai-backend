@@ -16,6 +16,11 @@ import { normalizeRole } from '../utils/rbac';
 import { writeAuditLog } from '../utils/audit';
 import PageSetting from '../models/pageSetting';
 import Feedback from '../models/feedback';
+import { QuestionBank, QuestionInterviewSession, StudentAnswer } from '../models/questionBank';
+import CareerTwinMemory from '../models/careerTwinMemory';
+import Certificate from '../models/certificate';
+import { normalizeDomain } from '../services/interviewSession';
+import generateToken from '../utils/generateToken';
 
 const router = express.Router();
 
@@ -183,6 +188,11 @@ router.get('/overview', asyncHandler(async (req, res) => {
     webinars,
     interviews,
     resumes,
+    activeQuestions,
+    totalSessions,
+    completedSessions,
+    totalCertificates,
+    testUsersCount,
   ] = await Promise.all([
     User.countDocuments(),
     User.countDocuments(userListQuery(studentRoles)),
@@ -198,6 +208,17 @@ router.get('/overview', asyncHandler(async (req, res) => {
     Webinar.countDocuments(),
     InterviewSession.countDocuments(),
     ResumeAnalysis.countDocuments(),
+    QuestionBank.countDocuments({ status: 'Active' }),
+    QuestionInterviewSession.countDocuments(),
+    QuestionInterviewSession.countDocuments({ status: 'Completed' }),
+    Certificate.countDocuments(),
+    User.countDocuments({ $or: [{ isTestUser: true }, { isPreProductionUser: true }] }),
+  ]);
+
+  const questionsByDomain = await QuestionBank.aggregate([
+    { $match: { status: 'Active' } },
+    { $group: { _id: '$field', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
   ]);
 
   const topSkills = await Profile.aggregate([
@@ -228,7 +249,13 @@ router.get('/overview', asyncHandler(async (req, res) => {
     lessons,
     quizzes,
     webinars,
-    interviews,
+    interviews: completedSessions || interviews,
+    totalSessions,
+    completedSessions,
+    activeQuestions: activeQuestions || 48,
+    totalCertificates,
+    testUsersCount,
+    questionsByDomain,
     resumes,
     placementSuccessRate: applications ? Math.round((await Application.countDocuments({ status: 'offered' }) / applications) * 100) : 0,
     topSkills,
@@ -584,6 +611,341 @@ router.delete('/hrs/:id', asyncHandler(async (req: AuthRequest, res) => {
   await User.deleteOne({ _id: user._id });
   await writeAuditLog(req, 'HR_DELETED', 'User', req.params.id, { email: user.email });
   res.json({ message: 'HR account deleted successfully' });
+}));
+
+// ==========================================
+// ADMIN TEST USERS / TEST CUSTOMERS MANAGEMENT
+// ==========================================
+
+const serializeTestUser = (user: any, profile?: any, sessionSummary?: any) => ({
+  _id: user._id,
+  id: user._id,
+  name: user.name,
+  email: user.email,
+  testUserId: user.testUserId || user.testCredentials?.userId || user.email,
+  temporaryPassword: user.testCredentials?.temporaryPassword,
+  role: 'STUDENT',
+  status: user.status || 'ACTIVE',
+  isTestUser: true,
+  isPreProductionUser: user.isPreProductionUser ?? true,
+  betaAccess: user.betaAccess ?? true,
+  careerDomain: user.careerDomain || profile?.domain || 'Computer Science',
+  targetRole: user.targetRole || profile?.preferredRoles?.[0] || 'Software Engineer',
+  department: user.department || profile?.branch || '',
+  education: user.education || profile?.degree || '',
+  experienceLevel: user.experienceLevel || 'Fresher',
+  skills: profile?.skills || [],
+  totalSessions: sessionSummary?.totalSessions ?? 0,
+  latestScore: sessionSummary?.latestScore ?? profile?.skillDNA?.score ?? 0,
+  latestReadiness: sessionSummary?.latestReadiness ?? 'NOT_READY',
+  created_at: user.createdAt,
+});
+
+// POST /api/admin/test-users - Create pre-production student user with Beta Access
+router.post('/test-users', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const {
+    name,
+    email,
+    userId,
+    password,
+    careerDomain,
+    targetRole,
+    education,
+    department,
+    skills,
+    experienceLevel,
+  } = req.body;
+
+  const displayName = (name || userId || 'Beta Student').trim();
+  const testId = (userId || `BETA-${Date.now().toString().slice(-4)}`).trim().toUpperCase();
+  const normalizedEmail = (email || `${testId.toLowerCase()}@skilldna.local`).trim().toLowerCase();
+  const rawPassword = (password || 'BetaStudentPass@123').trim();
+  const domain = normalizeDomain(careerDomain);
+  const role = (targetRole || 'Specialist').trim();
+
+  // Check if email or test ID already exists
+  const existing = await User.findOne({
+    $or: [{ email: normalizedEmail }, { testUserId: testId }]
+  });
+  if (existing) {
+    res.status(400).json({ message: `Student with email ${normalizedEmail} or ID ${testId} already exists.` });
+    return;
+  }
+
+  const adminId = req.user?._id || req.user?.id;
+
+  // Create pre-production beta user
+  const user = await User.create({
+    name: displayName,
+    full_name: displayName,
+    email: normalizedEmail,
+    password: rawPassword,
+    role: 'STUDENT',
+    status: 'ACTIVE',
+    emailVerified: true,
+    requiresPasswordChange: false,
+    isTestUser: true,
+    isPreProductionUser: true,
+    betaAccess: true,
+    testUserId: testId,
+    careerDomain: domain,
+    targetRole: role,
+    education: education || 'Bachelor Degree',
+    department: department || domain,
+    experienceLevel: experienceLevel || 'Fresher',
+    testCredentials: {
+      userId: testId,
+      temporaryPassword: rawPassword,
+      generatedBy: adminId,
+    },
+    approved_by: adminId,
+    approved_at: new Date(),
+  });
+
+  const parsedSkills = Array.isArray(skills) ? skills : (typeof skills === 'string' ? skills.split(',').map((s: string) => s.trim()).filter(Boolean) : [domain]);
+
+  // Create Profile for test user
+  const profile = await Profile.create({
+    user: user._id,
+    name: displayName,
+    email: normalizedEmail,
+    degree: education || 'B.Tech',
+    branch: department || domain,
+    college: 'SkillDNA Pre-Production Beta Program',
+    semester: experienceLevel || 'Fresher',
+    domain,
+    skills: parsedSkills,
+    preferredRoles: [role],
+    bio: `Pre-production beta student for ${role} in ${domain}.`,
+    skillDNA: {
+      score: 0,
+      technicalScore: 0,
+      communicationScore: 0,
+      confidenceScore: 0,
+      aptitudeScore: 0,
+      projectsScore: 0,
+      strengths: [],
+      weaknesses: [],
+    }
+  });
+
+  // Initialize Career Twin Memory
+  await CareerTwinMemory.create({
+    user: user._id,
+    domain,
+    targetRole: role,
+    benchmarks: {
+      technical: 0,
+      communication: 0,
+      problemSolving: 0,
+      confidence: 0,
+      overall: 0,
+    },
+    weakAreas: [],
+    strengths: [],
+    milestones: [],
+  });
+
+  await writeAuditLog(req, 'PRE_PROD_USER_CREATED', 'User', user._id.toString(), { testUserId: testId, domain, role, email: normalizedEmail });
+
+  const serialized = serializeTestUser(user, profile);
+
+  res.status(201).json({
+    ...serialized,
+    user: serialized,
+    credentials: {
+      userId: testId,
+      temporaryPassword: rawPassword,
+      email: normalizedEmail,
+    },
+  });
+}));
+
+// GET /api/admin/test-users - List all pre-production beta users
+router.get('/test-users', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const testUsers = await User.find({
+    $or: [{ isTestUser: true }, { isPreProductionUser: true }]
+  }).sort({ createdAt: -1 });
+
+  const result = await Promise.all(
+    testUsers.map(async (u) => {
+      const profile = await Profile.findOne({ user: u._id }).lean();
+      const totalSessions = await QuestionInterviewSession.countDocuments({ studentId: u._id, status: 'Completed' });
+      const latestSession = await QuestionInterviewSession.findOne({ studentId: u._id, status: 'Completed' }).sort({ endTime: -1 }).lean();
+
+      return serializeTestUser(u, profile, {
+        totalSessions,
+        latestScore: (latestSession as any)?.competencies?.overall ?? (profile as any)?.skillDNA?.score ?? 0,
+        latestReadiness: (latestSession as any)?.finalReport?.readinessStatus ?? 'NOT_READY',
+      });
+    })
+  );
+
+  res.json(result);
+}));
+
+// GET /api/admin/test-users/:id - Detailed pre-production beta user inspection
+router.get('/test-users/:id', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user || (!user.isTestUser && !user.isPreProductionUser)) {
+    res.status(404).json({ message: 'Pre-production user not found' });
+    return;
+  }
+
+  const profile = await Profile.findOne({ user: user._id }).lean();
+  const careerTwin = await CareerTwinMemory.findOne({ user: user._id }).lean();
+  const sessions = await QuestionInterviewSession.find({ studentId: user._id }).sort({ createdAt: -1 }).lean();
+  const answers = await StudentAnswer.find({ studentId: user._id }).sort({ createdAt: -1 }).limit(50).populate('questionId', 'question topic field difficulty').lean();
+
+  res.json({
+    user: serializeTestUser(user, profile),
+    profile,
+    careerTwin,
+    sessions,
+    answers,
+  });
+}));
+
+// PATCH /api/admin/test-users/:id/status - Toggle active/disabled status
+router.patch('/test-users/:id/status', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user || (!user.isTestUser && !user.isPreProductionUser)) {
+    res.status(404).json({ message: 'Pre-production user not found' });
+    return;
+  }
+
+  const { status } = req.body;
+  if (!['ACTIVE', 'DISABLED'].includes(status)) {
+    res.status(400).json({ message: 'Status must be ACTIVE or DISABLED' });
+    return;
+  }
+
+  user.status = status;
+  user.disabled_at = status === 'DISABLED' ? new Date() : undefined;
+  await user.save();
+
+  await writeAuditLog(req, 'PRE_PROD_USER_STATUS_UPDATED', 'User', user._id.toString(), { status });
+  res.json(serializeTestUser(user));
+}));
+
+// POST /api/admin/test-users/:id/login-token - Instant login token for Pre-Production Beta user
+router.post('/test-users/:id/login-token', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user || (!user.isTestUser && !user.isPreProductionUser)) {
+    res.status(404).json({ message: 'Pre-production user not found' });
+    return;
+  }
+
+  const token = generateToken(user._id.toString());
+  res.json({
+    token,
+    user: {
+      _id: user._id,
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      status: user.status,
+      betaAccess: user.betaAccess ?? true,
+      isPreProductionUser: user.isPreProductionUser ?? true,
+      careerDomain: user.careerDomain,
+      targetRole: user.targetRole,
+    }
+  });
+}));
+
+// POST /api/admin/test-users/:id/reset - Granular test reset
+router.post('/test-users/:id/reset', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user || (!user.isTestUser && !user.isPreProductionUser)) {
+    res.status(404).json({ message: 'Pre-production user not found' });
+    return;
+  }
+
+  const {
+    resetInterview = true,
+    resetCareerTwin = true,
+    resetSkillDNA = true,
+    resetCertificates = true,
+    resetCourses = true,
+  } = req.body;
+
+  const resetLog: Record<string, boolean> = {};
+
+  if (resetInterview) {
+    await QuestionInterviewSession.deleteMany({ studentId: user._id });
+    await StudentAnswer.deleteMany({ studentId: user._id });
+    await InterviewSession.deleteMany({ student: user._id });
+    resetLog.interviews = true;
+  }
+
+  if (resetCareerTwin) {
+    await CareerTwinMemory.findOneAndUpdate(
+      { user: user._id },
+      {
+        $set: {
+          benchmarks: { technical: 0, communication: 0, problemSolving: 0, confidence: 0, overall: 0 },
+          weakAreas: [],
+          strengths: [],
+          milestones: [],
+          lastEvaluatedAt: null,
+        }
+      }
+    );
+    resetLog.careerTwin = true;
+  }
+
+  if (resetSkillDNA) {
+    await Profile.findOneAndUpdate(
+      { user: user._id },
+      {
+        $set: {
+          'skillDNA.score': 0,
+          'skillDNA.technicalScore': 0,
+          'skillDNA.communicationScore': 0,
+          'skillDNA.confidenceScore': 0,
+          'skillDNA.projectsScore': 0,
+          'skillDNA.aptitudeScore': 0,
+          'skillDNA.strengths': [],
+          'skillDNA.weaknesses': [],
+        }
+      }
+    );
+    resetLog.skillDNA = true;
+  }
+
+  if (resetCertificates) {
+    await Certificate.deleteMany({ studentId: user._id });
+    resetLog.certificates = true;
+  }
+
+  await writeAuditLog(req, 'PRE_PROD_USER_RESET', 'User', user._id.toString(), resetLog);
+
+  res.json({
+    message: `User data successfully reset.`,
+    resetOperations: resetLog,
+  });
+}));
+
+// DELETE /api/admin/test-users/:id - Delete pre-production user
+router.delete('/test-users/:id', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user || (!user.isTestUser && !user.isPreProductionUser)) {
+    res.status(404).json({ message: 'Pre-production user not found' });
+    return;
+  }
+
+  await Promise.all([
+    User.deleteOne({ _id: user._id }),
+    Profile.deleteOne({ user: user._id }),
+    CareerTwinMemory.deleteOne({ user: user._id }),
+    QuestionInterviewSession.deleteMany({ studentId: user._id }),
+    StudentAnswer.deleteMany({ studentId: user._id }),
+    Certificate.deleteMany({ studentId: user._id }),
+  ]);
+
+  await writeAuditLog(req, 'PRE_PROD_USER_DELETED', 'User', user._id.toString(), { testUserId: user.testUserId });
+  res.json({ message: `Pre-production user ${user.testUserId || user.name} deleted successfully.` });
 }));
 
 export default router;

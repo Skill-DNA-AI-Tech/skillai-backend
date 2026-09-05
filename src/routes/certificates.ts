@@ -44,6 +44,9 @@ router.post(
       return;
     }
 
+    // Fetch actual completed session
+    const latestSession = await QuestionInterviewSession.findOne({ studentId, status: 'Completed' }).sort({ updatedAt: -1 });
+
     let careerPath = req.body.careerPath;
     let technicalScore = req.body.technicalScore;
     let communicationScore = req.body.communicationScore;
@@ -53,9 +56,26 @@ router.post(
     let strengths = req.body.strengths;
     let improvements = req.body.improvements;
 
-    if (profile) {
+    // Prioritize latest evaluated interview session scores to prevent client-side tampering
+    if (latestSession && latestSession.finalReport) {
+      const rep = latestSession.finalReport;
+      if (rep.competencies) {
+        technicalScore = rep.competencies.technical;
+        communicationScore = rep.competencies.communication;
+        problemSolvingScore = rep.competencies.problemSolving;
+        confidenceScore = rep.competencies.confidence;
+      }
+      const sessionAny = latestSession as any;
+      careerPath = sessionAny.role || sessionAny.domain || sessionAny.field || careerPath || 'Career Development';
+      if (rep.strengths && rep.strengths.length > 0) {
+        strengths = rep.strengths;
+      }
+      if (rep.improvements && rep.improvements.length > 0) {
+        improvements = rep.improvements;
+      }
+    } else if (profile) {
       if (!careerPath) {
-        careerPath = profile.preferredRoles?.[0] || profile.branch || 'Software Engineering';
+        careerPath = profile.preferredRoles?.[0] || profile.branch || 'Career Development';
       }
       const skillDNA = profile.skillDNA || {};
       
@@ -104,6 +124,14 @@ router.post(
     }
 
     const overallScore = Math.round((technicalScore + communicationScore + problemSolvingScore + confidenceScore) / 4);
+
+    // USER REQUIREMENT: Minimum 75% overall score required to generate certificate
+    if (overallScore < 75) {
+      res.status(400).json({
+        error: `Your overall interview evaluation score is ${overallScore}%. A minimum score of 75% is required to generate a SkillDNA Verified Certificate. Please review your Career Twin learning recommendations, practice weak areas, and retake the interview to qualify.`
+      });
+      return;
+    }
 
     // Determine interview readiness status
     let interviewReadinessStatus: 'NOT_READY' | 'IN_PROGRESS' | 'READY' | 'ADVANCED';

@@ -19,6 +19,20 @@ export interface IUser extends Document {
   microsoftId?: string;
   emailVerified: boolean;
   requiresPasswordChange?: boolean;
+  isTestUser?: boolean;
+  isPreProductionUser?: boolean;
+  betaAccess?: boolean;
+  testUserId?: string;
+  careerDomain?: string;
+  targetRole?: string;
+  department?: string;
+  education?: string;
+  experienceLevel?: string;
+  testCredentials?: {
+    userId?: string;
+    temporaryPassword?: string;
+    generatedBy?: mongoose.Types.ObjectId;
+  };
   otp?: {
     codeHash?: string;
     expiresAt?: Date;
@@ -52,6 +66,20 @@ const userSchema = new Schema<IUser>({
   microsoftId: { type: String },
   emailVerified: { type: Boolean, default: false },
   requiresPasswordChange: { type: Boolean, default: false },
+  isTestUser: { type: Boolean, default: false, index: true },
+  isPreProductionUser: { type: Boolean, default: false, index: true },
+  betaAccess: { type: Boolean, default: true, index: true },
+  testUserId: { type: String },
+  careerDomain: { type: String },
+  targetRole: { type: String },
+  department: { type: String },
+  education: { type: String },
+  experienceLevel: { type: String },
+  testCredentials: {
+    userId: { type: String },
+    temporaryPassword: { type: String },
+    generatedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+  },
   otp: {
     codeHash: { type: String },
     expiresAt: { type: Date },

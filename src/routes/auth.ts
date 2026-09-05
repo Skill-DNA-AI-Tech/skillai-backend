@@ -60,7 +60,16 @@ const ensureCanAuthenticate = (user: any, res: any) => {
   return true;
 };
 
+import { env } from '../config/env';
+
 router.post('/register', asyncHandler(async (req, res) => {
+  if (env.registrationMode === 'ADMIN_ONLY') {
+    res.status(403).json({
+      message: 'Public registration is currently disabled for controlled testing. Please sign in using the test credentials provided by your Administrator.'
+    });
+    return;
+  }
+
   const { name, email, password, role, mobile } = req.body;
   const normalizedEmail = normalizeEmail(email);
   const normalizedRole = normalizeRole(role, normalizedEmail);
@@ -118,8 +127,23 @@ router.post('/register', asyncHandler(async (req, res) => {
 
 router.post('/login', asyncHandler(async (req, res) => {
   const { email, password } = req.body;
+  if (!email || !password) {
+    res.status(400).json({ message: 'Email/User ID and password are required' });
+    return;
+  }
+
   const normalizedEmail = normalizeEmail(email);
-  const user = await User.findOne({ email: normalizedEmail });
+  const trimmed = String(email).trim();
+  
+  // Find by email or test user ID
+  const user = await User.findOne({
+    $or: [
+      { email: normalizedEmail },
+      { testUserId: trimmed },
+      { testUserId: trimmed.toUpperCase() },
+      { 'testCredentials.userId': trimmed },
+    ]
+  });
 
   if (user && (await user.matchPassword(password))) {
     if (!ensureCanAuthenticate(user, res)) return;
@@ -131,8 +155,16 @@ router.post('/login', asyncHandler(async (req, res) => {
     await writeAuditLog(req, 'LOGIN', 'User', user._id.toString());
     res.json(await authPayload(user, req.ip));
   } else {
-    res.status(401).json({ message: 'Invalid email or password' });
+    res.status(401).json({ message: 'Invalid credentials. Please verify your email/User ID and password.' });
   }
+}));
+
+router.post('/logout', asyncHandler(async (req, res) => {
+  const { refreshToken } = req.body;
+  if (refreshToken) {
+    await revokeRefreshToken(refreshToken);
+  }
+  res.json({ message: 'Logged out successfully' });
 }));
 
 router.post('/request-otp', asyncHandler(async (req, res) => {

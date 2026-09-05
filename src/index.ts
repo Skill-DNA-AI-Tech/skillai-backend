@@ -20,6 +20,7 @@ import aiRoutes from './routes/ai';
 import questionRoutes from './routes/questions';
 import careerTwinRoutes from './routes/careerTwin';
 import certificateRoutes from './routes/certificates';
+import studentRoutes from './routes/student';
 import { env } from './config/env';
 import { errorHandler, notFound } from './middleware/error';
 import { seedQuestions, seedPageSettings } from './utils/seeder';
@@ -35,11 +36,13 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 app.use('/api/auth', authRoutes);
+app.use('/api/student', studentRoutes);
 app.use('/api/profiles', profileRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/jobs', jobRoutes);
 app.use('/api/learning', learningRoutes);
 app.use('/api/interviews', interviewRoutes);
+app.use('/api/interview', interviewRoutes);
 app.use('/api/resume', resumeRoutes);
 app.use('/api/recruiters', recruiterRoutes);
 app.use('/api/community', communityRoutes);
@@ -50,6 +53,41 @@ app.use('/api/questions', questionRoutes);
 app.use('/api/career-twin', careerTwinRoutes);
 app.use('/api/certificates', certificateRoutes);
 app.use('/api/feedback', feedbackRoutes);
+
+// Public Certificate Verification Endpoint (No login required for QR scans)
+app.get('/api/verify/:certificateId', async (req, res) => {
+  try {
+    const Certificate = mongoose.models.Certificate || mongoose.model('Certificate');
+    const certificate = await Certificate.findOne({
+      certificateId: req.params.certificateId,
+      isActive: true,
+    });
+
+    if (!certificate) {
+      res.status(404).json({ error: 'Certificate not found or has been revoked', valid: false, verified: false });
+      return;
+    }
+
+    if (certificate.status !== 'APPROVED') {
+      res.status(400).json({ error: 'This certificate is not officially approved yet.', valid: false, verified: false });
+      return;
+    }
+
+    if (certificate.expiryDate && new Date() > new Date(certificate.expiryDate)) {
+      res.status(410).json({ error: 'Certificate has expired', valid: false, verified: false, certificate });
+      return;
+    }
+
+    res.json({
+      message: 'Certificate is authentic and valid',
+      valid: true,
+      verified: true,
+      certificate,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Verification failed', valid: false, verified: false });
+  }
+});
 
 app.get('/', (req, res) => {
   res.json({

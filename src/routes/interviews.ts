@@ -78,4 +78,89 @@ router.post('/sessions/:id/analyze', protect, asyncHandler(async (req, res) => {
   res.json({ session, score });
 }));
 
+// ==========================================
+// INTERVIEW ROUTE ALIASES (Requirement 28)
+// ==========================================
+import { interviewSessionService } from '../services/interviewSession';
+import { QuestionInterviewSession, StudentAnswer } from '../models/questionBank';
+
+// POST /api/interviews/start or /api/interview/start
+router.post('/start', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const { field, careerDomain, targetRole, topic, difficulty, questionCount, experienceLevel } = req.body;
+  const session = await interviewSessionService.createSession({
+    studentId: req.user._id,
+    field: field || careerDomain,
+    careerDomain,
+    targetRole,
+    topic,
+    difficulty,
+    questionCount: questionCount || 10,
+    experienceLevel,
+    useVariations: true,
+    adaptiveDifficulty: true,
+  });
+  res.json(session);
+}));
+
+// POST /api/interviews/:sessionId/answer
+router.post('/:sessionId/answer', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const { questionId, answer, answerType, timeTaken } = req.body;
+  const submission = await interviewSessionService.submitAnswer({
+    sessionId: req.params.sessionId,
+    studentId: req.user._id,
+    questionId,
+    answer,
+    answerType: answerType || 'Text',
+    timeTaken: timeTaken || 90,
+  });
+  res.json(submission);
+}));
+
+// POST /api/interviews/:sessionId/complete
+router.post('/:sessionId/complete', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const completed = await interviewSessionService.completeSession(req.params.sessionId, req.user._id);
+  res.json(completed);
+}));
+
+// GET /api/interviews/history
+router.get('/history', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const sessions = await QuestionInterviewSession.find({ studentId: req.user._id }).sort({ createdAt: -1 });
+  res.json(sessions);
+}));
+
+// GET /api/interviews/:sessionId
+router.get('/:sessionId', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const session = await QuestionInterviewSession.findOne({ sessionId: req.params.sessionId, studentId: req.user._id });
+  if (!session) {
+    res.status(404).json({ message: 'Interview session not found' });
+    return;
+  }
+  const answers = await StudentAnswer.find({ sessionId: req.params.sessionId }).populate('questionId', 'question topic field difficulty');
+  res.json({ session, answers });
+}));
+
+// GET /api/interviews/:sessionId/report
+router.get('/:sessionId/report', protect, asyncHandler(async (req: AuthRequest, res) => {
+  let session = await QuestionInterviewSession.findOne({ sessionId: req.params.sessionId, studentId: req.user._id });
+  if (!session) {
+    res.status(404).json({ message: 'Interview session not found' });
+    return;
+  }
+  if (session.status !== 'Completed') {
+    await interviewSessionService.completeSession(req.params.sessionId, req.user._id);
+    session = await QuestionInterviewSession.findOne({ sessionId: req.params.sessionId });
+  }
+  const answers = await StudentAnswer.find({ sessionId: req.params.sessionId }).populate('questionId', 'question topic field difficulty');
+  res.json({
+    session,
+    finalReport: session?.finalReport,
+    answers,
+    questionsAsked: answers.length,
+    averageScores: session?.competencies,
+    answerCounts: session?.answerCounts,
+    stuckTopics: session?.stuckTopics || [],
+    difficultyProgression: session?.difficultyProgression || [],
+  });
+}));
+
 export default router;

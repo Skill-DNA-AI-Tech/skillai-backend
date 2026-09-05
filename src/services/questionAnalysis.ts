@@ -197,66 +197,312 @@ Return JSON array with similarity analysis:
     }
   },
 
-  // Analyze student answer
+  // Analyze student answer with strict backend-level validation pipeline
   analyzeAnswer: async (payload: {
     question: string;
     modelAnswer: string;
     studentAnswer: string;
     topic: string;
+    field?: string;
   }): Promise<any> => {
-    const prompt = `You are an expert answer evaluator. Analyze this student's answer.
+    const rawAnswer = payload.studentAnswer || '';
+    const cleaned = rawAnswer.trim();
 
+    // 1. EMPTY ANSWER ENFORCEMENT (Backend level, strictly 0 marks, no LLM)
+    if (!cleaned) {
+      return {
+        answerStatus: 'EMPTY',
+        relevance: 0,
+        technicalKnowledge: 0,
+        technicalScore: 0,
+        communication: 0,
+        communicationScore: 0,
+        problemSolving: 0,
+        problemSolvingScore: 0,
+        confidence: 0,
+        confidenceScore: 0,
+        clarity: 0,
+        clarityScore: 0,
+        correctness: 0,
+        overallScore: 0,
+        conceptCoverage: 0,
+        completeness: 0,
+        technicalQuality: 0,
+        grammar: 0,
+        keywordMatches: [],
+        conceptsIdentified: [],
+        strengths: [],
+        weaknesses: ['No answer submitted. The question was left completely blank.'],
+        missingConcepts: ['All required technical concepts were omitted.'],
+        commonMistakes: ['Blank submission without attempt'],
+        suggestedImprovement: 'Always attempt to formulate a structured response, breaking down the problem step-by-step.',
+        feedback: 'No answer submitted. The question was left completely blank.',
+        betterAnswer: payload.modelAnswer,
+        confidenceIndicators: 'None (Unanswered)',
+      };
+    }
+
+    // 2. "I DON'T KNOW" / SKIP ENFORCEMENT (Backend level, 0-5 marks, no LLM)
+    const normalizedLower = cleaned.toLowerCase().replace(/['"`]/g, '');
+    const isNoAnswerRegex = /^(i\s+dont\s+know|dont\s+know|no\s+idea|i\s+have\s+no\s+idea|cant\s+answer|cannot\s+answer|skip|not\s+sure|pass|idk|no\s+clue|i\s+am\s+not\s+sure|i\s+do\s+not\s+know)[.!]?$/i;
+    const noAnswerPhrases = [
+      'dont know',
+      'do not know',
+      'no idea',
+      'cant answer',
+      'cannot answer',
+      'cant remember',
+      'cannot remember',
+      'havent studied',
+      'have not studied',
+      'not sure',
+      'no clue',
+      'skip',
+      'pass',
+      'idk',
+      'not familiar',
+      'didnt study',
+      'did not study',
+      'no knowledge'
+    ];
+    const hasNoAnswerPhrase = noAnswerPhrases.some(phrase => normalizedLower.includes(phrase));
+    const isShortAdmission = cleaned.length < 150 && hasNoAnswerPhrase;
+
+    if (isNoAnswerRegex.test(normalizedLower) || isShortAdmission) {
+      return {
+        answerStatus: 'NO_ANSWER',
+        relevance: 0,
+        technicalKnowledge: 0,
+        technicalScore: 0,
+        communication: 0,
+        communicationScore: 0,
+        problemSolving: 0,
+        problemSolvingScore: 0,
+        confidence: 0,
+        confidenceScore: 0,
+        clarity: 0,
+        clarityScore: 0,
+        correctness: 0,
+        overallScore: 0,
+        conceptCoverage: 0,
+        completeness: 0,
+        technicalQuality: 0,
+        grammar: 10,
+        keywordMatches: [],
+        conceptsIdentified: [],
+        strengths: ['Honest acknowledgment of current knowledge gap'],
+        weaknesses: [`Unfamiliarity with core concepts of ${payload.topic || 'the question'}`],
+        missingConcepts: [`Foundational principles of ${payload.topic || 'the assigned topic'}`],
+        commonMistakes: ['Skipping question without applying fundamental first-principles reasoning'],
+        suggestedImprovement: `Review foundational study modules on ${payload.topic || 'this subject'} and practice conceptual recall.`,
+        feedback: `Review foundational study modules on ${payload.topic || 'this subject'}.`,
+        betterAnswer: payload.modelAnswer,
+        confidenceIndicators: 'Uncertain / Pass',
+      };
+    }
+
+    // 3. QUESTION COPYING DETECTION (Similarity analysis against prompt)
+    const cleanTokens = (text: string) => text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 2);
+    const qTokens = new Set(cleanTokens(payload.question));
+    const aTokens = cleanTokens(cleaned);
+
+    let overlapCount = 0;
+    for (const token of aTokens) {
+      if (qTokens.has(token)) overlapCount++;
+    }
+
+    const tokenOverlapRatio = aTokens.length > 0 ? overlapCount / aTokens.length : 0;
+    const isExactSubstr = payload.question.toLowerCase().includes(normalizedLower) || normalizedLower.includes(payload.question.toLowerCase());
+
+    if ((tokenOverlapRatio > 0.75 && aTokens.length >= 4) || (isExactSubstr && cleaned.length > 25)) {
+      return {
+        answerStatus: 'COPY_SUSPECTED',
+        relevance: 15,
+        technicalKnowledge: 5,
+        technicalScore: 5,
+        communication: 10,
+        communicationScore: 10,
+        problemSolving: 0,
+        problemSolvingScore: 0,
+        confidence: 5,
+        confidenceScore: 5,
+        clarity: 10,
+        clarityScore: 10,
+        correctness: 0,
+        overallScore: 5,
+        conceptCoverage: 5,
+        completeness: 5,
+        technicalQuality: 5,
+        grammar: 40,
+        keywordMatches: [],
+        conceptsIdentified: [],
+        strengths: [],
+        weaknesses: ['Submission closely mirrors or repeats the interview prompt rather than explaining concepts independently.'],
+        missingConcepts: ['Original technical explanation, personal reasoning, and illustrative examples.'],
+        commonMistakes: ['Repeating question text instead of answering'],
+        suggestedImprovement: 'Provide an authentic, independently formulated response with concrete examples.',
+        feedback: 'Submission closely mirrors the question prompt rather than demonstrating independent explanation.',
+        betterAnswer: payload.modelAnswer,
+        confidenceIndicators: 'Suspicious (Echoing prompt)',
+      };
+    }
+
+    // 4. CALL AI / GROQ FOR STRUCTURED EVALUATION
+    const prompt = `You are a strict, professional technical interviewer and assessor evaluating a student's answer.
+Context:
+Career Field: ${payload.field || 'Engineering / Professional'}
+Topic: ${payload.topic}
 Question: ${payload.question}
 Model Answer: ${payload.modelAnswer}
-Student's Answer: ${payload.studentAnswer}
-Topic: ${payload.topic}
+Student's Submitted Answer: ${cleaned}
 
-Provide analysis in JSON format:
+Evaluate the student's answer objectively.
+Rules:
+1. If the answer is completely off-topic or irrelevant (e.g. answering about a totally different field or nonsense), set "answerStatus": "IRRELEVANT" and give very low marks (below 15).
+2. For a genuine, valid answer, evaluate:
+   - technicalKnowledge (0-100): Depth, accuracy, and grasp of technical concepts.
+   - communication (0-100): Structure, conciseness, and articulation.
+   - problemSolving (0-100): Logical thinking, application of principles, and edge case handling.
+   - confidence (0-100): Decisiveness, tone, and conviction.
+   - clarity (0-100): Precision and absence of ambiguity.
+   - relevance (0-100): Direct alignment with the specific question asked.
+
+Return ONLY a valid JSON object strictly matching this schema:
 {
-  "correctness": number 0-100,
-  "conceptCoverage": number 0-100,
-  "clarity": number 0-100,
-  "completeness": number 0-100,
-  "technicalQuality": number 0-100,
-  "grammar": number 0-100,
-  "keywordMatches": ["keywords found in answer"],
-  "conceptsIdentified": ["concepts mentioned"],
-  "strengths": ["strength1", "strength2"],
-  "weaknesses": ["weakness1", "weakness2"],
-  "missingConcepts": ["missing1", "missing2"],
-  "commonMistakes": ["error1", "error2"],
-  "suggestedImprovement": "specific improvement suggestion",
-  "betterAnswer": "example of better answer",
-  "confidenceIndicators": "assessment of confidence level",
-  "overallScore": number 0-100
+  "answerStatus": "VALID" or "IRRELEVANT",
+  "relevance": number (0-100),
+  "technicalKnowledge": number (0-100),
+  "communication": number (0-100),
+  "problemSolving": number (0-100),
+  "confidence": number (0-100),
+  "clarity": number (0-100),
+  "overallScore": number (0-100),
+  "conceptCoverage": number (0-100),
+  "completeness": number (0-100),
+  "grammar": number (0-100),
+  "keywordMatches": ["keyword1", "keyword2"],
+  "conceptsIdentified": ["concept1", "concept2"],
+  "strengths": ["specific strength 1", "specific strength 2"],
+  "weaknesses": ["specific weakness 1", "specific weakness 2"],
+  "missingConcepts": ["missing concept 1"],
+  "commonMistakes": ["mistake identified if any"],
+  "suggestedImprovement": "actionable guidance",
+  "betterAnswer": "example of a superior answer"
 }`;
 
     try {
       const response = await groqRequest({ prompt });
       const jsonMatch = response.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
+        const parsed = JSON.parse(jsonMatch[0]);
+
+        // Validate and clamp all scores
+        const clamp = (val: any, fallback = 50) => {
+          const n = Number(val);
+          return isNaN(n) ? fallback : Math.max(0, Math.min(100, Math.round(n)));
+        };
+
+        const relevance = clamp(parsed.relevance, 70);
+        let status = parsed.answerStatus === 'IRRELEVANT' || relevance < 25 ? 'IRRELEVANT' : 'VALID';
+
+        let tech = clamp(parsed.technicalKnowledge || parsed.technicalQuality, 60);
+        let comm = clamp(parsed.communication || parsed.clarity, 65);
+        let ps = clamp(parsed.problemSolving || parsed.conceptCoverage, 60);
+        let conf = clamp(parsed.confidence, 65);
+        let clar = clamp(parsed.clarity, 65);
+
+        if (status === 'IRRELEVANT') {
+          tech = Math.min(tech, 15);
+          ps = Math.min(ps, 10);
+        }
+
+        const overall = clamp(parsed.overallScore, Math.round(tech * 0.4 + comm * 0.2 + ps * 0.2 + conf * 0.1 + clar * 0.1));
+
+        return {
+          answerStatus: status,
+          relevance,
+          technicalKnowledge: tech,
+          technicalScore: tech,
+          technicalQuality: tech,
+          communication: comm,
+          communicationScore: comm,
+          problemSolving: ps,
+          problemSolvingScore: ps,
+          confidence: conf,
+          confidenceScore: conf,
+          clarity: clar,
+          clarityScore: clar,
+          correctness: tech,
+          overallScore: overall,
+          conceptCoverage: clamp(parsed.conceptCoverage, tech),
+          completeness: clamp(parsed.completeness, tech),
+          grammar: clamp(parsed.grammar, 80),
+          keywordMatches: Array.isArray(parsed.keywordMatches) ? parsed.keywordMatches : [],
+          conceptsIdentified: Array.isArray(parsed.conceptsIdentified) ? parsed.conceptsIdentified : [payload.topic],
+          strengths: Array.isArray(parsed.strengths) && parsed.strengths.length > 0 ? parsed.strengths : ['Demonstrated fundamental knowledge'],
+          weaknesses: Array.isArray(parsed.weaknesses) && parsed.weaknesses.length > 0 ? parsed.weaknesses : ['Could deepen technical rigor'],
+          missingConcepts: Array.isArray(parsed.missingConcepts) ? parsed.missingConcepts : [],
+          commonMistakes: Array.isArray(parsed.commonMistakes) ? parsed.commonMistakes : [],
+          suggestedImprovement: parsed.suggestedImprovement || 'Continue developing structured technical explanations.',
+          feedback: parsed.suggestedImprovement || 'Structured technical response evaluated.',
+          betterAnswer: parsed.betterAnswer || payload.modelAnswer,
+          confidenceIndicators: `${conf >= 75 ? 'Strong' : conf >= 50 ? 'Moderate' : 'Developing'} presence`,
+        };
       }
-      return {};
+      throw new Error('Could not parse AI response JSON');
     } catch (error) {
-      console.error('Answer analysis failed:', error);
+      console.warn('AI Answer evaluation fallback activated:', error);
+
+      // Heuristic fallback matching model answer & question keywords
+      const modelTokens = cleanTokens(payload.modelAnswer);
+      const questionTokens = cleanTokens(payload.question);
+      const topicTokens = cleanTokens(payload.topic);
+      const fieldTokens = cleanTokens(payload.field || '');
+      const refTokens = new Set([...modelTokens, ...questionTokens, ...topicTokens, ...fieldTokens]);
+
+      const studentTokens = cleanTokens(cleaned);
+      const matched = studentTokens.filter(t => refTokens.has(t));
+      const matchRatio = studentTokens.length > 0 ? matched.length / studentTokens.length : 0;
+
+      // An answer is off-topic/irrelevant if it shares virtually no relevant domain/question tokens
+      const isOffTopic = matchRatio < 0.12 || (studentTokens.length >= 4 && matched.length === 0);
+
+      const baseTech = isOffTopic ? 5 : Math.min(95, Math.max(25, Math.round(matchRatio * 100 + (cleaned.length > 80 ? 25 : 10))));
+      const baseComm = isOffTopic ? 15 : Math.min(90, Math.max(30, Math.round(50 + (cleaned.length > 60 ? 25 : 10))));
+      const basePS = isOffTopic ? 0 : Math.min(90, Math.max(25, Math.round(baseTech * 0.9)));
+      const baseConf = isOffTopic ? 15 : Math.min(85, Math.max(35, Math.round(baseComm * 0.9)));
+      const baseClar = isOffTopic ? 15 : Math.min(90, Math.max(30, Math.round(baseComm * 0.95)));
+      const baseOverall = Math.round(baseTech * 0.4 + baseComm * 0.2 + basePS * 0.2 + baseConf * 0.1 + baseClar * 0.1);
+
       return {
-        correctness: 75,
-        conceptCoverage: 80,
-        clarity: 70,
-        completeness: 75,
-        technicalQuality: 70,
-        grammar: 85,
-        keywordMatches: ["logic", "solution", "design"],
-        conceptsIdentified: [payload.topic || "programming"],
-        strengths: ["Clear solution approach", "Good logical structure", "Covers primary requirements"],
-        weaknesses: ["Could explain time complexity", "Add more edge cases", "Needs deeper structural explanation"],
-        missingConcepts: ["Time and space complexity analysis", "Edge case validation"],
-        commonMistakes: [],
-        suggestedImprovement: "Try to mention time/space complexity and optimization considerations at the end.",
-        betterAnswer: "A complete solution would also address optimization, scalability, and specific edge cases.",
-        confidenceIndicators: "Steady tone, solid explanation.",
-        overallScore: 74
+        answerStatus: isOffTopic ? 'IRRELEVANT' : 'VALID',
+        relevance: isOffTopic ? 15 : 75,
+        technicalKnowledge: baseTech,
+        technicalScore: baseTech,
+        technicalQuality: baseTech,
+        communication: baseComm,
+        communicationScore: baseComm,
+        problemSolving: basePS,
+        problemSolvingScore: basePS,
+        confidence: baseConf,
+        confidenceScore: baseConf,
+        clarity: baseClar,
+        clarityScore: baseClar,
+        correctness: baseTech,
+        overallScore: baseOverall,
+        conceptCoverage: baseTech,
+        completeness: baseTech,
+        grammar: 75,
+        keywordMatches: matched.slice(0, 5),
+        conceptsIdentified: [payload.topic || 'Domain concept'],
+        strengths: isOffTopic ? [] : ['Structured attempt', 'Foundational vocabulary applied'],
+        weaknesses: isOffTopic ? ['Answer appears disconnected from the question topic'] : ['Expand on practical implementations and edge cases'],
+        missingConcepts: ['Comprehensive edge-case and architectural elaboration'],
+        commonMistakes: isOffTopic ? ['Off-topic answer'] : [],
+        suggestedImprovement: 'Include concrete technical details, real-world examples, and trade-offs in your explanation.',
+        feedback: isOffTopic ? 'Answer appears disconnected from the question topic.' : 'Include concrete technical details and trade-offs in your explanation.',
+        betterAnswer: payload.modelAnswer,
+        confidenceIndicators: 'Evaluated via benchmark heuristic',
       };
     }
   },

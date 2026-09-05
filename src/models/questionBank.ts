@@ -133,10 +133,17 @@ const QuestionInterviewSessionSchema = new mongoose.Schema(
     // Interview configuration
     field: String,
     topic: String,
+    careerDomain: String,
+    targetRole: String,
+    experienceLevel: String,
+    currentDifficulty: { type: String, enum: ['BASIC', 'INTERMEDIATE', 'ADVANCED'], default: 'BASIC' },
+    
     questionSet: [
       {
         questionId: mongoose.Schema.Types.ObjectId,
         sequence: Number,
+        difficulty: { type: String, enum: ['BASIC', 'INTERMEDIATE', 'ADVANCED', 'Easy', 'Medium', 'Hard'] },
+        topic: String,
         asked: { type: Boolean, default: false },
         askedAt: Date,
         answerSubmitted: Boolean,
@@ -147,8 +154,40 @@ const QuestionInterviewSessionSchema = new mongoose.Schema(
     startTime: { type: Date, default: Date.now },
     endTime: Date,
     status: { type: String, enum: ['Active', 'Completed', 'Paused', 'Abandoned'], default: 'Active' },
-    totalQuestions: Number,
+    totalQuestions: { type: Number, default: 10 },
+    minQuestions: { type: Number, default: 10 },
+    maxQuestions: { type: Number, default: 15 },
     questionsAnswered: { type: Number, default: 0 },
+    
+    // Summary metrics & breakdown
+    competencies: {
+      technical: { type: Number, default: 0 },
+      communication: { type: Number, default: 0 },
+      problemSolving: { type: Number, default: 0 },
+      confidence: { type: Number, default: 0 },
+      clarity: { type: Number, default: 0 },
+      overall: { type: Number, default: 0 },
+    },
+    answerCounts: {
+      valid: { type: Number, default: 0 },
+      empty: { type: Number, default: 0 },
+      noAnswer: { type: Number, default: 0 },
+      irrelevant: { type: Number, default: 0 },
+      copySuspected: { type: Number, default: 0 },
+    },
+    strengths: [String],
+    weaknesses: [String],
+    stuckTopics: [String],
+    difficultyProgression: [
+      {
+        sequence: Number,
+        difficulty: String,
+        topic: String,
+        score: Number,
+        status: String,
+      }
+    ],
+    finalReport: { type: mongoose.Schema.Types.Mixed },
     
     // Generated variations
     useVariations: { type: Boolean, default: true },
@@ -168,15 +207,24 @@ const StudentAnswerSchema = new mongoose.Schema(
     
     answer: String, // text, transcribed speech, or video URL
     answerType: { type: String, enum: ['Text', 'Voice', 'Video'], default: 'Text' },
+    answerStatus: { 
+      type: String, 
+      enum: ['VALID', 'EMPTY', 'NO_ANSWER', 'IRRELEVANT', 'COPY_SUSPECTED'], 
+      default: 'VALID' 
+    },
     
-    // Analysis results
-    correctness: { type: Number, min: 0, max: 100, default: 0 },
-    confidenceScore: { type: Number, min: 0, max: 100, default: 0 },
+    // 5 Core Competency Scores (0-100)
+    technicalScore: { type: Number, min: 0, max: 100, default: 0 },
     communicationScore: { type: Number, min: 0, max: 100, default: 0 },
+    problemSolvingScore: { type: Number, min: 0, max: 100, default: 0 },
+    confidenceScore: { type: Number, min: 0, max: 100, default: 0 },
+    clarityScore: { type: Number, min: 0, max: 100, default: 0 },
+    
+    // Additional analysis metrics
+    correctness: { type: Number, min: 0, max: 100, default: 0 },
     technicalQualityScore: { type: Number, min: 0, max: 100, default: 0 },
     completenessScore: { type: Number, min: 0, max: 100, default: 0 },
     grammarScore: { type: Number, min: 0, max: 100, default: 0 },
-    clarityScore: { type: Number, min: 0, max: 100, default: 0 },
     
     overallScore: { type: Number, min: 0, max: 100, default: 0 },
     
@@ -187,6 +235,7 @@ const StudentAnswerSchema = new mongoose.Schema(
       missingConcepts: [String],
       suggestedImprovement: String,
       betterAnswer: String,
+      relevanceScore: Number,
     },
     
     submitTime: { type: Date, default: Date.now },
