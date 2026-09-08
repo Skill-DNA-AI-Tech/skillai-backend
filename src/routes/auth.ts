@@ -26,6 +26,11 @@ const sanitizeUser = (user: any) => ({
   avatarUrl: user.avatarUrl,
   emailVerified: user.emailVerified,
   requiresPasswordChange: user.requiresPasswordChange ?? false,
+  isTestUser: user.isTestUser ?? false,
+  isPreProductionUser: user.isPreProductionUser ?? false,
+  betaAccess: user.betaAccess ?? false,
+  careerDomain: user.careerDomain,
+  targetRole: user.targetRole,
 });
 
 const authPayload = async (user: any, ip = '') => ({
