@@ -42,8 +42,26 @@ app.add_middleware(
 )
 
 # Register API Routers
-app.include_router(student_auth_router)
-app.include_router(admin_auth_router)
+# Register API Routers under consistent /api prefix
+app.include_router(student_auth_router, prefix="/api")
+app.include_router(admin_auth_router, prefix="/api")
+
+@app.get("/")
+async def root_health_check():
+    return {
+        "status": "healthy",
+        "service": "SkillDNA Tech AI Auth Service",
+        "version": "1.0.0"
+    }
+
+@app.get("/api")
+async def api_health_check():
+    return {
+        "status": "healthy",
+        "service": "SkillDNA Tech AI Auth Service",
+        "version": "1.0.0",
+        "message": "SkillDNA API is running"
+    }
 
 @app.get("/")
 async def root_health_check():
