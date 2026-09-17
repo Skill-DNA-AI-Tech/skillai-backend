@@ -174,7 +174,7 @@ async def login(payload: StudentLogin, request: Request):
         role=user["role"],
         created_at=user["created_at"]
     )
-    return TokenResponse(access_token=access_token, user=user_response)
+    return TokenResponse(access_token=access_token, role=user.get("role", "student"), user=user_response)
 
 @router.post("/verify-email", response_model=TokenResponse)
 async def verify_email(payload: VerifyEmailRequest, request: Request):
@@ -249,7 +249,7 @@ async def verify_email(payload: VerifyEmailRequest, request: Request):
         role=user["role"],
         created_at=user["created_at"]
     )
-    return TokenResponse(access_token=access_token, user=user_response)
+    return TokenResponse(access_token=access_token, role=user.get("role", "student"), user=user_response)
 
 @router.post("/google", response_model=TokenResponse)
 async def google_login(payload: GoogleLoginRequest, request: Request):
@@ -360,7 +360,7 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
         role=user["role"],
         created_at=user["created_at"]
     )
-    return TokenResponse(access_token=access_token, user=user_response)
+    return TokenResponse(access_token=access_token, role=user.get("role", "student"), user=user_response)
 
 @router.post("/forgot-password", response_model=MessageResponse)
 async def forgot_password(payload: ForgotPasswordRequest):
