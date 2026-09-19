@@ -391,6 +391,7 @@ router.post('/students', asyncHandler(async (req: AuthRequest, res) => {
   const selectedCareer = (career || 'Software Development').trim();
   const resolvedCurriculum = resolveCurriculum(selectedCareer);
   const selectedDomain = (domain?.trim()) || resolvedCurriculum.domain || 'Computer Science';
+  const selectedTargetRole = (req.body?.targetRole || resolvedCurriculum.targetRole || 'Specialist').trim();
 
   // 1. Create student User
   const user = new User({
@@ -403,7 +404,7 @@ router.post('/students', asyncHandler(async (req: AuthRequest, res) => {
     emailVerified: true,
     requiresPasswordChange: true,
     careerDomain: selectedDomain,
-    targetRole: resolvedCurriculum.targetRole,
+    targetRole: selectedTargetRole,
     mobile: mobile ? mobile.trim() : undefined,
     approved_by: req.user?._id,
     approved_at: new Date(),
@@ -423,7 +424,7 @@ router.post('/students', asyncHandler(async (req: AuthRequest, res) => {
     semester: (semester || 'Final Year').trim(),
     career: selectedCareer,
     domain: selectedDomain,
-    preferredRoles: [resolvedCurriculum.targetRole],
+    preferredRoles: [selectedTargetRole],
     activeCurriculum: {
       curriculumId: resolvedCurriculum.id,
       title: resolvedCurriculum.careerName,
@@ -441,6 +442,7 @@ router.post('/students', asyncHandler(async (req: AuthRequest, res) => {
     email: user.email,
     career: selectedCareer,
     domain: selectedDomain,
+    targetRole: selectedTargetRole,
     createdById: req.user?._id,
     createdByName: req.user?.name,
   });
@@ -450,6 +452,59 @@ router.post('/students', asyncHandler(async (req: AuthRequest, res) => {
     user: serializeUserAccount(user),
     profile,
     temporaryPassword: password.trim(),
+  });
+}));
+
+// GET /api/admin/students/:id - Detailed student inspection (Strictly student accounts only)
+router.get('/students/:id', asyncHandler(async (req: AuthRequest, res) => {
+  const student = await User.findById(req.params.id);
+  if (!student || !['STUDENT', 'student'].includes(student.role)) {
+    res.status(404).json({ message: 'Student account not found.' });
+    return;
+  }
+
+  const [profile, certificates, sessions, careerTwin] = await Promise.all([
+    Profile.findOne({ user: student._id }).lean(),
+    Certificate.find({ studentId: student._id, isActive: true }).sort({ createdAt: -1 }).lean(),
+    QuestionInterviewSession.find({ studentId: student._id }).sort({ createdAt: -1 }).limit(10).lean(),
+    CareerTwinMemory.findOne({ $or: [{ user: student._id }, { userId: student._id }] }).lean(),
+  ]);
+
+  res.json({
+    student: serializeUserAccount(student),
+    profile,
+    certificates,
+    sessions,
+    careerTwin,
+  });
+}));
+
+// PATCH /api/admin/students/:id/status - Toggle student account status (Strictly student accounts only)
+router.patch('/students/:id/status', asyncHandler(async (req: AuthRequest, res) => {
+  const student = await User.findById(req.params.id);
+  if (!student || !['STUDENT', 'student'].includes(student.role)) {
+    res.status(404).json({ message: 'Student account not found or cannot modify non-student accounts.' });
+    return;
+  }
+
+  const { status } = req.body;
+  if (!['ACTIVE', 'DISABLED'].includes(status)) {
+    res.status(400).json({ message: 'Status must be ACTIVE or DISABLED' });
+    return;
+  }
+
+  student.status = status;
+  student.disabled_at = status === 'DISABLED' ? new Date() : undefined;
+  await student.save();
+
+  await writeAuditLog(req, 'ADMIN_STUDENT_STATUS_UPDATED', 'User', student._id.toString(), {
+    email: student.email,
+    status,
+  });
+
+  res.json({
+    message: `Student account ${student.name} is now ${status}.`,
+    student: serializeUserAccount(student),
   });
 }));
 
@@ -568,51 +623,56 @@ router.post('/certificates/issue', asyncHandler(async (req: AuthRequest, res) =>
   const defaultStrengths = ['Technical Acumen', 'Problem Resolution', 'Professional Articulation'];
   const defaultImprovements = ['Continuous Domain Exploration', 'High-Scale System Architecture'];
 
-  const certificate = new Certificate({
-    studentId: student._id,
-    studentName: student.name,
-    email: student.email,
-    careerPath: certCareerPath,
-    courseName: (courseName || certCareerPath).trim(),
-    certificateId,
-    technicalScore: tech,
-    communicationScore: comm,
-    problemSolvingScore: prob,
-    confidenceScore: conf,
-    overallScore: numericOverall,
-    sessionsCompleted: Math.max(1, Number(sessionsCompleted) || 1),
-    interviewReadinessStatus: readiness,
-    strengths: Array.isArray(strengths) && strengths.length > 0 ? strengths : defaultStrengths,
-    improvements: Array.isArray(improvements) && improvements.length > 0 ? improvements : defaultImprovements,
-    qrCode: qrCodeDataUrl,
-    verificationUrl,
-    passStatus: 'PASS',
-    templateId,
-    status: 'APPROVED',
-    approvedBy: req.user?._id,
-    approvedAt: new Date(),
-    issuedBy: req.user?._id,
-    issuedByName: req.user?.name || 'Administrator',
-    adminSignatureBase64: signature,
-    issueDate: certIssueDate,
-    expiryDate: certExpiryDate,
-    isActive: true,
-  });
+    const officialRemark = (req.body?.adminRemark || req.body?.officialRemark || req.body?.remark || '').trim();
 
-  await certificate.save();
+    const certificate = new Certificate({
+      studentId: student._id,
+      studentName: student.name,
+      email: student.email,
+      careerPath: certCareerPath,
+      courseName: (courseName || certCareerPath).trim(),
+      certificateId,
+      technicalScore: tech,
+      communicationScore: comm,
+      problemSolvingScore: prob,
+      confidenceScore: conf,
+      overallScore: numericOverall,
+      sessionsCompleted: Math.max(1, Number(sessionsCompleted) || 1),
+      interviewReadinessStatus: readiness,
+      strengths: Array.isArray(strengths) && strengths.length > 0 ? strengths : defaultStrengths,
+      improvements: Array.isArray(improvements) && improvements.length > 0 ? improvements : defaultImprovements,
+      qrCode: qrCodeDataUrl,
+      verificationUrl,
+      passStatus: 'PASS',
+      templateId,
+      status: 'APPROVED',
+      approvedBy: req.user?._id,
+      approvedAt: new Date(),
+      issuedBy: req.user?._id,
+      issuedByName: req.user?.name || 'Administrator',
+      adminSignatureBase64: signature,
+      adminRemark: officialRemark,
+      officialRemark,
+      issueDate: certIssueDate,
+      expiryDate: certExpiryDate,
+      isActive: true,
+    });
 
-  // Audit record of issuance
-  await writeAuditLog(req, 'CERTIFICATE_ISSUED_BY_ADMIN', 'Certificate', certificate._id.toString(), {
-    certificateId,
-    studentId: student._id.toString(),
-    studentName: student.name,
-    studentEmail: student.email,
-    careerPath: certCareerPath,
-    overallScore: numericOverall,
-    issuedById: req.user?._id,
-    issuedByName: req.user?.name,
-    issuedAt: new Date(),
-  });
+    await certificate.save();
+
+    // Audit record of issuance
+    await writeAuditLog(req, 'CERTIFICATE_ISSUED_BY_ADMIN', 'Certificate', certificate._id.toString(), {
+      certificateId,
+      studentId: student._id.toString(),
+      studentName: student.name,
+      studentEmail: student.email,
+      careerPath: certCareerPath,
+      overallScore: numericOverall,
+      officialRemark,
+      issuedById: req.user?._id,
+      issuedByName: req.user?.name,
+      issuedAt: new Date(),
+    });
 
   res.status(201).json({
     message: `Verified Certificate ${certificateId} successfully issued to ${student.name}.`,

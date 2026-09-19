@@ -95,6 +95,18 @@ app.get('/api/verify/:certificateId', async (req, res) => {
   }
 });
 
+const healthPayload = () => ({
+  status: 'healthy',
+  service: 'SkillDNA Tech AI Authoritative Application Backend',
+  version: '1.0.0',
+  uptime: process.uptime(),
+  database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+  timestamp: new Date().toISOString(),
+});
+
+app.get('/health', (req, res) => res.json(healthPayload()));
+app.get('/api/health', (req, res) => res.json(healthPayload()));
+
 app.get('/', (req, res) => {
   res.json({
     message: 'SkillDNA AI backend is running',

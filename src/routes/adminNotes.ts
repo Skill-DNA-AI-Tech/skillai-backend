@@ -95,21 +95,47 @@ router.post(
       return;
     }
 
-    const { domain, topic, subtopic, title, overview, richText, keyTakeaways, examples, resources, status, career } = req.body;
+    const {
+      domain = 'Computer Science',
+      topic,
+      subtopic = 'General',
+      title,
+      overview,
+      richText,
+      content,
+      keyTakeaways,
+      examples,
+      resources,
+      status,
+      career,
+    } = req.body;
 
-    if (!domain || !topic || !subtopic || !title) {
-      res.status(400).json({ message: 'Domain, Topic, Subtopic, and Title are required fields.' });
+    if (!topic || !String(topic).trim()) {
+      res.status(400).json({ message: 'Topic is a required field.' });
       return;
+    }
+
+    const trimmedTopic = String(topic).trim();
+    const trimmedSubtopic = String(subtopic || 'General').trim();
+    const effectiveTitle = (title || `${trimmedTopic} - ${trimmedSubtopic}`).trim();
+    const effectiveText = (richText || content || overview || '').trim();
+
+    let normalizedStatus: 'Draft' | 'Published' | 'Archived' = 'Published';
+    if (typeof status === 'string') {
+      const s = status.trim().toUpperCase();
+      if (s === 'DRAFT') normalizedStatus = 'Draft';
+      else if (s === 'ARCHIVED') normalizedStatus = 'Archived';
+      else normalizedStatus = 'Published';
     }
 
     const note = await TopicNote.create({
       career: career || '',
-      domain: domain.trim(),
-      topic: topic.trim(),
-      subtopic: subtopic.trim(),
-      title: title.trim(),
-      overview: overview || '',
-      richText: richText || '',
+      domain: String(domain).trim(),
+      topic: trimmedTopic,
+      subtopic: trimmedSubtopic,
+      title: effectiveTitle,
+      overview: overview || effectiveText.slice(0, 300),
+      richText: effectiveText,
       keyTakeaways: Array.isArray(keyTakeaways)
         ? keyTakeaways
         : typeof keyTakeaways === 'string'
@@ -117,10 +143,10 @@ router.post(
         : [],
       examples: examples || '',
       resources: Array.isArray(resources) ? resources : [],
-      status: status || 'Published',
+      status: normalizedStatus,
       isAiGenerated: false,
       createdBy: req.user._id,
-      publishedAt: status === 'Published' ? new Date() : undefined,
+      publishedAt: normalizedStatus === 'Published' ? new Date() : undefined,
     });
 
     await writeAuditLog(req, 'TOPIC_NOTE_CREATED', 'TopicNote', note._id.toString(), {
@@ -133,119 +159,112 @@ router.post(
   })
 );
 
-// POST /api/admin/notes/ai-generate - Admin triggers LLM to generate note draft for review & publishing
-router.post(
-  '/ai-generate',
-  protect,
-  asyncHandler(async (req: AuthRequest, res) => {
-    if (!canManageNotes(req)) {
-      res.status(403).json({ message: 'Unauthorized. Admin permission required.' });
-      return;
-    }
+// POST /api/admin/notes/ai-generate and /generate-ai - Admin triggers LLM to generate note draft
+const handleAiGenerate = asyncHandler(async (req: AuthRequest, res) => {
+  if (!canManageNotes(req)) {
+    res.status(403).json({ message: 'Unauthorized. Admin permission required.' });
+    return;
+  }
 
-    const { domain, topic, subtopic, careerDomain, level = 'Intermediate' } = req.body;
+  const { domain, topic, subtopic = 'General', careerDomain, level = 'Intermediate' } = req.body;
 
-    if (!topic || !subtopic) {
-      res.status(400).json({ message: 'Topic and Subtopic are required for AI generation.' });
-      return;
-    }
+  if (!topic || !String(topic).trim()) {
+    res.status(400).json({ message: 'Topic is required for AI generation.' });
+    return;
+  }
 
-    const prompt = `You are a world-class technical instructional designer writing official curriculum notes for SkillDNA AI.
+  const trimmedTopic = String(topic).trim();
+  const trimmedSubtopic = String(subtopic).trim();
+
+  const prompt = `You are a world-class technical instructional designer writing official curriculum notes for SkillDNA AI.
 Generate comprehensive, pedagogical, and industry-grade notes for:
 - Domain: ${domain || 'Computer Science'}
-- Topic: ${topic}
-- Subtopic: ${subtopic}
+- Topic: ${trimmedTopic}
+- Subtopic: ${trimmedSubtopic}
 - Target Level: ${level}
 
 Return ONLY a valid JSON object matching this schema:
 {
-  "title": "Mastering ${subtopic} in ${topic}",
-  "overview": "Clear 2-3 paragraph foundational and mechanical breakdown of ${subtopic}.",
+  "title": "Mastering ${trimmedSubtopic} in ${trimmedTopic}",
+  "overview": "Clear 2-3 paragraph foundational and mechanical breakdown of ${trimmedSubtopic}.",
   "richText": "Detailed explanatory lesson text including architecture, mechanisms, and production best practices.",
   "keyTakeaways": ["Point 1", "Point 2", "Point 3", "Point 4"],
-  "examples": "Working practical code snippet or design example demonstrating ${subtopic}.",
+  "examples": "Working practical code snippet or design example demonstrating ${trimmedSubtopic}.",
   "resources": [
     {
-      "title": "${subtopic} Full Tutorial",
+      "title": "${trimmedSubtopic} Full Tutorial",
       "type": "youtube",
-      "url": "https://www.youtube.com/results?search_query=${encodeURIComponent(topic + ' ' + subtopic + ' tutorial')}",
-      "description": "Comprehensive video breakdown of ${subtopic} with live implementation."
-    },
-    {
-      "title": "${topic} Official Documentation & Specs",
-      "type": "doc",
-      "url": "https://docs.oracle.com/en/java/",
-      "description": "Authoritative standard specifications and design guidelines."
-    },
-    {
-      "title": "Production ${subtopic} Course",
-      "type": "udemy",
-      "url": "https://www.udemy.com/courses/search/?q=${encodeURIComponent(topic + ' ' + subtopic)}",
-      "description": "In-depth video course with real-world projects."
+      "url": "https://www.youtube.com/results?search_query=${encodeURIComponent(trimmedTopic + ' ' + trimmedSubtopic + ' tutorial')}",
+      "description": "Comprehensive video breakdown of ${trimmedSubtopic} with live implementation."
     }
   ]
 }`;
 
-    try {
-      const aiResponse = await groqRequest({ prompt });
-      const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        res.json({
-          domain: domain || 'Computer Science',
-          topic,
-          subtopic,
-          ...parsed,
-        });
-        return;
-      }
-    } catch (err) {
-      console.warn('AI note generation failed, using structured template fallback:', err);
+  let parsed: any = null;
+  try {
+    const aiResponse = await groqRequest({ prompt });
+    const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      parsed = JSON.parse(jsonMatch[0]);
     }
+  } catch (err) {
+    console.warn('AI note generation failed, using structured template fallback:', err);
+  }
 
-    // Structured fallback
-    res.json({
-      domain: domain || 'Computer Science',
-      topic,
-      subtopic,
-      title: `Mastery Guide: ${subtopic} in ${topic}`,
-      overview: `${subtopic} is an indispensable core concept within ${topic}. Understanding its foundational mechanisms, performance characteristics, and industry patterns enables resilient system implementation.`,
-      richText: `### 1. Conceptual Foundation\n${subtopic} establishes the core structural rules governing this module.\n\n### 2. Architectural Mechanisms\nWhen executed in production environments, ${subtopic} ensures predictable resource utilization and prevents runtime anti-patterns.\n\n### 3. Industry Best Practices\n- Verify boundary cases and null safety.\n- Profile memory and CPU allocations under simulated peak loads.\n- Follow clean design principles to maintain modularity.`,
+  if (!parsed) {
+    parsed = {
+      title: `Mastery Guide: ${trimmedSubtopic} in ${trimmedTopic}`,
+      overview: `${trimmedSubtopic} is an indispensable core concept within ${trimmedTopic}. Understanding its foundational mechanisms, performance characteristics, and industry patterns enables resilient system implementation.`,
+      richText: `### 1. Conceptual Foundation\n${trimmedSubtopic} establishes the core structural rules governing this module.\n\n### 2. Architectural Mechanisms\nWhen executed in production environments, ${trimmedSubtopic} ensures predictable resource utilization and prevents runtime anti-patterns.\n\n### 3. Industry Best Practices\n- Verify boundary cases and null safety.\n- Profile memory and CPU allocations under simulated peak loads.\n- Follow clean design principles to maintain modularity.`,
       keyTakeaways: [
         `Master fundamental principles before applying optimizations.`,
         `Recognize common edge cases and implement graceful fallbacks.`,
         `Maintain modular separation of concerns.`,
         `Write automated unit tests verifying contract invariants.`,
       ],
-      examples: `// Practical demonstration for ${subtopic}\npublic class ${subtopic.replace(/[^a-zA-Z]/g, '')}Example {\n    public static void main(String[] args) {\n        System.out.println("Executing verified pattern for: ${subtopic}");\n    }\n}`,
+      examples: `// Practical demonstration for ${trimmedSubtopic}\npublic class ${trimmedSubtopic.replace(/[^a-zA-Z]/g, '')}Example {\n    public static void main(String[] args) {\n        System.out.println("Executing verified pattern for: ${trimmedSubtopic}");\n    }\n}`,
       resources: [
         {
-          title: `${subtopic} Complete Video Walkthrough`,
+          title: `${trimmedSubtopic} Complete Video Walkthrough`,
           type: 'youtube',
-          url: `https://www.youtube.com/results?search_query=${encodeURIComponent(topic + ' ' + subtopic + ' tutorial')}`,
-          description: `Detailed video guide explaining ${subtopic} step-by-step.`,
-        },
-        {
-          title: `${topic} Architectural Reference`,
-          type: 'doc',
-          url: 'https://docs.oracle.com/en/java/',
-          description: 'Official specifications and language reference.',
+          url: `https://www.youtube.com/results?search_query=${encodeURIComponent(trimmedTopic + ' ' + trimmedSubtopic + ' tutorial')}`,
+          description: `Detailed video guide explaining ${trimmedSubtopic} step-by-step.`,
         },
       ],
-    });
-  })
-);
+    };
+  }
 
-// POST /api/admin/notes/upload - Bulk import topic notes via Excel or CSV
-router.post(
-  '/upload',
-  protect,
-  upload.single('file'),
-  asyncHandler(async (req: AuthRequest, res) => {
-    if (!canManageNotes(req)) {
-      res.status(403).json({ message: 'Unauthorized. Admin permission required.' });
-      return;
-    }
+  const responsePayload = {
+    domain: domain || 'Computer Science',
+    topic: trimmedTopic,
+    subtopic: trimmedSubtopic,
+    title: parsed.title || `Mastery Guide: ${trimmedSubtopic} in ${trimmedTopic}`,
+    overview: parsed.overview || '',
+    richText: parsed.richText || '',
+    keyTakeaways: parsed.keyTakeaways || [],
+    examples: parsed.examples || '',
+    resources: parsed.resources || [],
+    notes: {
+      title: parsed.title || `Mastery Guide: ${trimmedSubtopic} in ${trimmedTopic}`,
+      content: parsed.richText || parsed.overview || '',
+      keyTakeaways: parsed.keyTakeaways || [],
+      codeExamples: parsed.examples ? [parsed.examples] : [],
+      resources: parsed.resources || [],
+    },
+  };
+
+  res.json(responsePayload);
+});
+
+router.post('/ai-generate', protect, handleAiGenerate);
+router.post('/generate-ai', protect, handleAiGenerate);
+
+// POST /api/admin/notes/upload and /bulk-upload - Bulk import topic notes via Excel or CSV
+const handleUpload = asyncHandler(async (req: AuthRequest, res) => {
+  if (!canManageNotes(req)) {
+    res.status(403).json({ message: 'Unauthorized. Admin permission required.' });
+    return;
+  }
 
     if (!req.file) {
       res.status(400).json({ message: 'Please upload an Excel (.xlsx, .xls) or CSV file.' });
@@ -339,8 +358,10 @@ router.post(
       console.error('Notes upload error:', err);
       res.status(400).json({ message: err.message || 'Failed to process notes file.' });
     }
-  })
-);
+});
+
+router.post('/upload', protect, upload.single('file'), handleUpload);
+router.post('/bulk-upload', protect, upload.single('file'), handleUpload);
 
 // GET /api/admin/notes/template - Download starter template for Excel or CSV
 router.get(

@@ -2,6 +2,7 @@ import express from 'express';
 import asyncHandler from 'express-async-handler';
 import { protect } from '../middleware/auth';
 import { QuestionBank, QuestionInterviewSession, StudentAnswer, AnswerAnalysis, GeneratedQuestion } from '../models/questionBank';
+import CareerTwinMemory from '../models/careerTwinMemory';
 import { questionAnalysisService } from '../services/questionAnalysis';
 import { interviewSessionService } from '../services/interviewSession';
 import multer from 'multer';
@@ -787,13 +788,25 @@ router.get('/interview/report/:sessionId', protect, asyncHandler(async (req: Aut
 
   const answers = await StudentAnswer.find({ sessionId: req.params.sessionId }).populate('questionId', 'question topic field difficulty');
 
+  // Fetch Career Twin weakness remediations
+  const twinDoc = await CareerTwinMemory.findOne({
+    $or: [{ userId: req.user._id }, { user: req.user._id }]
+  }).lean();
+
+  const remediations = (session.finalReport as any)?.weaknessRemediations || (twinDoc as any)?.weaknessRemediations || [];
+  const finalRemark = (session.finalReport as any)?.finalRemark || (session.finalReport as any)?.aiRemark || `Candidate completed technical assessment in ${session.careerDomain || session.field}.`;
+
   res.json({
     session,
-    finalReport: session.finalReport || {
-      overallScore: session.competencies?.overall || 0,
-      competencies: session.competencies,
-      strengths: session.strengths || [],
-      weaknesses: session.weaknesses || [],
+    finalReport: {
+      ...(session.finalReport || {}),
+      overallScore: session.competencies?.overall || (session.finalReport as any)?.overallScore || 0,
+      competencies: session.competencies || (session.finalReport as any)?.competencies,
+      strengths: session.strengths || (session.finalReport as any)?.strengths || [],
+      weaknesses: session.weaknesses || (session.finalReport as any)?.weaknesses || [],
+      finalRemark,
+      aiRemark: finalRemark,
+      weaknessRemediations: remediations,
     },
     answers,
     questionsAsked: answers.length,
@@ -811,6 +824,8 @@ router.get('/interview/report/:sessionId', protect, asyncHandler(async (req: Aut
     difficultyProgression: session.difficultyProgression || [],
     strengthAreas: session.strengths?.slice(0, 6) || [],
     weakAreas: session.weaknesses?.slice(0, 6) || [],
+    weaknessRemediations: remediations,
+    myImprovementPlan: remediations,
   });
 }));
 

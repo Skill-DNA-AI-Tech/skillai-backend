@@ -190,6 +190,8 @@ router.post(
       qrCode,
       verificationUrl,
       expiryDate,
+      adminRemark: (req.body?.adminRemark || req.body?.officialRemark || '').trim(),
+      officialRemark: (req.body?.officialRemark || req.body?.adminRemark || '').trim(),
       isActive: true,
     });
 
@@ -245,26 +247,6 @@ router.get(
   })
 );
 
-// Get specific certificate by ID
-router.get(
-  '/:certificateId',
-  asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { certificateId } = req.params;
-
-    const certificate = await Certificate.findOne({
-      certificateId,
-      isActive: true,
-    });
-
-    if (!certificate) {
-      res.status(404).json({ error: 'Certificate not found' });
-      return;
-    }
-
-    res.status(200).json(certificate);
-  })
-);
-
 // GET /api/certificates/verify/:certificateId - Public verification endpoint (No auth required)
 router.get(
   '/verify/:certificateId',
@@ -314,6 +296,8 @@ router.get(
         qrCode: certificate.qrCode,
         issuedByName: certificate.issuedByName || 'SkillDNA AI Certification Authority',
         adminSignatureBase64: certificate.adminSignatureBase64,
+        adminRemark: certificate.adminRemark || certificate.officialRemark || '',
+        officialRemark: certificate.officialRemark || certificate.adminRemark || '',
         template,
       },
     });
@@ -994,6 +978,30 @@ router.post(
       message: 'Certificate regenerated and updated with active template successfully',
       certificate,
     });
+  })
+);
+
+// GET specific certificate by ID (mounted at the bottom to avoid shadowing literal routes)
+router.get(
+  '/:certificateId',
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    const { certificateId } = req.params;
+
+    const query: any = { isActive: true };
+    if (certificateId.match(/^[0-9a-fA-F]{24}$/)) {
+      query.$or = [{ certificateId }, { _id: certificateId }];
+    } else {
+      query.certificateId = certificateId;
+    }
+
+    const certificate = await Certificate.findOne(query);
+
+    if (!certificate) {
+      res.status(404).json({ error: 'Certificate not found' });
+      return;
+    }
+
+    res.status(200).json(certificate);
   })
 );
 

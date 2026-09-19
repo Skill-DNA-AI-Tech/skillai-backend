@@ -35,6 +35,8 @@ export interface ICertificate extends Document {
   issuedBy?: mongoose.Types.ObjectId;
   issuedByName?: string;
   adminSignatureBase64?: string;
+  adminRemark?: string;
+  officialRemark?: string;
   isActive: boolean;
 }
 
@@ -88,6 +90,8 @@ const certificateSchema = new Schema<ICertificate>(
     issuedBy: { type: Schema.Types.ObjectId, ref: 'User' },
     issuedByName: { type: String },
     adminSignatureBase64: { type: String },
+    adminRemark: { type: String, default: '' },
+    officialRemark: { type: String, default: '' },
     isActive: { type: Boolean, default: true },
   },
   { timestamps: true, collection: 'certificates' }

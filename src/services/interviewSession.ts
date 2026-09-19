@@ -27,6 +27,102 @@ export function normalizeDomain(rawDomain?: string): string {
   return rawDomain;
 }
 
+export function generateWeaknessRemediation(weakConcept: string, domain: string, score: number, targetRole: string) {
+  const safeConcept = weakConcept.trim();
+  const safeDomain = (domain || 'Computer Science').trim();
+  
+  const googleSearchUrl = `https://www.google.com/search?q=${encodeURIComponent(safeConcept + ' ' + safeDomain + ' interview guide tutorial documentation')}`;
+  const youtubeSearchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(safeConcept + ' ' + safeDomain + ' concept explained crash course')}`;
+
+  const simpleExplanation = `At its core, ${safeConcept} is a fundamental building block in ${safeDomain}. In production applications and professional workflows, it governs how system components interact, maintain state, and handle operational scale. Understanding ${safeConcept} empowers you to make defensible architectural choices with high reliability.`;
+
+  const importantConcepts = [
+    `Foundational Definition: What ${safeConcept} accomplishes in production environments.`,
+    `Mechanisms & State Lifecycle: Internal execution model and lifecycle guarantees.`,
+    `Trade-offs & Edge Cases: Performance, concurrency, and common failure modes when using ${safeConcept}.`,
+    `Industry Best Practices: Clean code patterns, error handling, and unit testing strategies.`
+  ];
+
+  const examples = `// Production Implementation Example for ${safeConcept}\n// Key takeaway: Validate boundary conditions, handle asynchronous failures, and log errors predictably.\nfunction handleConceptWorkflow(input: any) {\n  if (!input) throw new Error("Invalid parameters for ${safeConcept}");\n  // Execute core algorithmic or domain-specific transformation\n  return { success: true, processedConcept: "${safeConcept}", timestamp: Date.now() };\n}`;
+
+  const commonInterviewQuestions = [
+    `1. Can you explain the core purpose of ${safeConcept} and when you would choose it over alternatives?`,
+    `2. What are the common pitfalls or anti-patterns developers encounter with ${safeConcept}?`,
+    `3. How would you debug or optimize a performance bottleneck caused by ${safeConcept}?`
+  ];
+
+  const practiceQuestions = [
+    {
+      question: `Define ${safeConcept} and explain why it is critical in ${safeDomain}.`,
+      answer: `${safeConcept} enables structured, modular architecture by separating concerns and guaranteeing predictable behavior under load. In interviews, emphasize both the technical mechanism and the practical reliability benefit.`,
+      difficulty: 'Basic'
+    },
+    {
+      question: `What are two common trade-offs or limitations associated with ${safeConcept}?`,
+      answer: `Trade-offs typically include increased initial architectural complexity and memory overhead. Mitigate these through careful profiling and following defensive coding conventions.`,
+      difficulty: 'Intermediate'
+    },
+    {
+      question: `Walk through how you would architect a solution utilizing ${safeConcept} for high concurrency.`,
+      answer: `Discuss thread safety, stateless processing, horizontal scale, caching strategies, and robust retry mechanisms with exponential backoff.`,
+      difficulty: 'Advanced'
+    },
+    {
+      question: `How would you test and validate that your implementation of ${safeConcept} handles failure gracefully?`,
+      answer: `Use unit tests for edge cases, integration tests with mocks for dependent services, and chaos testing to observe behavior under degraded conditions.`,
+      difficulty: 'Intermediate'
+    },
+    {
+      question: `If a junior engineer misused ${safeConcept} causing production latency, what code review feedback would you provide?`,
+      answer: `Explain the root cause of the latency, provide an optimized code snippet with benchmark comparisons, and recommend best-practice documentation.`,
+      difficulty: 'Advanced'
+    }
+  ];
+
+  const improvementTips = [
+    `Always start your answer with a one-sentence high-level summary before diving into low-level details.`,
+    `Mention real-world metrics, trade-offs, and failure handling when explaining ${safeConcept}.`,
+    `Practice writing clean syntactical code on a whiteboard or blank editor without auto-complete.`
+  ];
+
+  return {
+    concept: safeConcept,
+    topic: safeConcept,
+    domain: safeDomain,
+    score,
+    diagnostic: `Identified as a targeted growth area during technical assessment (overall score: ${score}%). Focused reinforcement will elevate candidate to enterprise interview readiness.`,
+    simpleExplanation,
+    importantConcepts,
+    examples,
+    commonInterviewQuestions,
+    practiceQuestions,
+    improvementTips,
+    resources: {
+      googleSearchUrl,
+      youtubeSearchUrl,
+      searchQuery: `${safeConcept} ${safeDomain}`,
+      youtubeQuery: `${safeConcept} ${safeDomain}`,
+    },
+    youtubeResources: [
+      {
+        title: `${safeConcept} Concept Crash Course & Interview Deep Dive`,
+        url: youtubeSearchUrl,
+        channel: `${safeDomain} Engineering Academy`,
+      },
+    ],
+    externalResources: [
+      {
+        title: `${safeConcept} Documentation & Practice Guide`,
+        url: googleSearchUrl,
+        platform: 'Google & Official Developer Network',
+      },
+    ],
+    reassessmentAvailable: true,
+    resolved: false,
+    lastAssessedAt: new Date(),
+  };
+}
+
 export const interviewSessionService = {
   // Create personalized adaptive interview session (10-15 questions)
   createSession: async (payload: {
@@ -518,6 +614,24 @@ export const interviewSessionService = {
     // 75% Passing Standard Rule (Backend Enforced)
     const passStatus: 'PASS' | 'FAIL' = avgOverall >= 75 ? 'PASS' : 'FAIL';
 
+    // AI-generated professional final remark
+    const sessionDomain = session.careerDomain || session.field || 'Software Engineering';
+    const aiRemark = `Candidate demonstrated ${
+      avgOverall >= 85 ? 'outstanding distinction and deep practical' :
+      avgOverall >= 75 ? 'solid professional and job-ready' :
+      avgOverall >= 60 ? 'promising foundational but developing' :
+      'foundational novice'
+    } competence across ${sessionDomain}. ${
+      distinctStrengths.length > 0 ? `Demonstrated notable strengths in ${distinctStrengths.join(', ')}. ` : ''
+    }${
+      distinctWeaknesses.length > 0 ? `To attain peak enterprise readiness, prioritize targeted practice on: ${distinctWeaknesses.join(', ')}. Comprehensive study notes and mini-reassessments have been generated.` : 'Candidate demonstrates ready capability for professional role placement.'
+    }`;
+
+    // Build comprehensive weakness remediations (Notes, Resources, 5 Practice Questions)
+    const interviewRemediations = distinctWeaknesses.map(weakConcept =>
+      generateWeaknessRemediation(weakConcept, sessionDomain, avgOverall, session.targetRole || 'Specialist')
+    );
+
     const reportData = {
       overallScore: avgOverall,
       passStatus,
@@ -531,7 +645,7 @@ export const interviewSessionService = {
         overall: avgOverall,
       },
       readinessStatus,
-      careerDomain: session.careerDomain || session.field,
+      careerDomain: sessionDomain,
       targetRole: session.targetRole || 'Specialist',
       questionsAttempted: answers.length,
       answerCounts: session.answerCounts,
@@ -539,6 +653,10 @@ export const interviewSessionService = {
       difficultyProgression: session.difficultyProgression || [],
       strengths: distinctStrengths,
       weaknesses: distinctWeaknesses,
+      finalRemark: aiRemark,
+      aiRemark,
+      interviewerRemark: aiRemark,
+      weaknessRemediations: interviewRemediations,
       recommendations: distinctWeaknesses.map(w => `Focus practice on ${w} using structured problems and targeted domain tutorials.`),
       completedAt: new Date(),
     };
@@ -678,39 +796,6 @@ export const interviewSessionService = {
       const twinDoc = await CareerTwinMemory.findOne({
         $or: [{ userId: studentId }, { user: studentId }]
       });
-
-      const interviewRemediations = distinctWeaknesses.map(weakConcept => ({
-        concept: weakConcept,
-        topic: session.topic || weakConcept,
-        domain: session.careerDomain || session.field,
-        score: avgOverall,
-        diagnostic: `Identified as a critical weak point during technical mock interview evaluation (overall score: ${avgOverall}%).`,
-        personalizedNotes: `### Interview Concept Mastery: ${weakConcept}\nTo confidently articulate ${weakConcept} in technical interviews:\n1. Clearly state the core definition and system architecture role.\n2. Detail trade-offs, edge cases, and typical implementation challenges.\n3. Practice explaining the concept out loud using concise technical terminology.`,
-        youtubeResources: [
-          {
-            title: `${weakConcept} Technical Interview Questions & Answers`,
-            url: `https://www.youtube.com/results?search_query=${encodeURIComponent(weakConcept + ' interview questions deep dive')}`,
-            channel: 'Tech Primers / Engineering Digest',
-          },
-        ],
-        externalResources: [
-          {
-            title: `${weakConcept} Architecture Guide & Documentation`,
-            url: `https://www.google.com/search?q=${encodeURIComponent(weakConcept + ' architecture documentation guide')}`,
-            platform: 'System Design / Official Guide',
-          },
-        ],
-        examples: `// Key architectural pattern and syntax for ${weakConcept}\n// Ensure fault tolerance and correct exception handling.`,
-        practiceQuestions: [
-          {
-            question: `How would you explain the internal mechanism of ${weakConcept} to a hiring manager?`,
-            answer: `Focus on how data flows, memory allocation, and concurrency guarantees.`,
-          },
-        ],
-        reassessmentAvailable: true,
-        resolved: false,
-        lastAssessedAt: new Date(),
-      }));
 
       if (twinDoc) {
         twinDoc.domain = session.careerDomain || session.field;
