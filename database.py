@@ -59,11 +59,12 @@ async def init_db():
             })
             logger.info(f"Seeded super admin account: {super_email}")
         else:
-            # Ensure the password and role are correct
-            await admins_collection.update_one(
-                {"email": super_email},
-                {"$set": {"hashed_password": hashed_pass, "role": "MAIN_ADMIN"}}
-            )
-            logger.info(f"Verified and updated super admin credentials: {super_email}")
+            # Preserve existing administrator password; only assign default MAIN_ADMIN role if missing
+            if not super_admin.get("role"):
+                await admins_collection.update_one(
+                    {"email": super_email},
+                    {"$set": {"role": "MAIN_ADMIN"}}
+                )
+            logger.info(f"Verified existing super admin account (credentials preserved): {super_email}")
     except Exception as e:
         logger.error(f"Error initializing database indexes / seeding super admin: {e}")

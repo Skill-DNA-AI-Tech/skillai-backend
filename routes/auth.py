@@ -80,7 +80,7 @@ async def register(payload: StudentRegister, request: Request):
 
     # Generate 6-digit verification OTP
     otp = f"{sys_random.randint(100000, 999999)}"
-    logger.info(f"*** DEBUG: Generated Student Registration OTP for {email}: {otp} ***")
+    logger.info(f"Generated secure Student Registration OTP for {email}")
     otp_hash = hashlib.sha256(otp.encode("utf-8")).hexdigest()
     expires_at = datetime.utcnow() + timedelta(minutes=10)
 
@@ -97,12 +97,10 @@ async def register(payload: StudentRegister, request: Request):
     # Dispatch verification email via Resend
     email_sent = await send_otp_email(to_email=email, otp=otp, purpose="email_verification")
     if not email_sent:
-        logger.warning(f"Failed to dispatch registration verification email to {email}. Proceeding in local debug mode with fallback OTP '123456'.")
-        fallback_otp = "123456"
-        fallback_hash = hashlib.sha256(fallback_otp.encode("utf-8")).hexdigest()
-        await otp_logs_collection.update_one(
-            {"_id": otp_result.inserted_id},
-            {"$set": {"otp_hash": fallback_hash}}
+        logger.error(f"Failed to dispatch registration verification email to {email}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send verification code email. Please check your email configuration or try again later."
         )
 
     return RegisterResponse(
@@ -410,7 +408,7 @@ async def forgot_password(payload: ForgotPasswordRequest):
 
     # Generate 6-digit OTP
     otp = f"{sys_random.randint(100000, 999999)}"
-    logger.info(f"*** DEBUG: Generated Student Reset Password OTP for {email}: {otp} ***")
+    logger.info(f"Generated secure Student Reset Password OTP for {email}")
     otp_hash = hashlib.sha256(otp.encode("utf-8")).hexdigest()
     
     # Set expiration (10 minutes)
@@ -429,12 +427,10 @@ async def forgot_password(payload: ForgotPasswordRequest):
     # Dispatch email via Resend
     email_sent = await send_otp_email(to_email=email, otp=otp, purpose="reset_password")
     if not email_sent:
-        logger.warning(f"Failed to dispatch forgot password email to {email}. Proceeding in local debug mode with fallback OTP '123456'.")
-        fallback_otp = "123456"
-        fallback_hash = hashlib.sha256(fallback_otp.encode("utf-8")).hexdigest()
-        await otp_logs_collection.update_one(
-            {"_id": otp_result.inserted_id},
-            {"$set": {"otp_hash": fallback_hash}}
+        logger.error(f"Failed to dispatch forgot password email to {email}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send password reset verification code email. Please try again later."
         )
 
     return MessageResponse(message="Verification OTP code has been sent to your email address.")
