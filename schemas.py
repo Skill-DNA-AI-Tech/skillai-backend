@@ -35,7 +35,9 @@ class UserResponse(BaseModel):
     name: str
     email: EmailStr
     role: str
-    created_at: datetime
+    isTestUser: Optional[bool] = False
+    isPreProductionUser: Optional[bool] = False
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -43,7 +45,7 @@ class UserResponse(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    role: str
+    role: str = "student"
     user: UserResponse
 
 class AdminResponse(BaseModel):

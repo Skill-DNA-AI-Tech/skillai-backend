@@ -37,8 +37,11 @@ async def admin_password_login(payload: AdminLoginRequest, request: Request):
     user_agent = request.headers.get("user-agent")
 
     admin = await admins_collection.find_one({"email": email})
+    if not admin:
+        admin = await users_collection.find_one({"email": email, "role": {"$in": ["MAIN_ADMIN", "ADMIN", "admin", "SUPER_ADMIN"]}})
     
-    if not admin or not verify_password(payload.password, admin["hashed_password"]):
+    password_hash = admin.get("hashed_password") or admin.get("password") if admin else None
+    if not admin or not password_hash or not verify_password(payload.password, password_hash):
         # Log failure
         await login_logs_collection.insert_one({
             "email": email,
@@ -55,12 +58,12 @@ async def admin_password_login(payload: AdminLoginRequest, request: Request):
 
     # Credentials valid, generate OTP
     otp = f"{sys_random.randint(100000, 999999)}"
-    logger.info(f"*** DEBUG: Generated Admin Login OTP for {email}: {otp} ***")
+    logger.info(f"Generated secure Admin Login OTP for {email}")
     otp_hash = hashlib.sha256(otp.encode("utf-8")).hexdigest()
     expires_at = datetime.utcnow() + timedelta(minutes=10)
 
     # Store OTP Log
-    await otp_logs_collection.insert_one({
+    otp_result = await otp_logs_collection.insert_one({
         "email": email,
         "otp_hash": otp_hash,
         "purpose": "admin_login",
@@ -72,7 +75,11 @@ async def admin_password_login(payload: AdminLoginRequest, request: Request):
     # Dispatch OTP email via Resend
     email_sent = await send_otp_email(to_email=email, otp=otp, purpose="admin_login")
     if not email_sent:
-        logger.warning(f"Failed to dispatch OTP email to {email}. Proceeding in local debug mode.")
+        logger.error(f"Failed to dispatch admin login OTP email to {email}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send admin verification code email. Please check your email configuration or contact support."
+        )
 
     logger.info(f"Admin login step 1 success. OTP sent to {email}")
     return AdminLoginResponse(
@@ -132,17 +139,19 @@ async def admin_otp_verify(payload: AdminVerifyOTPRequest, request: Request):
         {"$set": {"verified": True}}
     )
 
+    admin_role = admin.get("role") or "ADMIN"
+
     # Generate Admin JWT
     token_data = {
         "sub": email,
-        "role": "admin"
+        "role": admin_role
     }
     access_token = create_access_token(data=token_data)
 
     # Log login success
     await login_logs_collection.insert_one({
         "email": email,
-        "role": "admin",
+        "role": admin_role,
         "ip_address": ip_address,
         "user_agent": user_agent,
         "status": "success",
@@ -152,10 +161,10 @@ async def admin_otp_verify(payload: AdminVerifyOTPRequest, request: Request):
     admin_response = AdminResponse(
         id=str(admin["_id"]),
         email=admin["email"],
-        role="admin",
+        role=admin_role,
         created_at=admin["created_at"]
     )
-    logger.info(f"Admin verified successfully. JWT issued for {email}")
+    logger.info(f"Admin verified successfully. JWT issued for {email} with role {admin_role}")
     return AdminTokenResponse(access_token=access_token, admin=admin_response)
 
 @router.get("/me", response_model=AdminResponse)
@@ -172,9 +181,10 @@ async def get_admin_me(current_admin: dict = Depends(get_current_admin)):
             detail="Admin not found."
         )
         
+    admin_role = admin.get("role") or "ADMIN"
     return AdminResponse(
         id=str(admin["_id"]),
         email=admin["email"],
-        role="admin",
+        role=admin_role,
         created_at=admin["created_at"]
     )
