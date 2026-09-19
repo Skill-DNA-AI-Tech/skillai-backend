@@ -37,8 +37,11 @@ async def admin_password_login(payload: AdminLoginRequest, request: Request):
     user_agent = request.headers.get("user-agent")
 
     admin = await admins_collection.find_one({"email": email})
+    if not admin:
+        admin = await users_collection.find_one({"email": email, "role": {"$in": ["MAIN_ADMIN", "ADMIN", "admin", "SUPER_ADMIN"]}})
     
-    if not admin or not verify_password(payload.password, admin["hashed_password"]):
+    password_hash = admin.get("hashed_password") or admin.get("password") if admin else None
+    if not admin or not password_hash or not verify_password(payload.password, password_hash):
         # Log failure
         await login_logs_collection.insert_one({
             "email": email,

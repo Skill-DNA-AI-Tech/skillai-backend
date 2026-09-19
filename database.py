@@ -8,15 +8,15 @@ logger = logging.getLogger(__name__)
 client = AsyncIOMotorClient(settings.mongodb_uri)
 
 # Select Database
-# Extract database name from URI if present, default to 'skilldna_auth'
+# Extract database name from URI if present, fallback to 'test' (single unified database)
 try:
     default_db = client.get_default_database()
-    db_name = default_db.name if default_db else 'skilldna_auth'
+    db_name = default_db.name if default_db else 'test'
 except Exception:
-    db_name = 'skilldna_auth'
+    db_name = 'test'
 
-if db_name == 'admin' or not db_name:
-    db_name = 'skilldna_auth'
+if not db_name or db_name == 'admin':
+    db_name = 'test'
 
 db = client[db_name]
 
@@ -31,7 +31,7 @@ async def init_db():
     Initialize database indexes:
     - Unique index on user and admin emails
     - TTL index on otp_logs (expires_at) for automatic garbage collection of expired OTPs
-    - Seed a default admin if no admins exist
+    - Verify super admin account exists without deleting real users or existing admins
     """
     try:
         # User unique email index
@@ -41,12 +41,7 @@ async def init_db():
         # OTP logs TTL index (expires_at)
         # expireAfterSeconds=0 means the document expires at the exact datetime of expires_at
         await otp_logs_collection.create_index("expires_at", expireAfterSeconds=0)
-        logger.info("MongoDB indexes created successfully.")
-
-        # Ensure only the specified super admin exists: delete other admins
-        delete_result = await admins_collection.delete_many({"email": {"$ne": settings.super_admin_email}})
-        if delete_result.deleted_count > 0:
-            logger.info(f"Deleted {delete_result.deleted_count} other admin accounts to maintain super admin exclusivity.")
+        logger.info("MongoDB indexes created successfully on unified database: %s", db_name)
 
         from auth_handler import get_password_hash
         from datetime import datetime
@@ -59,20 +54,16 @@ async def init_db():
             await admins_collection.insert_one({
                 "email": super_email,
                 "hashed_password": hashed_pass,
+                "role": "MAIN_ADMIN",
                 "created_at": datetime.utcnow()
             })
             logger.info(f"Seeded super admin account: {super_email}")
         else:
-            # Ensure the password is correct
+            # Ensure the password and role are correct
             await admins_collection.update_one(
                 {"email": super_email},
-                {"$set": {"hashed_password": hashed_pass}}
+                {"$set": {"hashed_password": hashed_pass, "role": "MAIN_ADMIN"}}
             )
-            logger.info(f"Verified and updated super admin password: {super_email}")
-
-        # Clean up super admin email from users collection to prevent role overlap
-        clean_user = await users_collection.delete_many({"email": super_email})
-        if clean_user.deleted_count > 0:
-            logger.info(f"Removed conflicting student account for super admin: {super_email}")
+            logger.info(f"Verified and updated super admin credentials: {super_email}")
     except Exception as e:
-        logger.error(f"Error initializing database / seeding admin: {e}")
+        logger.error(f"Error initializing database indexes / seeding super admin: {e}")

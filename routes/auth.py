@@ -63,11 +63,15 @@ async def register(payload: StudentRegister, request: Request):
     hashed_password = get_password_hash(payload.password)
     new_user = {
         "name": payload.name,
+        "full_name": payload.name,
         "email": email,
         "hashed_password": hashed_password,
+        "password": hashed_password,
         "google_id": None,
         "role": "student",
         "is_verified": False,
+        "isTestUser": False,
+        "isPreProductionUser": False,
         "created_at": datetime.utcnow()
     }
     
@@ -117,21 +121,30 @@ async def login(payload: StudentLogin, request: Request):
     ip_address = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
 
-    # Check if this email is an admin
-    is_admin = await admins_collection.find_one({"email": email})
-    if is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This account is registered as an administrator. Please log in through the Admin Portal."
-        )
-
+    # Look up account in users or admins collection to support unified database
     user = await users_collection.find_one({"email": email})
-    
-    if not user or not user.get("hashed_password") or not verify_password(payload.password, user["hashed_password"]):
+    if not user:
+        admin_doc = await admins_collection.find_one({"email": email})
+        if admin_doc:
+            user = {
+                "_id": admin_doc["_id"],
+                "name": admin_doc.get("name") or admin_doc.get("full_name") or "Administrator",
+                "email": admin_doc["email"],
+                "role": admin_doc.get("role", "MAIN_ADMIN"),
+                "hashed_password": admin_doc.get("hashed_password"),
+                "password": admin_doc.get("password"),
+                "is_verified": True,
+                "isTestUser": False,
+                "isPreProductionUser": False,
+                "created_at": admin_doc.get("created_at") or datetime.utcnow()
+            }
+
+    password_hash = (user.get("hashed_password") or user.get("password")) if user else None
+    if not user or not password_hash or not verify_password(payload.password, password_hash):
         # Log failure
         await login_logs_collection.insert_one({
             "email": email,
-            "role": "student",
+            "role": user.get("role", "student") if user else "unknown",
             "ip_address": ip_address,
             "user_agent": user_agent,
             "status": "failed",
@@ -142,8 +155,11 @@ async def login(payload: StudentLogin, request: Request):
             detail="Incorrect email or password."
         )
 
-    # Check if student email is verified (skip check for Google OAuth users)
-    if not user.get("is_verified", False) and not user.get("google_id"):
+    user_role = user.get("role", "student")
+    isAdminAccount = user_role in ["MAIN_ADMIN", "ADMIN", "admin", "SUPER_ADMIN", "SUPPORT_TEAM"]
+
+    # Check verification (skip check for Google OAuth or Admin accounts)
+    if not isAdminAccount and not user.get("is_verified", False) and not user.get("google_id"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Your email address has not been verified yet. Please verify your email first."
@@ -152,15 +168,15 @@ async def login(payload: StudentLogin, request: Request):
     # Generate JWT
     token_data = {
         "sub": email,
-        "role": "student",
-        "name": user["name"]
+        "role": user_role,
+        "name": user.get("name", "User")
     }
     access_token = create_access_token(data=token_data)
 
     # Log success
     await login_logs_collection.insert_one({
         "email": email,
-        "role": "student",
+        "role": user_role,
         "ip_address": ip_address,
         "user_agent": user_agent,
         "status": "success",
@@ -169,12 +185,14 @@ async def login(payload: StudentLogin, request: Request):
 
     user_response = UserResponse(
         id=str(user["_id"]),
-        name=user["name"],
+        name=user.get("name", "User"),
         email=user["email"],
-        role=user["role"],
-        created_at=user["created_at"]
+        role=user_role,
+        isTestUser=bool(user.get("isTestUser", False)),
+        isPreProductionUser=bool(user.get("isPreProductionUser", False)),
+        created_at=user.get("created_at")
     )
-    return TokenResponse(access_token=access_token, role=user.get("role", "student"), user=user_response)
+    return TokenResponse(access_token=access_token, role=user_role, user=user_response)
 
 @router.post("/verify-email", response_model=TokenResponse)
 async def verify_email(payload: VerifyEmailRequest, request: Request):
@@ -244,10 +262,12 @@ async def verify_email(payload: VerifyEmailRequest, request: Request):
 
     user_response = UserResponse(
         id=str(user["_id"]),
-        name=user["name"],
+        name=user.get("name", "User"),
         email=user["email"],
-        role=user["role"],
-        created_at=user["created_at"]
+        role=user.get("role", "student"),
+        isTestUser=bool(user.get("isTestUser", False)),
+        isPreProductionUser=bool(user.get("isPreProductionUser", False)),
+        created_at=user.get("created_at")
     )
     return TokenResponse(access_token=access_token, role=user.get("role", "student"), user=user_response)
 
@@ -290,34 +310,41 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
 
     email = token_info.get("email").lower()
     
-    # Check if this email is an admin
-    is_admin = await admins_collection.find_one({"email": email})
-    if is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This account is registered as an administrator. Please log in through the Admin Portal."
-        )
-
     name = token_info.get("name", email.split("@")[0])
     google_id = token_info.get("sub")
 
     # Find or create user
     user = await users_collection.find_one({"email": email})
+    admin_doc = await admins_collection.find_one({"email": email})
     
-    if not user:
+    if not user and not admin_doc:
         # Create user automatically
         user = {
             "name": name,
+            "full_name": name,
             "email": email,
             "google_id": google_id,
             "hashed_password": None,
             "role": "student",
             "is_verified": True,
+            "isTestUser": False,
+            "isPreProductionUser": False,
             "created_at": datetime.utcnow()
         }
         result = await users_collection.insert_one(user)
         user["_id"] = result.inserted_id
         logger.info(f"Automatically registered Google user: {email}")
+    elif not user and admin_doc:
+        user = {
+            "_id": admin_doc["_id"],
+            "name": admin_doc.get("name") or admin_doc.get("full_name") or name,
+            "email": admin_doc["email"],
+            "role": admin_doc.get("role", "MAIN_ADMIN"),
+            "is_verified": True,
+            "isTestUser": False,
+            "isPreProductionUser": False,
+            "created_at": admin_doc.get("created_at") or datetime.utcnow()
+        }
     else:
         # User exists; verify/link Google ID and ensure is_verified is True
         update_fields = {}
@@ -335,18 +362,20 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
             )
             logger.info(f"Updated Google credentials/verification for user: {email}")
 
+    user_role = user.get("role", "student")
+
     # Generate JWT
     token_data = {
         "sub": email,
-        "role": "student",
-        "name": user["name"]
+        "role": user_role,
+        "name": user.get("name", name)
     }
     access_token = create_access_token(data=token_data)
 
     # Log success
     await login_logs_collection.insert_one({
         "email": email,
-        "role": "student",
+        "role": user_role,
         "ip_address": ip_address,
         "user_agent": user_agent,
         "status": "success",
@@ -355,12 +384,14 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
 
     user_response = UserResponse(
         id=str(user["_id"]),
-        name=user["name"],
+        name=user.get("name", name),
         email=user["email"],
-        role=user["role"],
-        created_at=user["created_at"]
+        role=user_role,
+        isTestUser=bool(user.get("isTestUser", False)),
+        isPreProductionUser=bool(user.get("isPreProductionUser", False)),
+        created_at=user.get("created_at")
     )
-    return TokenResponse(access_token=access_token, role=user.get("role", "student"), user=user_response)
+    return TokenResponse(access_token=access_token, role=user_role, user=user_response)
 
 @router.post("/forgot-password", response_model=MessageResponse)
 async def forgot_password(payload: ForgotPasswordRequest):
@@ -441,10 +472,10 @@ async def reset_password(payload: ResetPasswordRequest):
     # Hash new password
     hashed_password = get_password_hash(payload.new_password)
 
-    # Update user password
+    # Update user password in both hashed_password and password for cross-runtime compatibility
     update_result = await users_collection.update_one(
         {"email": email},
-        {"$set": {"hashed_password": hashed_password}}
+        {"$set": {"hashed_password": hashed_password, "password": hashed_password}}
     )
 
     if update_result.modified_count == 0:
@@ -464,6 +495,18 @@ async def get_me(current_user: dict = Depends(get_current_user)):
     email = current_user.get("sub")
     user = await users_collection.find_one({"email": email})
     if not user:
+        admin_doc = await admins_collection.find_one({"email": email})
+        if admin_doc:
+            user = {
+                "_id": admin_doc["_id"],
+                "name": admin_doc.get("name") or admin_doc.get("full_name") or "Administrator",
+                "email": admin_doc["email"],
+                "role": admin_doc.get("role", "MAIN_ADMIN"),
+                "isTestUser": False,
+                "isPreProductionUser": False,
+                "created_at": admin_doc.get("created_at")
+            }
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found."
@@ -471,8 +514,10 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         
     return UserResponse(
         id=str(user["_id"]),
-        name=user["name"],
+        name=user.get("name", "User"),
         email=user["email"],
-        role=user["role"],
-        created_at=user["created_at"]
+        role=user.get("role", "student"),
+        isTestUser=bool(user.get("isTestUser", False)),
+        isPreProductionUser=bool(user.get("isPreProductionUser", False)),
+        created_at=user.get("created_at")
     )
