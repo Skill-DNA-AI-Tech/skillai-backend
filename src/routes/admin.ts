@@ -19,8 +19,13 @@ import Feedback from '../models/feedback';
 import { QuestionBank, QuestionInterviewSession, StudentAnswer } from '../models/questionBank';
 import CareerTwinMemory from '../models/careerTwinMemory';
 import Certificate from '../models/certificate';
+import CertificateTemplate from '../models/certificateTemplate';
 import { normalizeDomain } from '../services/interviewSession';
 import generateToken from '../utils/generateToken';
+import QRCode from 'qrcode';
+import { resolveCurriculum } from '../data/curriculaData';
+import { generateCertificateId } from './certificates';
+import { env } from '../config/env';
 
 const router = express.Router();
 
@@ -194,10 +199,10 @@ router.get('/overview', asyncHandler(async (req, res) => {
     totalCertificates,
     testUsersCount,
   ] = await Promise.all([
-    User.countDocuments(),
-    User.countDocuments(userListQuery(studentRoles)),
-    User.countDocuments(userListQuery(hrAccountRoles)),
-    User.countDocuments({ role: { $in: ['ADMIN', 'admin'] }, status: 'PENDING' }),
+    User.countDocuments({ isTestUser: { $ne: true }, isPreProductionUser: { $ne: true } }),
+    User.countDocuments({ ...userListQuery(studentRoles), isTestUser: { $ne: true }, isPreProductionUser: { $ne: true } }),
+    User.countDocuments({ ...userListQuery(hrAccountRoles), isTestUser: { $ne: true }, isPreProductionUser: { $ne: true } }),
+    User.countDocuments({ role: { $in: ['ADMIN', 'admin'] }, status: 'PENDING', isTestUser: { $ne: true }, isPreProductionUser: { $ne: true } }),
     Company.countDocuments(),
     Profile.countDocuments(),
     Job.countDocuments(),
@@ -264,8 +269,391 @@ router.get('/overview', asyncHandler(async (req, res) => {
 }));
 
 router.get('/students', asyncHandler(async (req, res) => {
-  const students = await Profile.find().populate('user', 'name email emailVerified').sort({ updatedAt: -1 }).limit(200);
+  const students = await Profile.find().populate('user', 'name email emailVerified isTestUser isPreProductionUser testUserId').sort({ updatedAt: -1 }).limit(200);
   res.json(students);
+}));
+
+// GET /api/admin/students/list - Paginated and searchable student directory with profile & certificate counts
+router.get('/students/list', asyncHandler(async (req, res) => {
+  const { search = '', page = 1, limit = 50 } = req.query;
+  const pageNum = Math.max(1, Number(page) || 1);
+  const limitNum = Math.max(1, Math.min(100, Number(limit) || 50));
+  const skip = (pageNum - 1) * limitNum;
+
+  const userQuery: any = {
+    ...userListQuery(studentRoles),
+    isTestUser: { $ne: true },
+    isPreProductionUser: { $ne: true },
+  };
+
+  if (search && String(search).trim()) {
+    const searchRegex = new RegExp(String(search).trim(), 'i');
+    userQuery.$or = [
+      { name: searchRegex },
+      { full_name: searchRegex },
+      { email: searchRegex },
+      { careerDomain: searchRegex },
+    ];
+  }
+
+  const [totalStudents, studentUsers] = await Promise.all([
+    User.countDocuments(userQuery),
+    User.find(userQuery).select('-password -otp.codeHash').sort({ createdAt: -1 }).skip(skip).limit(limitNum),
+  ]);
+
+  const userIds = studentUsers.map((u) => u._id);
+
+  const [profiles, certCounts] = await Promise.all([
+    Profile.find({ user: { $in: userIds } }),
+    Certificate.aggregate([
+      { $match: { studentId: { $in: userIds }, isActive: true } },
+      { $group: { _id: '$studentId', count: { $sum: 1 } } },
+    ]),
+  ]);
+
+  const profileMap = new Map(profiles.map((p) => [p.user.toString(), p]));
+  const certCountMap = new Map(certCounts.map((c) => [c._id.toString(), c.count]));
+
+  const data = studentUsers.map((student) => {
+    const p = profileMap.get(student._id.toString());
+    return {
+      _id: student._id,
+      name: student.name,
+      email: student.email,
+      role: student.role,
+      status: student.status,
+      mobile: student.mobile,
+      careerDomain: student.careerDomain,
+      requiresPasswordChange: student.requiresPasswordChange,
+      createdAt: (student as any).createdAt,
+      career: p?.career || student.careerDomain || 'Software Development',
+      domain: p?.domain || student.careerDomain || 'Computer Science',
+      college: p?.college || 'SkillDNA Partner Institute',
+      degree: p?.degree || 'B.Tech',
+      branch: p?.branch || 'Computer Science & Engineering',
+      activeCurriculum: p?.activeCurriculum,
+      certificateCount: certCountMap.get(student._id.toString()) || 0,
+    };
+  });
+
+  res.json({
+    students: data,
+    total: totalStudents,
+    page: pageNum,
+    totalPages: Math.ceil(totalStudents / limitNum),
+  });
+}));
+
+// POST /api/admin/students - Admin securely creates a new student account
+router.post('/students', asyncHandler(async (req: AuthRequest, res) => {
+  const {
+    name,
+    email,
+    password,
+    career,
+    domain,
+    mobile,
+    college,
+    degree,
+    branch,
+    semester,
+  } = req.body;
+
+  if (!name || !name.trim()) {
+    res.status(400).json({ message: 'Student full name is required.' });
+    return;
+  }
+
+  if (!email || !email.trim()) {
+    res.status(400).json({ message: 'Student email address is required.' });
+    return;
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!emailRegex.test(normalizedEmail)) {
+    res.status(400).json({ message: 'Please provide a valid email address.' });
+    return;
+  }
+
+  if (!password || password.trim().length < 6) {
+    res.status(400).json({ message: 'Temporary password must be at least 6 characters long.' });
+    return;
+  }
+
+  const existingUser = await User.findOne({ email: normalizedEmail });
+  if (existingUser) {
+    res.status(400).json({ message: `An account with email ${normalizedEmail} already exists on the platform.` });
+    return;
+  }
+
+  // Resolve curriculum automatically from career selection
+  const selectedCareer = (career || 'Software Development').trim();
+  const resolvedCurriculum = resolveCurriculum(selectedCareer);
+  const selectedDomain = (domain?.trim()) || resolvedCurriculum.domain || 'Computer Science';
+
+  // 1. Create student User
+  const user = new User({
+    name: name.trim(),
+    full_name: name.trim(),
+    email: normalizedEmail,
+    password: password.trim(), // Will be hashed by User pre-save hook
+    role: 'STUDENT',
+    status: 'ACTIVE',
+    emailVerified: true,
+    requiresPasswordChange: true,
+    careerDomain: selectedDomain,
+    targetRole: resolvedCurriculum.targetRole,
+    mobile: mobile ? mobile.trim() : undefined,
+    approved_by: req.user?._id,
+    approved_at: new Date(),
+  });
+
+  await user.save();
+
+  // 2. Create student Profile with auto-assigned active curriculum
+  const profile = new Profile({
+    user: user._id,
+    name: user.name,
+    email: user.email,
+    mobile: user.mobile || '',
+    degree: (degree || 'B.Tech').trim(),
+    branch: (branch || 'Computer Science & Engineering').trim(),
+    college: (college || 'SkillDNA Partner Institute').trim(),
+    semester: (semester || 'Final Year').trim(),
+    career: selectedCareer,
+    domain: selectedDomain,
+    preferredRoles: [resolvedCurriculum.targetRole],
+    activeCurriculum: {
+      curriculumId: resolvedCurriculum.id,
+      title: resolvedCurriculum.careerName,
+      domain: resolvedCurriculum.domain,
+      totalTopics: resolvedCurriculum.topics.length,
+      masteredTopics: 0,
+    },
+    isProfileCompleted: true,
+  });
+
+  await profile.save();
+
+  // 3. Write immutable audit log
+  await writeAuditLog(req, 'ADMIN_STUDENT_CREATED', 'User', user._id.toString(), {
+    email: user.email,
+    career: selectedCareer,
+    domain: selectedDomain,
+    createdById: req.user?._id,
+    createdByName: req.user?.name,
+  });
+
+  res.status(201).json({
+    message: `Student account created successfully for ${user.name}.`,
+    user: serializeUserAccount(user),
+    profile,
+    temporaryPassword: password.trim(),
+  });
+}));
+
+// POST /api/admin/certificates/issue - Admin creates and issues verified certificate to student
+router.post('/certificates/issue', asyncHandler(async (req: AuthRequest, res) => {
+  const {
+    studentId,
+    careerPath,
+    courseName,
+    overallScore,
+    technicalScore,
+    communicationScore,
+    problemSolvingScore,
+    confidenceScore,
+    sessionsCompleted,
+    interviewReadinessStatus,
+    issueDate,
+    expiryDate,
+    strengths,
+    improvements,
+  } = req.body;
+
+  if (!studentId) {
+    res.status(400).json({ message: 'Student ID is required.' });
+    return;
+  }
+
+  const student = await User.findById(studentId);
+  if (!student) {
+    res.status(404).json({ message: 'Selected student not found.' });
+    return;
+  }
+
+  const certCareerPath = (careerPath || courseName || student.careerDomain || 'Software Development').trim();
+  if (!certCareerPath) {
+    res.status(400).json({ message: 'Career path or course name is required.' });
+    return;
+  }
+
+  // Server-side Score Validation (Must be >= 75%)
+  const numericOverall = Number(overallScore);
+  if (isNaN(numericOverall) || numericOverall < 75 || numericOverall > 100) {
+    res.status(400).json({
+      message: 'Certificate issuance requires a verified overall score of at least 75% (and maximum 100%).',
+    });
+    return;
+  }
+
+  const tech = typeof technicalScore === 'number' ? Math.max(0, Math.min(100, technicalScore)) : numericOverall;
+  const comm = typeof communicationScore === 'number' ? Math.max(0, Math.min(100, communicationScore)) : 80;
+  const prob = typeof problemSolvingScore === 'number' ? Math.max(0, Math.min(100, problemSolvingScore)) : numericOverall;
+  const conf = typeof confidenceScore === 'number' ? Math.max(0, Math.min(100, confidenceScore)) : 80;
+
+  // STRICT DUPLICATE PREVENTION:
+  // Reject if an active certificate already exists for this student and career path
+  const escapedCareer = certCareerPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const existingCert = await Certificate.findOne({
+    studentId: student._id,
+    careerPath: { $regex: new RegExp(`^${escapedCareer}$`, 'i') },
+    isActive: true,
+    status: { $in: ['APPROVED', 'PENDING'] },
+  });
+
+  if (existingCert) {
+    res.status(400).json({
+      message: `An active certificate (${existingCert.certificateId}) has already been issued to ${student.name} for '${certCareerPath}'. Duplicate certificates for the same career path are prohibited.`,
+      existingCertificateId: existingCert.certificateId,
+    });
+    return;
+  }
+
+  // Generate unique Certificate ID
+  const certificateId = generateCertificateId();
+
+  // Public verification URL
+  const baseUrl = env.appBaseUrl || 'https://skilldna.ai';
+  const verificationUrl = `${baseUrl}/verify/${certificateId}`;
+
+  // Generate high-resolution QR code data URL
+  let qrCodeDataUrl = '';
+  try {
+    qrCodeDataUrl = await QRCode.toDataURL(verificationUrl, {
+      errorCorrectionLevel: 'H',
+      margin: 2,
+      width: 320,
+      color: {
+        dark: '#0284c7',
+        light: '#ffffff',
+      },
+    });
+  } catch (qrErr) {
+    console.warn('QR code generation failed, using API fallback:', qrErr);
+    qrCodeDataUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(verificationUrl)}`;
+  }
+
+  // Interview readiness status
+  let readiness: 'NOT_READY' | 'IN_PROGRESS' | 'READY' | 'ADVANCED' = 'READY';
+  if (interviewReadinessStatus && ['NOT_READY', 'IN_PROGRESS', 'READY', 'ADVANCED'].includes(interviewReadinessStatus)) {
+    readiness = interviewReadinessStatus;
+  } else if (numericOverall >= 85) {
+    readiness = 'ADVANCED';
+  } else {
+    readiness = 'READY';
+  }
+
+  // Fetch issuing admin's digital signature if available
+  const adminUser = await User.findById(req.user?._id);
+  const signature = adminUser?.signatureBase64 || undefined;
+
+  const activeTemplate = await CertificateTemplate.findOne({ isActive: true }) || await CertificateTemplate.findOne();
+  const templateId = activeTemplate?.templateId || 'template-01';
+
+  const certIssueDate = issueDate ? new Date(issueDate) : new Date();
+  const certExpiryDate = expiryDate ? new Date(expiryDate) : new Date(certIssueDate.getTime() + 365 * 24 * 60 * 60 * 1000);
+
+  const defaultStrengths = ['Technical Acumen', 'Problem Resolution', 'Professional Articulation'];
+  const defaultImprovements = ['Continuous Domain Exploration', 'High-Scale System Architecture'];
+
+  const certificate = new Certificate({
+    studentId: student._id,
+    studentName: student.name,
+    email: student.email,
+    careerPath: certCareerPath,
+    courseName: (courseName || certCareerPath).trim(),
+    certificateId,
+    technicalScore: tech,
+    communicationScore: comm,
+    problemSolvingScore: prob,
+    confidenceScore: conf,
+    overallScore: numericOverall,
+    sessionsCompleted: Math.max(1, Number(sessionsCompleted) || 1),
+    interviewReadinessStatus: readiness,
+    strengths: Array.isArray(strengths) && strengths.length > 0 ? strengths : defaultStrengths,
+    improvements: Array.isArray(improvements) && improvements.length > 0 ? improvements : defaultImprovements,
+    qrCode: qrCodeDataUrl,
+    verificationUrl,
+    passStatus: 'PASS',
+    templateId,
+    status: 'APPROVED',
+    approvedBy: req.user?._id,
+    approvedAt: new Date(),
+    issuedBy: req.user?._id,
+    issuedByName: req.user?.name || 'Administrator',
+    adminSignatureBase64: signature,
+    issueDate: certIssueDate,
+    expiryDate: certExpiryDate,
+    isActive: true,
+  });
+
+  await certificate.save();
+
+  // Audit record of issuance
+  await writeAuditLog(req, 'CERTIFICATE_ISSUED_BY_ADMIN', 'Certificate', certificate._id.toString(), {
+    certificateId,
+    studentId: student._id.toString(),
+    studentName: student.name,
+    studentEmail: student.email,
+    careerPath: certCareerPath,
+    overallScore: numericOverall,
+    issuedById: req.user?._id,
+    issuedByName: req.user?.name,
+    issuedAt: new Date(),
+  });
+
+  res.status(201).json({
+    message: `Verified Certificate ${certificateId} successfully issued to ${student.name}.`,
+    certificate,
+    verificationUrl,
+    qrCode: qrCodeDataUrl,
+  });
+}));
+
+// GET /api/admin/certificates - Audit list of all certificates
+router.get('/certificates', asyncHandler(async (req, res) => {
+  const { search = '', status = '', page = 1, limit = 50 } = req.query;
+  const pageNum = Math.max(1, Number(page) || 1);
+  const limitNum = Math.max(1, Math.min(100, Number(limit) || 50));
+  const skip = (pageNum - 1) * limitNum;
+
+  const query: any = {};
+  if (status) query.status = status;
+  if (search && String(search).trim()) {
+    const searchRegex = new RegExp(String(search).trim(), 'i');
+    query.$or = [
+      { studentName: searchRegex },
+      { email: searchRegex },
+      { certificateId: searchRegex },
+      { careerPath: searchRegex },
+      { courseName: searchRegex },
+      { issuedByName: searchRegex },
+    ];
+  }
+
+  const [total, certificates] = await Promise.all([
+    Certificate.countDocuments(query),
+    Certificate.find(query).sort({ createdAt: -1 }).skip(skip).limit(limitNum),
+  ]);
+
+  res.json({
+    certificates,
+    total,
+    page: pageNum,
+    totalPages: Math.ceil(total / limitNum),
+  });
 }));
 
 router.get('/recruiters', asyncHandler(async (req, res) => {

@@ -19,14 +19,21 @@ export interface ICertificate extends Document {
   improvements: string[];
   qrCode?: string;
   pdfUrl?: string;
+  verificationUrl?: string;
+  courseName?: string;
   sharedWith: Array<{
     recruiterId: mongoose.Types.ObjectId;
     recruiterEmail: string;
     sharedAt: Date;
   }>;
   status: 'PENDING' | 'APPROVED' | 'REJECTED';
+  passStatus?: 'PASS' | 'FAIL';
+  templateId?: string;
+  assessmentId?: mongoose.Types.ObjectId;
   approvedBy?: mongoose.Types.ObjectId;
   approvedAt?: Date;
+  issuedBy?: mongoose.Types.ObjectId;
+  issuedByName?: string;
   adminSignatureBase64?: string;
   isActive: boolean;
 }
@@ -55,6 +62,8 @@ const certificateSchema = new Schema<ICertificate>(
     improvements: [{ type: String }],
     qrCode: { type: String },
     pdfUrl: { type: String },
+    verificationUrl: { type: String },
+    courseName: { type: String },
     sharedWith: [
       {
         recruiterId: { type: Schema.Types.ObjectId, ref: 'User' },
@@ -67,8 +76,17 @@ const certificateSchema = new Schema<ICertificate>(
       enum: ['PENDING', 'APPROVED', 'REJECTED'],
       default: 'PENDING',
     },
+    passStatus: {
+      type: String,
+      enum: ['PASS', 'FAIL'],
+      default: 'PASS',
+    },
+    templateId: { type: String, default: 'template-01' },
+    assessmentId: { type: Schema.Types.ObjectId, ref: 'Assessment' },
     approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },
     approvedAt: { type: Date },
+    issuedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+    issuedByName: { type: String },
     adminSignatureBase64: { type: String },
     isActive: { type: Boolean, default: true },
   },

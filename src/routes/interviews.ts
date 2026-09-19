@@ -102,9 +102,15 @@ router.post('/start', protect, asyncHandler(async (req: AuthRequest, res) => {
   res.json(session);
 }));
 
+// GET /api/interviews/:sessionId/next
+router.get('/:sessionId/next', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const question = await interviewSessionService.getNextQuestion(req.params.sessionId, req.user._id);
+  res.json(question);
+}));
+
 // POST /api/interviews/:sessionId/answer
 router.post('/:sessionId/answer', protect, asyncHandler(async (req: AuthRequest, res) => {
-  const { questionId, answer, answerType, timeTaken } = req.body;
+  const { questionId, answer, answerType, timeTaken, transcriptionConfidence, audioQuality, isSilent, visualMetrics } = req.body;
   const submission = await interviewSessionService.submitAnswer({
     sessionId: req.params.sessionId,
     studentId: req.user._id,
@@ -112,6 +118,10 @@ router.post('/:sessionId/answer', protect, asyncHandler(async (req: AuthRequest,
     answer,
     answerType: answerType || 'Text',
     timeTaken: timeTaken || 90,
+    transcriptionConfidence,
+    audioQuality,
+    isSilent,
+    visualMetrics,
   });
   res.json(submission);
 }));

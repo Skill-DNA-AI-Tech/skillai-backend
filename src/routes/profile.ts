@@ -3,9 +3,13 @@ import asyncHandler from 'express-async-handler';
 import multer from 'multer';
 import path from 'path';
 import Profile from '../models/profile';
+import User from '../models/user';
+import CareerTwinMemory from '../models/careerTwinMemory';
 import { protect, AuthRequest } from '../middleware/auth';
 import { aiClient } from '../services/aiClient';
 import { calculateSkillDNA } from '../services/scoring';
+import { resolveCurriculum } from '../data/curriculaData';
+import { isAdminRole } from '../utils/rbac';
 
 const router = express.Router();
 
@@ -56,13 +60,45 @@ router.get('/user/:userId', protect, asyncHandler(async (req: AuthRequest, res) 
 }));
 
 router.post('/', protect, asyncHandler(async (req: AuthRequest, res) => {
-  const payload = {
+  const existingProfile = await Profile.findOne({ user: req.user._id });
+  const chosenCareer = req.body.career || req.body.domain || 'Java Software Engineer';
+  const curriculum = resolveCurriculum(chosenCareer);
+
+  const payload: any = {
     ...req.body,
     user: req.user._id,
     name: req.body.name ?? req.user.name,
     email: req.body.email ?? req.user.email,
     mobile: req.body.mobile ?? req.user.mobile,
   };
+
+  // If first profile setup, bind career & active curriculum
+  if (!existingProfile?.career) {
+    payload.career = curriculum.careerName;
+    payload.domain = curriculum.domain;
+    payload.activeCurriculum = {
+      curriculumId: curriculum.id,
+      title: curriculum.careerName,
+      domain: curriculum.domain,
+      totalTopics: curriculum.topics.length,
+      masteredTopics: 0,
+    };
+    payload.isProfileCompleted = true;
+
+    // Sync User model
+    await User.findByIdAndUpdate(req.user._id, {
+      careerDomain: curriculum.domain,
+      targetRole: req.body.targetRole || curriculum.targetRole,
+      education: req.body.degree ? `${req.body.degree} in ${req.body.branch || ''}` : req.user.education,
+      experienceLevel: req.body.experienceLevel || req.user.experienceLevel,
+    });
+  } else if (!isAdminRole(req.user?.role, req.user?.email)) {
+    // Retain locked career and curriculum for students
+    payload.career = existingProfile.career;
+    payload.domain = existingProfile.domain;
+    payload.activeCurriculum = existingProfile.activeCurriculum;
+  }
+
   const skillDNA = calculateSkillDNA(payload);
   const profile = new Profile({ ...payload, skillDNA });
   const saved = await profile.save();
@@ -70,12 +106,55 @@ router.post('/', protect, asyncHandler(async (req: AuthRequest, res) => {
 }));
 
 router.put('/me', protect, asyncHandler(async (req: AuthRequest, res) => {
-  const payload = {
+  const existingProfile = await Profile.findOne({ user: req.user._id });
+  const isAdmin = isAdminRole(req.user?.role, req.user?.email);
+
+  const payload: any = {
     ...req.body,
     name: req.body.name ?? req.user.name,
     email: req.body.email ?? req.user.email,
   };
-  const skillDNA = calculateSkillDNA(payload);
+
+  // Initial setup: If profile does not have a career yet, assign active curriculum
+  if (!existingProfile || !existingProfile.career) {
+    const chosenCareer = req.body.career || req.body.domain || 'Java Software Engineer';
+    const curriculum = resolveCurriculum(chosenCareer);
+    payload.career = curriculum.careerName;
+    payload.domain = curriculum.domain;
+    payload.activeCurriculum = {
+      curriculumId: curriculum.id,
+      title: curriculum.careerName,
+      domain: curriculum.domain,
+      totalTopics: curriculum.topics.length,
+      masteredTopics: 0,
+    };
+    payload.isProfileCompleted = true;
+
+    // Update User model
+    await User.findByIdAndUpdate(req.user._id, {
+      careerDomain: curriculum.domain,
+      targetRole: req.body.targetRole || curriculum.targetRole,
+      education: req.body.degree ? `${req.body.degree} in ${req.body.branch || ''}` : req.user.education,
+      experienceLevel: req.body.experienceLevel || req.user.experienceLevel,
+    });
+  } else if (!isAdmin) {
+    // USER REQUIREMENT: Students can update normal profile info but CANNOT directly change Career or Curriculum
+    // If student sends new career, ignore/lock and preserve existing career & curriculum
+    payload.career = existingProfile.career;
+    payload.domain = existingProfile.domain;
+    payload.activeCurriculum = existingProfile.activeCurriculum;
+  }
+
+  // Update normal profile fields on User model if provided
+  if (req.body.targetRole || req.body.experienceLevel || req.body.degree) {
+    await User.findByIdAndUpdate(req.user._id, {
+      ...(req.body.targetRole && { targetRole: req.body.targetRole }),
+      ...(req.body.experienceLevel && { experienceLevel: req.body.experienceLevel }),
+      ...(req.body.degree && { education: `${req.body.degree} in ${req.body.branch || ''}` }),
+    });
+  }
+
+  const skillDNA = calculateSkillDNA({ ...existingProfile?.toObject(), ...payload });
 
   const profile = await Profile.findOneAndUpdate(
     { user: req.user._id },

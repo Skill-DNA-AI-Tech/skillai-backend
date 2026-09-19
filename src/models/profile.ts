@@ -14,6 +14,16 @@ const academicMarkSchema = new Schema({
   max: { type: Number, default: 100 },
 }, { _id: false });
 
+const skillEvidenceSchema = new Schema({
+  skill: { type: String, required: true },
+  score: { type: Number, default: 0 },
+  confidence: { type: Number, default: 0 },
+  evidence: { type: String, default: 'interview' },
+  verifiedAt: { type: Date, default: Date.now },
+  trend: { type: String, enum: ['improving', 'steady', 'declining'], default: 'steady' },
+  attempts: { type: Number, default: 1 },
+}, { _id: false });
+
 const scoreSchema = new Schema({
   score: { type: Number, default: 0 },
   strengths: { type: [String], default: [] },
@@ -28,6 +38,8 @@ const scoreSchema = new Schema({
   careerPathSuggestions: { type: [String], default: [] },
   salaryRangeEstimate: { type: String, default: 'TBD' },
   badge: { type: String, enum: ['Bronze', 'Silver', 'Gold', 'Platinum'], default: 'Bronze' },
+  evidenceMatrix: { type: [skillEvidenceSchema], default: [] },
+  lastAssessedAt: { type: Date },
 }, { _id: false });
 
 const profileSchema = new Schema({
@@ -55,6 +67,16 @@ const profileSchema = new Schema({
   portfolioLinks: { type: [String], default: [] },
   location: { type: String, default: '' },
   bio: { type: String, default: '' },
+  career: { type: String, default: '' },
+  activeCurriculum: {
+    curriculumId: { type: String, default: '' },
+    title: { type: String, default: '' },
+    domain: { type: String, default: '' },
+    totalTopics: { type: Number, default: 0 },
+    masteredTopics: { type: Number, default: 0 },
+  },
+  experienceLevel: { type: String, default: 'Fresher' },
+  isProfileCompleted: { type: Boolean, default: false },
   skillDNA: { type: scoreSchema, default: () => ({}) },
 }, { timestamps: true, collection: 'profiles' });
 

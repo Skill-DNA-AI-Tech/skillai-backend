@@ -51,6 +51,60 @@ const dynamicInterviewSchema = new Schema(
   { _id: false },
 );
 
+const weaknessRemediationSchema = new Schema(
+  {
+    concept: { type: String, required: true },
+    topic: { type: String, default: '' },
+    domain: { type: String, default: '' },
+    score: { type: Number, default: 0 },
+    diagnostic: { type: String, default: '' },
+    personalizedNotes: { type: String, default: '' },
+    youtubeResources: {
+      type: [
+        new Schema(
+          {
+            title: { type: String, default: '' },
+            url: { type: String, default: '' },
+            channel: { type: String, default: '' },
+          },
+          { _id: false }
+        ),
+      ],
+      default: [],
+    },
+    externalResources: {
+      type: [
+        new Schema(
+          {
+            title: { type: String, default: '' },
+            url: { type: String, default: '' },
+            platform: { type: String, default: '' },
+          },
+          { _id: false }
+        ),
+      ],
+      default: [],
+    },
+    examples: { type: String, default: '' },
+    practiceQuestions: {
+      type: [
+        new Schema(
+          {
+            question: { type: String, default: '' },
+            answer: { type: String, default: '' },
+          },
+          { _id: false }
+        ),
+      ],
+      default: [],
+    },
+    reassessmentAvailable: { type: Boolean, default: true },
+    resolved: { type: Boolean, default: false },
+    lastAssessedAt: { type: Date, default: Date.now },
+  },
+  { _id: false }
+);
+
 const careerTwinMemorySchema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: 'User', index: true },
@@ -76,6 +130,7 @@ const careerTwinMemorySchema = new Schema(
     mentorSuggestions: { type: [String], default: [] },
     skillGaps: { type: [String], default: [] },
     recommendations: { type: [taskSchema], default: [] },
+    weaknessRemediations: { type: [weaknessRemediationSchema], default: [] },
     dynamicInterview: { type: dynamicInterviewSchema, default: () => ({}) },
     generatedAt: { type: Date, default: Date.now },
   },

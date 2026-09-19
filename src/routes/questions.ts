@@ -736,7 +736,7 @@ router.get('/interview/next/:sessionId', protect, asyncHandler(async (req: AuthR
 
 // POST /api/questions/interview/submit-answer - Submit student answer
 router.post('/interview/submit-answer', protect, asyncHandler(async (req: AuthRequest, res) => {
-  const { sessionId, questionId, answer, answerType, timeTaken } = req.body;
+  const { sessionId, questionId, answer, answerType, timeTaken, transcriptionConfidence, audioQuality, isSilent, visualMetrics } = req.body;
 
   const submission = await interviewSessionService.submitAnswer({
     sessionId,
@@ -745,6 +745,10 @@ router.post('/interview/submit-answer', protect, asyncHandler(async (req: AuthRe
     answer,
     answerType: answerType || 'Text',
     timeTaken: timeTaken || 90,
+    transcriptionConfidence,
+    audioQuality,
+    isSilent,
+    visualMetrics,
   });
 
   res.json(submission);

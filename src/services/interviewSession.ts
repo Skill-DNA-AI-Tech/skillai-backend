@@ -2,6 +2,8 @@ import { QuestionInterviewSession, QuestionBank, StudentAnswer } from '../models
 import User from '../models/user';
 import Profile from '../models/profile';
 import CareerTwinMemory from '../models/careerTwinMemory';
+import Assessment from '../models/assessment';
+import StudentTopicProgress from '../models/learning/studentTopicProgress';
 import { questionAnalysisService } from './questionAnalysis';
 import { randomUUID } from 'crypto';
 
@@ -128,15 +130,21 @@ export const interviewSessionService = {
       }
       const selectedHR = await rotateQuestions(payload.studentId, availableHR, 2);
 
-      // 5. Combine for an initial set of 10 questions (8 Domain + 2 Behavioral/HR)
+      // 5. Combine for an initial set of 10 questions with progressive difficulty:
+      // Questions 1-3: BASIC, Questions 4-7: INTERMEDIATE, Questions 8-10+: ADVANCED
       const initialPool = [...selectedDomain, ...selectedHR];
-      const questionSet = initialPool.map((q: any, idx: number) => ({
-        questionId: q._id,
-        sequence: idx + 1,
-        difficulty: q.difficulty || startingDifficulty,
-        topic: q.topic || targetDomain,
-        asked: false,
-      }));
+      const questionSet = initialPool.map((q: any, idx: number) => {
+        let diff = 'BASIC';
+        if (idx >= 3 && idx < 7) diff = 'INTERMEDIATE';
+        else if (idx >= 7) diff = 'ADVANCED';
+        return {
+          questionId: q._id,
+          sequence: idx + 1,
+          difficulty: diff,
+          topic: q.topic || targetDomain,
+          asked: false,
+        };
+      });
 
       // 6. Create session record
       const session = await QuestionInterviewSession.create({
@@ -282,6 +290,15 @@ export const interviewSessionService = {
     answer: string;
     answerType?: 'Text' | 'Voice' | 'Video';
     timeTaken?: number;
+    transcriptionConfidence?: number;
+    audioQuality?: string;
+    isSilent?: boolean;
+    visualMetrics?: {
+      faceDetected: boolean;
+      cameraFacingRatio: number;
+      lookingAwayRatio: number;
+      multipleFacesDetected: boolean;
+    };
   }): Promise<any> => {
     try {
       const session = await QuestionInterviewSession.findOne({
@@ -300,6 +317,9 @@ export const interviewSessionService = {
         studentAnswer: payload.answer,
         topic: questionDoc.topic,
         field: session.field || session.careerDomain,
+        transcriptionConfidence: payload.transcriptionConfidence,
+        audioQuality: payload.audioQuality,
+        isSilent: payload.isSilent,
       });
 
       // Create StudentAnswer record with 5 competency metrics
@@ -310,6 +330,9 @@ export const interviewSessionService = {
         answer: payload.answer,
         answerType: payload.answerType || 'Text',
         answerStatus: analysis.answerStatus,
+        transcriptionConfidence: payload.transcriptionConfidence ?? 1.0,
+        audioQuality: payload.audioQuality ?? 'CLEAR',
+        visualMetrics: payload.visualMetrics,
         technicalScore: analysis.technicalScore,
         communicationScore: analysis.communicationScore,
         problemSolvingScore: analysis.problemSolvingScore,
@@ -331,6 +354,39 @@ export const interviewSessionService = {
         timeTaken: payload.timeTaken || 90,
         analysisCompletedAt: new Date(),
       });
+
+      // Update session visual analytics if visual metrics provided
+      if (payload.visualMetrics) {
+        if (!session.visualAnalytics) {
+          session.visualAnalytics = {
+            faceDetectedPercent: 100,
+            cameraFacingPercent: 100,
+            lookingAwayPercent: 0,
+            multipleFaceEvents: 0,
+            behaviorStatus: 'NORMAL',
+          };
+        }
+        const vm = payload.visualMetrics;
+        const totalAnswers = (session.questionsAnswered || 0) + 1;
+        session.visualAnalytics.cameraFacingPercent = Math.round(
+          (session.visualAnalytics.cameraFacingPercent * (totalAnswers - 1) + (vm.cameraFacingRatio * 100)) / totalAnswers
+        );
+        session.visualAnalytics.lookingAwayPercent = Math.round(
+          (session.visualAnalytics.lookingAwayPercent * (totalAnswers - 1) + (vm.lookingAwayRatio * 100)) / totalAnswers
+        );
+        if (vm.multipleFacesDetected) {
+          session.visualAnalytics.multipleFaceEvents += 1;
+        }
+        if (session.visualAnalytics.lookingAwayPercent > 45) {
+          session.visualAnalytics.behaviorStatus = 'EXCESSIVE_LOOK_AWAY';
+        } else if (!vm.faceDetected) {
+          session.visualAnalytics.behaviorStatus = 'NO_FACE_DETECTED';
+        } else if (session.visualAnalytics.multipleFaceEvents > 1) {
+          session.visualAnalytics.behaviorStatus = 'MULTIPLE_FACES_DETECTED';
+        } else {
+          session.visualAnalytics.behaviorStatus = 'NORMAL';
+        }
+      }
 
       // Update questionBank stats
       await QuestionBank.findByIdAndUpdate(payload.questionId, {
@@ -459,8 +515,13 @@ export const interviewSessionService = {
       ...answers.flatMap(a => a.feedback?.weaknesses || [])
     ])).slice(0, 6);
 
+    // 75% Passing Standard Rule (Backend Enforced)
+    const passStatus: 'PASS' | 'FAIL' = avgOverall >= 75 ? 'PASS' : 'FAIL';
+
     const reportData = {
       overallScore: avgOverall,
+      passStatus,
+      passingScore: 75,
       competencies: {
         technical: avgTech,
         communication: avgComm,
@@ -484,12 +545,74 @@ export const interviewSessionService = {
 
     session.status = 'Completed';
     session.endTime = new Date();
+    session.passStatus = passStatus;
+    session.passingScore = 75;
     session.competencies = reportData.competencies;
     session.finalReport = reportData;
     await session.save();
 
+    // Record verified Assessment entry
+    try {
+      await Assessment.create({
+        studentId,
+        assessmentType: 'INTERVIEW',
+        careerDomain: session.careerDomain || session.field,
+        targetRole: session.targetRole || 'Specialist',
+        overallScore: avgOverall,
+        passStatus,
+        passingScore: 75,
+        competencies: {
+          technicalKnowledge: avgTech,
+          communication: avgComm,
+          problemSolving: avgPS,
+          confidence: avgConf,
+          clarity: avgClar,
+        },
+        topicBreakdown: (session.stuckTopics || []).map(topic => ({
+          topic,
+          score: 45,
+          questionsCount: 1,
+          correctCount: 0,
+        })),
+        strengths: distinctStrengths,
+        weakTopics: distinctWeaknesses,
+        knowledgeGaps: distinctWeaknesses,
+        recommendedLearning: distinctWeaknesses.map(w => ({
+          title: `Mastery Module: ${w}`,
+          reason: `Targeted concept reinforcement identified during interview`,
+          priority: 'HIGH',
+          recommendedModule: w,
+        })),
+        questionsAnswered: answers.length,
+        totalQuestions: session.totalQuestions,
+        answers: answers.map(a => ({
+          questionId: a.questionId,
+          score: a.overallScore,
+          status: a.answerStatus,
+        })),
+        attemptNumber: (await Assessment.countDocuments({ studentId, assessmentType: 'INTERVIEW' })) + 1,
+        verified: true,
+        certificateEligible: passStatus === 'PASS',
+        visualAnalytics: session.visualAnalytics,
+        audioAnalytics: session.audioAnalytics,
+      });
+    } catch (assessErr) {
+      console.warn('Failed to record Assessment entry:', assessErr);
+    }
+
     // 8. Sync with Profile & Skill DNA
     try {
+      const assessedSkill = session.topic || session.field || 'Core Technical';
+      const evidenceEntry = {
+        skill: assessedSkill,
+        score: avgOverall,
+        confidence: avgConf,
+        evidence: 'interview',
+        verifiedAt: new Date(),
+        trend: avgOverall >= 70 ? 'improving' : 'steady',
+        attempts: 1,
+      };
+
       await Profile.findOneAndUpdate(
         { user: studentId },
         {
@@ -501,7 +624,14 @@ export const interviewSessionService = {
             'skillDNA.score': avgOverall,
             'skillDNA.strengths': distinctStrengths,
             'skillDNA.weaknesses': distinctWeaknesses,
-          }
+            'skillDNA.lastAssessedAt': new Date(),
+          },
+          $push: {
+            'skillDNA.evidenceMatrix': {
+              $each: [evidenceEntry],
+              $slice: -50,
+            },
+          },
         },
         { upsert: true }
       );
@@ -509,37 +639,163 @@ export const interviewSessionService = {
       console.warn('Profile skillDNA update failed:', profErr);
     }
 
-    // 9. Sync with Career Twin Memory
-    try {
-      await CareerTwinMemory.findOneAndUpdate(
-        { $or: [{ userId: studentId }, { user: studentId }] },
-        {
-          $set: {
-            userId: studentId,
-            user: studentId,
+    // 8.5. Sync with StudentTopicProgress if topic or field is available
+    if (session.topic || session.field) {
+      const topicToUpdate = session.topic || session.field;
+      const isMastered = passStatus === 'PASS';
+      try {
+        await StudentTopicProgress.findOneAndUpdate(
+          {
+            studentId,
             domain: session.careerDomain || session.field,
-            targetRole: session.targetRole,
-            'benchmarks.technical': avgTech,
-            'benchmarks.communication': avgComm,
-            'benchmarks.problemSolving': avgPS,
-            'benchmarks.confidence': avgConf,
-            'benchmarks.overall': avgOverall,
-            overallScore: avgOverall,
-            technicalScore: avgTech,
-            confidence: avgConf,
-            communicationQuality: avgComm,
-            lastEvaluatedAt: new Date(),
-            generatedAt: new Date(),
+            topic: topicToUpdate,
+            subtopic: 'General',
           },
-          $addToSet: {
-            weakAreas: { $each: distinctWeaknesses },
-            strengths: { $each: distinctStrengths },
-            weaknesses: { $each: distinctWeaknesses },
-            skillGaps: { $each: distinctWeaknesses },
+          {
+            $set: {
+              career: (session as any).career || 'General',
+              domain: session.careerDomain || session.field,
+              topic: topicToUpdate,
+              subtopic: 'General',
+              interviewScore: avgOverall,
+              status: isMastered ? 'PASSED' : 'NEEDS_REVISION',
+              isMastered,
+              lastAssessedAt: new Date(),
+              ...(isMastered ? { passedAt: new Date() } : {}),
+            },
+            $max: { highestScore: avgOverall },
+            $inc: { attempts: 1 },
+          },
+          { upsert: true, new: true }
+        );
+      } catch (progErr) {
+        console.warn('StudentTopicProgress update from interview failed:', progErr);
+      }
+    }
+
+    // 9. Sync with Career Twin Memory & Weakness Remediation
+    try {
+      const twinDoc = await CareerTwinMemory.findOne({
+        $or: [{ userId: studentId }, { user: studentId }]
+      });
+
+      const interviewRemediations = distinctWeaknesses.map(weakConcept => ({
+        concept: weakConcept,
+        topic: session.topic || weakConcept,
+        domain: session.careerDomain || session.field,
+        score: avgOverall,
+        diagnostic: `Identified as a critical weak point during technical mock interview evaluation (overall score: ${avgOverall}%).`,
+        personalizedNotes: `### Interview Concept Mastery: ${weakConcept}\nTo confidently articulate ${weakConcept} in technical interviews:\n1. Clearly state the core definition and system architecture role.\n2. Detail trade-offs, edge cases, and typical implementation challenges.\n3. Practice explaining the concept out loud using concise technical terminology.`,
+        youtubeResources: [
+          {
+            title: `${weakConcept} Technical Interview Questions & Answers`,
+            url: `https://www.youtube.com/results?search_query=${encodeURIComponent(weakConcept + ' interview questions deep dive')}`,
+            channel: 'Tech Primers / Engineering Digest',
+          },
+        ],
+        externalResources: [
+          {
+            title: `${weakConcept} Architecture Guide & Documentation`,
+            url: `https://www.google.com/search?q=${encodeURIComponent(weakConcept + ' architecture documentation guide')}`,
+            platform: 'System Design / Official Guide',
+          },
+        ],
+        examples: `// Key architectural pattern and syntax for ${weakConcept}\n// Ensure fault tolerance and correct exception handling.`,
+        practiceQuestions: [
+          {
+            question: `How would you explain the internal mechanism of ${weakConcept} to a hiring manager?`,
+            answer: `Focus on how data flows, memory allocation, and concurrency guarantees.`,
+          },
+        ],
+        reassessmentAvailable: true,
+        resolved: false,
+        lastAssessedAt: new Date(),
+      }));
+
+      if (twinDoc) {
+        twinDoc.domain = session.careerDomain || session.field;
+        twinDoc.targetRole = session.targetRole;
+        twinDoc.benchmarks = {
+          technical: avgTech,
+          communication: avgComm,
+          problemSolving: avgPS,
+          confidence: avgConf,
+          overall: avgOverall,
+        };
+        twinDoc.overallScore = avgOverall;
+        twinDoc.technicalScore = avgTech;
+        twinDoc.confidence = avgConf;
+        twinDoc.communicationQuality = avgComm;
+        twinDoc.lastEvaluatedAt = new Date();
+        twinDoc.generatedAt = new Date();
+
+        if (passStatus === 'PASS' && (session.topic || session.field)) {
+          const resolvedTopic = session.topic || session.field;
+          if (Array.isArray(twinDoc.weaknessRemediations)) {
+            for (const rem of twinDoc.weaknessRemediations) {
+              if (rem.topic === resolvedTopic || rem.concept === resolvedTopic) {
+                rem.resolved = true;
+                rem.reassessmentAvailable = true;
+              }
+            }
           }
-        },
-        { upsert: true }
-      );
+        }
+
+        if (interviewRemediations.length > 0) {
+          if (!Array.isArray(twinDoc.weaknessRemediations)) {
+            twinDoc.weaknessRemediations = [];
+          }
+          for (const rem of interviewRemediations) {
+            const idx = twinDoc.weaknessRemediations.findIndex(
+              (r: any) => r.concept === rem.concept
+            );
+            if (idx >= 0) {
+              twinDoc.weaknessRemediations[idx] = rem;
+            } else {
+              twinDoc.weaknessRemediations.push(rem);
+            }
+          }
+        }
+
+        const existingWeak = new Set(twinDoc.weakAreas || []);
+        const existingStrengths = new Set(twinDoc.strengths || []);
+        for (const wt of distinctWeaknesses) {
+          existingWeak.add(wt);
+          existingStrengths.delete(wt);
+        }
+        for (const st of distinctStrengths) {
+          existingStrengths.add(st);
+          if (avgOverall >= 75) existingWeak.delete(st);
+        }
+        twinDoc.weakAreas = Array.from(existingWeak);
+        twinDoc.weaknesses = Array.from(existingWeak);
+        twinDoc.strengths = Array.from(existingStrengths);
+
+        await twinDoc.save();
+      } else {
+        await CareerTwinMemory.create({
+          userId: studentId,
+          user: studentId,
+          domain: session.careerDomain || session.field,
+          targetRole: session.targetRole,
+          benchmarks: {
+            technical: avgTech,
+            communication: avgComm,
+            problemSolving: avgPS,
+            confidence: avgConf,
+            overall: avgOverall,
+          },
+          overallScore: avgOverall,
+          technicalScore: avgTech,
+          confidence: avgConf,
+          communicationQuality: avgComm,
+          weakAreas: distinctWeaknesses,
+          strengths: distinctStrengths,
+          weaknesses: distinctWeaknesses,
+          weaknessRemediations: interviewRemediations,
+          lastEvaluatedAt: new Date(),
+        });
+      }
     } catch (ctErr) {
       console.warn('CareerTwinMemory update failed:', ctErr);
     }

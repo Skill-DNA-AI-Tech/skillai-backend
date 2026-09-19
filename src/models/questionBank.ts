@@ -9,6 +9,8 @@ const QuestionSchema = new mongoose.Schema(
     answer: { type: String, required: true },
     difficulty: { type: String, enum: ['Easy', 'Medium', 'Hard', 'Expert'], required: true, index: true },
     interviewType: { type: String, enum: ['Technical', 'HR', 'Behavioral', 'Scenario', 'Domain', 'MCQ', 'Descriptive', 'RapidFire'], default: 'Technical' },
+    mcqOptions: [String],
+    notes: String,
     tags: [String],
     keywords: [String],
     expectedDuration: { type: Number, default: 120 }, // seconds
@@ -188,6 +190,19 @@ const QuestionInterviewSessionSchema = new mongoose.Schema(
       }
     ],
     finalReport: { type: mongoose.Schema.Types.Mixed },
+    passStatus: { type: String, enum: ['PASS', 'FAIL'], default: 'FAIL' },
+    passingScore: { type: Number, default: 75 },
+    visualAnalytics: {
+      faceDetectedPercent: { type: Number, default: 100 },
+      cameraFacingPercent: { type: Number, default: 100 },
+      lookingAwayPercent: { type: Number, default: 0 },
+      multipleFaceEvents: { type: Number, default: 0 },
+      behaviorStatus: { type: String, default: 'NORMAL' },
+    },
+    audioAnalytics: {
+      audioQualityStatus: { type: String, default: 'ACCEPTABLE' },
+      averageConfidence: { type: Number, default: 0.9 },
+    },
     
     // Generated variations
     useVariations: { type: Boolean, default: true },
@@ -209,8 +224,30 @@ const StudentAnswerSchema = new mongoose.Schema(
     answerType: { type: String, enum: ['Text', 'Voice', 'Video'], default: 'Text' },
     answerStatus: { 
       type: String, 
-      enum: ['VALID', 'EMPTY', 'NO_ANSWER', 'IRRELEVANT', 'COPY_SUSPECTED'], 
+      enum: [
+        'EMPTY', 
+        'NO_SPEECH', 
+        'LOW_AUDIO_QUALITY', 
+        'LOW_TRANSCRIPTION_CONFIDENCE', 
+        'TOO_SHORT', 
+        'I_DONT_KNOW', 
+        'NO_ANSWER', 
+        'IRRELEVANT', 
+        'NONSENSE', 
+        'COPY_SUSPECTED', 
+        'PARTIALLY_VALID', 
+        'VALID', 
+        'STRONG'
+      ], 
       default: 'VALID' 
+    },
+    transcriptionConfidence: { type: Number, default: 1.0 },
+    audioQuality: { type: String, default: 'CLEAR' },
+    visualMetrics: {
+      faceDetected: { type: Boolean, default: true },
+      cameraFacingRatio: { type: Number, default: 1.0 },
+      lookingAwayRatio: { type: Number, default: 0.0 },
+      multipleFacesDetected: { type: Boolean, default: false },
     },
     
     // 5 Core Competency Scores (0-100)

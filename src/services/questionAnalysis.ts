@@ -1,4 +1,5 @@
 import { groqRequest } from './groqClient';
+import { normalizeTechnicalTranscript } from '../utils/technicalDictionary';
 
 export const questionAnalysisService = {
   // Analyze uploaded question + answer pair
@@ -204,9 +205,113 @@ Return JSON array with similarity analysis:
     studentAnswer: string;
     topic: string;
     field?: string;
+    transcriptionConfidence?: number;
+    audioQuality?: string;
+    isSilent?: boolean;
   }): Promise<any> => {
+    // 0. Speech & Audio Quality Validation
+    if (payload.isSilent) {
+      return {
+        answerStatus: 'NO_SPEECH',
+        relevance: 0,
+        technicalKnowledge: 0,
+        technicalScore: 0,
+        communication: 0,
+        communicationScore: 0,
+        problemSolving: 0,
+        problemSolvingScore: 0,
+        confidence: 0,
+        confidenceScore: 0,
+        clarity: 0,
+        clarityScore: 0,
+        correctness: 0,
+        overallScore: 0,
+        conceptCoverage: 0,
+        completeness: 0,
+        technicalQuality: 0,
+        grammar: 0,
+        keywordMatches: [],
+        conceptsIdentified: [],
+        strengths: [],
+        weaknesses: ['No speech detected from microphone during this question.'],
+        missingConcepts: ['Verbal explanation required.'],
+        commonMistakes: ['Microphone muted or silent response.'],
+        suggestedImprovement: 'Please unmute your microphone and speak clearly.',
+        feedback: 'No voice detected. Please unmute your microphone and try again.',
+        betterAnswer: payload.modelAnswer,
+        confidenceIndicators: 'Silence (No speech)',
+      };
+    }
+
+    if (payload.audioQuality === 'LOW_QUALITY' || payload.audioQuality === 'GARBLED') {
+      return {
+        answerStatus: 'LOW_AUDIO_QUALITY',
+        relevance: 0,
+        technicalKnowledge: 0,
+        technicalScore: 0,
+        communication: 0,
+        communicationScore: 0,
+        problemSolving: 0,
+        problemSolvingScore: 0,
+        confidence: 0,
+        confidenceScore: 0,
+        clarity: 0,
+        clarityScore: 0,
+        correctness: 0,
+        overallScore: 0,
+        conceptCoverage: 0,
+        completeness: 0,
+        technicalQuality: 0,
+        grammar: 0,
+        keywordMatches: [],
+        conceptsIdentified: [],
+        strengths: [],
+        weaknesses: ['Audio quality was too low or muffled to assess accurately.'],
+        missingConcepts: ['Clear audio signal required for fair scoring.'],
+        commonMistakes: ['Microphone distortion or excessive background noise.'],
+        suggestedImprovement: 'Speak closer to the microphone and minimize background interference.',
+        feedback: 'Audio was muffled or distorted. Please repeat your answer clearly.',
+        betterAnswer: payload.modelAnswer,
+        confidenceIndicators: 'Audio unclear',
+      };
+    }
+
+    if (payload.transcriptionConfidence !== undefined && payload.transcriptionConfidence < 0.45) {
+      return {
+        answerStatus: 'LOW_TRANSCRIPTION_CONFIDENCE',
+        relevance: 0,
+        technicalKnowledge: 0,
+        technicalScore: 0,
+        communication: 0,
+        communicationScore: 0,
+        problemSolving: 0,
+        problemSolvingScore: 0,
+        confidence: 0,
+        confidenceScore: 0,
+        clarity: 0,
+        clarityScore: 0,
+        correctness: 0,
+        overallScore: 0,
+        conceptCoverage: 0,
+        completeness: 0,
+        technicalQuality: 0,
+        grammar: 0,
+        keywordMatches: [],
+        conceptsIdentified: [],
+        strengths: [],
+        weaknesses: ['Speech-to-text confidence too low for reliable evaluation.'],
+        missingConcepts: ['Articulate pronunciation required.'],
+        commonMistakes: ['Mumbling or speaking too fast for recognition engine.'],
+        suggestedImprovement: 'Speak with clear articulation at a steady pace.',
+        feedback: 'Transcription confidence was low. To protect your score, please repeat clearly.',
+        betterAnswer: payload.modelAnswer,
+        confidenceIndicators: 'Low transcription confidence',
+      };
+    }
+
     const rawAnswer = payload.studentAnswer || '';
-    const cleaned = rawAnswer.trim();
+    const normalizedRaw = normalizeTechnicalTranscript(rawAnswer, payload.field);
+    const cleaned = normalizedRaw.trim();
 
     // 1. EMPTY ANSWER ENFORCEMENT (Backend level, strictly 0 marks, no LLM)
     if (!cleaned) {
@@ -242,7 +347,45 @@ Return JSON array with similarity analysis:
       };
     }
 
-    // 2. "I DON'T KNOW" / SKIP ENFORCEMENT (Backend level, 0-5 marks, no LLM)
+    // 2. NONSENSE / GIBBERISH DETECTION
+    const isRepeatedChar = /(.)\1{5,}/i.test(cleaned);
+    const isKeyboardSmash = /^[asdfghjklqwertyuiopzxcvbnm\s]{12,}$/i.test(cleaned) && !cleaned.includes(' ');
+    const isRepetitiveGibberish = /^(bla|blah|na|la|ha|test|qwerty|asdf)(\s+(bla|blah|na|la|ha|test|qwerty|asdf))+$/i.test(cleaned);
+    
+    if (isRepeatedChar || isKeyboardSmash || isRepetitiveGibberish) {
+      return {
+        answerStatus: 'NONSENSE',
+        relevance: 0,
+        technicalKnowledge: 0,
+        technicalScore: 0,
+        communication: 0,
+        communicationScore: 0,
+        problemSolving: 0,
+        problemSolvingScore: 0,
+        confidence: 0,
+        confidenceScore: 0,
+        clarity: 0,
+        clarityScore: 0,
+        correctness: 0,
+        overallScore: 0,
+        conceptCoverage: 0,
+        completeness: 0,
+        technicalQuality: 0,
+        grammar: 0,
+        keywordMatches: [],
+        conceptsIdentified: [],
+        strengths: [],
+        weaknesses: ['Submitted text contains non-meaningful repetitive characters or gibberish.'],
+        missingConcepts: ['Legitimate technical terminology and coherent English explanation.'],
+        commonMistakes: ['Submitting gibberish or test text'],
+        suggestedImprovement: 'Provide real technical reasoning relevant to the question.',
+        feedback: 'Submission does not contain meaningful words or concepts.',
+        betterAnswer: payload.modelAnswer,
+        confidenceIndicators: 'Nonsense submission',
+      };
+    }
+
+    // 3. "I DON'T KNOW" / SKIP ENFORCEMENT
     const normalizedLower = cleaned.toLowerCase().replace(/['"`]/g, '');
     const isNoAnswerRegex = /^(i\s+dont\s+know|dont\s+know|no\s+idea|i\s+have\s+no\s+idea|cant\s+answer|cannot\s+answer|skip|not\s+sure|pass|idk|no\s+clue|i\s+am\s+not\s+sure|i\s+do\s+not\s+know)[.!]?$/i;
     const noAnswerPhrases = [
@@ -270,7 +413,7 @@ Return JSON array with similarity analysis:
 
     if (isNoAnswerRegex.test(normalizedLower) || isShortAdmission) {
       return {
-        answerStatus: 'NO_ANSWER',
+        answerStatus: 'I_DONT_KNOW',
         relevance: 0,
         technicalKnowledge: 0,
         technicalScore: 0,
@@ -295,13 +438,48 @@ Return JSON array with similarity analysis:
         missingConcepts: [`Foundational principles of ${payload.topic || 'the assigned topic'}`],
         commonMistakes: ['Skipping question without applying fundamental first-principles reasoning'],
         suggestedImprovement: `Review foundational study modules on ${payload.topic || 'this subject'} and practice conceptual recall.`,
-        feedback: `Review foundational study modules on ${payload.topic || 'this subject'}.`,
+        feedback: `Knowledge gap acknowledged on ${payload.topic || 'this subject'}. Added to personalized study path.`,
         betterAnswer: payload.modelAnswer,
-        confidenceIndicators: 'Uncertain / Pass',
+        confidenceIndicators: 'Uncertain / Skipped',
       };
     }
 
-    // 3. QUESTION COPYING DETECTION (Similarity analysis against prompt)
+    // 4. TOO SHORT / SINGLE WORD CHECK
+    const wordList = cleaned.split(/\s+/).filter(w => w.length > 0);
+    if (wordList.length < 3 && cleaned.length < 20) {
+      return {
+        answerStatus: 'TOO_SHORT',
+        relevance: 10,
+        technicalKnowledge: 5,
+        technicalScore: 5,
+        communication: 5,
+        communicationScore: 5,
+        problemSolving: 0,
+        problemSolvingScore: 0,
+        confidence: 5,
+        confidenceScore: 5,
+        clarity: 10,
+        clarityScore: 10,
+        correctness: 0,
+        overallScore: 5,
+        conceptCoverage: 5,
+        completeness: 5,
+        technicalQuality: 5,
+        grammar: 20,
+        keywordMatches: [],
+        conceptsIdentified: [],
+        strengths: [],
+        weaknesses: ['Answer was too brief to explain the concept.'],
+        missingConcepts: ['Comprehensive explanation, mechanism, and reasoning.'],
+        commonMistakes: ['Answering with only 1 or 2 words'],
+        suggestedImprovement: 'Provide full sentences explaining how and why the concept works.',
+        feedback: 'Answer was too brief to evaluate. Provide a complete, structured explanation.',
+        betterAnswer: payload.modelAnswer,
+        confidenceIndicators: 'Too short',
+      };
+    }
+
+    // 5. QUESTION COPYING DETECTION (Similarity analysis against prompt)
     const cleanTokens = (text: string) => text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 2);
     const qTokens = new Set(cleanTokens(payload.question));
     const aTokens = cleanTokens(cleaned);
@@ -347,7 +525,7 @@ Return JSON array with similarity analysis:
       };
     }
 
-    // 4. CALL AI / GROQ FOR STRUCTURED EVALUATION
+    // 6. CALL AI / GROQ FOR STRUCTURED EVALUATION
     const prompt = `You are a strict, professional technical interviewer and assessor evaluating a student's answer.
 Context:
 Career Field: ${payload.field || 'Engineering / Professional'}
@@ -418,6 +596,12 @@ Return ONLY a valid JSON object strictly matching this schema:
 
         const overall = clamp(parsed.overallScore, Math.round(tech * 0.4 + comm * 0.2 + ps * 0.2 + conf * 0.1 + clar * 0.1));
 
+        if (status !== 'IRRELEVANT') {
+          if (overall >= 85) status = 'STRONG';
+          else if (overall >= 70) status = 'VALID';
+          else status = 'PARTIALLY_VALID';
+        }
+
         return {
           answerStatus: status,
           relevance,
@@ -473,9 +657,19 @@ Return ONLY a valid JSON object strictly matching this schema:
       const baseConf = isOffTopic ? 15 : Math.min(85, Math.max(35, Math.round(baseComm * 0.9)));
       const baseClar = isOffTopic ? 15 : Math.min(90, Math.max(30, Math.round(baseComm * 0.95)));
       const baseOverall = Math.round(baseTech * 0.4 + baseComm * 0.2 + basePS * 0.2 + baseConf * 0.1 + baseClar * 0.1);
+      let fallbackStatus: 'IRRELEVANT' | 'PARTIALLY_VALID' | 'VALID' | 'STRONG' = 'VALID';
+      if (isOffTopic) {
+        fallbackStatus = 'IRRELEVANT';
+      } else if (baseOverall >= 85) {
+        fallbackStatus = 'STRONG';
+      } else if (baseOverall >= 70) {
+        fallbackStatus = 'VALID';
+      } else {
+        fallbackStatus = 'PARTIALLY_VALID';
+      }
 
       return {
-        answerStatus: isOffTopic ? 'IRRELEVANT' : 'VALID',
+        answerStatus: fallbackStatus,
         relevance: isOffTopic ? 15 : 75,
         technicalKnowledge: baseTech,
         technicalScore: baseTech,

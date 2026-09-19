@@ -21,6 +21,9 @@ import questionRoutes from './routes/questions';
 import careerTwinRoutes from './routes/careerTwin';
 import certificateRoutes from './routes/certificates';
 import studentRoutes from './routes/student';
+import mcqRoutes from './routes/mcq';
+import careerChangeRoutes from './routes/careerChange';
+import adminNotesRoutes from './routes/adminNotes';
 import { env } from './config/env';
 import { errorHandler, notFound } from './middleware/error';
 import { seedQuestions, seedPageSettings } from './utils/seeder';
@@ -53,6 +56,9 @@ app.use('/api/questions', questionRoutes);
 app.use('/api/career-twin', careerTwinRoutes);
 app.use('/api/certificates', certificateRoutes);
 app.use('/api/feedback', feedbackRoutes);
+app.use('/api/mcq', mcqRoutes);
+app.use('/api/career-change-requests', careerChangeRoutes);
+app.use('/api/admin/notes', adminNotesRoutes);
 
 // Public Certificate Verification Endpoint (No login required for QR scans)
 app.get('/api/verify/:certificateId', async (req, res) => {

@@ -1,22 +1,28 @@
 import { Router, Response } from 'express';
 import asyncHandler from 'express-async-handler';
 import { randomUUID } from 'crypto';
+import mongoose from 'mongoose';
 import Certificate, { ICertificate } from '../models/certificate';
+import CertificateTemplate from '../models/certificateTemplate';
+import Assessment from '../models/assessment';
 import User from '../models/user';
 import { env } from '../config/env';
 import { protect, AuthRequest } from '../middleware/auth';
 import { QuestionInterviewSession } from '../models/questionBank';
 import Profile from '../models/profile';
 import { isAdminRole } from '../utils/rbac';
+import QRCode from 'qrcode';
 
 const router = Router();
 
-// Generate unique certificate ID
-const generateCertificateId = (): string => {
-  return `SKILLDNA-${Date.now()}-${randomUUID().substring(0, 8).toUpperCase()}`;
+// Generate unique certificate ID in format SDNA-CERT-YYYY-XXXXXX
+export const generateCertificateId = (): string => {
+  const year = new Date().getFullYear();
+  const hex = randomUUID().replace(/-/g, '').substring(0, 6).toUpperCase();
+  return `SDNA-CERT-${year}-${hex}`;
 };
 
-// Create certificate for a student
+// Create / Claim certificate for a student (tamper-proof, server-side validated only)
 router.post(
   '/create',
   protect,
@@ -26,146 +32,163 @@ router.post(
       return;
     }
 
-    const studentId = req.user.id;
+    const studentId = req.user._id;
     const student = await User.findById(studentId);
     if (!student) {
       res.status(404).json({ error: 'Student not found' });
       return;
     }
 
-    // Try to get student's real profile for dynamic scores
-    const profile = await Profile.findOne({ user: studentId });
+    // 1. Fetch latest verified assessment or interview session strictly from server records
+    const requestedSessionId = req.body?.sessionId;
+    const requestedAssessmentId = req.body?.assessmentId;
 
-    // Fetch actual completed session count
-    const actualSessions = await QuestionInterviewSession.countDocuments({ studentId, status: 'Completed' });
-
-    if (actualSessions === 0) {
-      res.status(400).json({ error: 'You must complete at least one mock interview practice session before generating a certificate.' });
-      return;
-    }
-
-    // Fetch actual completed session
-    const latestSession = await QuestionInterviewSession.findOne({ studentId, status: 'Completed' }).sort({ updatedAt: -1 });
-
-    let careerPath = req.body.careerPath;
-    let technicalScore = req.body.technicalScore;
-    let communicationScore = req.body.communicationScore;
-    let problemSolvingScore = req.body.problemSolvingScore;
-    let confidenceScore = req.body.confidenceScore;
-    let sessionsCompleted = req.body.sessionsCompleted ?? actualSessions;
-    let strengths = req.body.strengths;
-    let improvements = req.body.improvements;
-
-    // Prioritize latest evaluated interview session scores to prevent client-side tampering
-    if (latestSession && latestSession.finalReport) {
-      const rep = latestSession.finalReport;
-      if (rep.competencies) {
-        technicalScore = rep.competencies.technical;
-        communicationScore = rep.competencies.communication;
-        problemSolvingScore = rep.competencies.problemSolving;
-        confidenceScore = rep.competencies.confidence;
-      }
-      const sessionAny = latestSession as any;
-      careerPath = sessionAny.role || sessionAny.domain || sessionAny.field || careerPath || 'Career Development';
-      if (rep.strengths && rep.strengths.length > 0) {
-        strengths = rep.strengths;
-      }
-      if (rep.improvements && rep.improvements.length > 0) {
-        improvements = rep.improvements;
-      }
-    } else if (profile) {
-      if (!careerPath) {
-        careerPath = profile.preferredRoles?.[0] || profile.branch || 'Career Development';
-      }
-      const skillDNA = profile.skillDNA || {};
-      
-      // Pull real-time scores if not provided in the request
-      if (technicalScore === undefined || technicalScore === null || technicalScore === 0) {
-        technicalScore = skillDNA.technicalScore ?? 70;
-      }
-      if (communicationScore === undefined || communicationScore === null || communicationScore === 0) {
-        communicationScore = skillDNA.communicationScore ?? 75;
-      }
-      if (problemSolvingScore === undefined || problemSolvingScore === null || problemSolvingScore === 0) {
-        problemSolvingScore = skillDNA.projectsScore ?? skillDNA.aptitudeScore ?? 72;
-      }
-      if (confidenceScore === undefined || confidenceScore === null || confidenceScore === 0) {
-        confidenceScore = skillDNA.confidenceScore ?? 68;
-      }
-      if (!strengths || strengths.length === 0) {
-        strengths = skillDNA.strengths && skillDNA.strengths.length > 0 ? skillDNA.strengths : ['Problem Solving', 'System Design'];
-      }
-      if (!improvements || improvements.length === 0) {
-        improvements = skillDNA.weaknesses && skillDNA.weaknesses.length > 0 ? skillDNA.weaknesses : ['Communication Depth'];
-      }
+    let verifiedAssessment = null;
+    if (requestedAssessmentId && mongoose.Types.ObjectId.isValid(requestedAssessmentId)) {
+      verifiedAssessment = await Assessment.findOne({
+        _id: requestedAssessmentId,
+        studentId: req.user._id,
+        overallScore: { $gte: 75 }
+      });
     } else {
-      // Set baseline values if no profile is found and request body values are empty
-      if (!careerPath) careerPath = 'Software Development';
-      if (technicalScore === undefined || technicalScore === null) technicalScore = 70;
-      if (communicationScore === undefined || communicationScore === null) communicationScore = 75;
-      if (problemSolvingScore === undefined || problemSolvingScore === null) problemSolvingScore = 72;
-      if (confidenceScore === undefined || confidenceScore === null) confidenceScore = 68;
-      if (!strengths) strengths = ['Problem Solving', 'System Design'];
-      if (!improvements) improvements = ['Communication Depth'];
+      verifiedAssessment = await Assessment.findOne({
+        studentId: req.user._id,
+        overallScore: { $gte: 75 }
+      }).sort({ createdAt: -1 });
     }
 
-    // Ensure scores are numbers
-    technicalScore = Number(technicalScore);
-    communicationScore = Number(communicationScore);
-    problemSolvingScore = Number(problemSolvingScore);
-    confidenceScore = Number(confidenceScore);
-    sessionsCompleted = Number(sessionsCompleted);
+    let latestSession = null;
+    if (requestedSessionId) {
+      const sessionOrQueries: any[] = [{ sessionId: requestedSessionId }];
+      if (mongoose.Types.ObjectId.isValid(requestedSessionId)) {
+        sessionOrQueries.push({ _id: requestedSessionId });
+      }
+      latestSession = await QuestionInterviewSession.findOne({
+        $or: sessionOrQueries,
+        studentId,
+        status: 'Completed'
+      });
+    } else {
+      latestSession = await QuestionInterviewSession.findOne({ studentId, status: 'Completed' }).sort({ updatedAt: -1 });
+    }
 
-    // Validate scores
-    const scores = [technicalScore, communicationScore, problemSolvingScore, confidenceScore];
-    if (scores.some(s => typeof s !== 'number' || isNaN(s) || s < 0 || s > 100)) {
-      res.status(400).json({ error: 'Invalid scores. Must be between 0 and 100.' });
+    let verifiedOverall = 0;
+    let technicalScore = 0;
+    let communicationScore = 0;
+    let problemSolvingScore = 0;
+    let confidenceScore = 0;
+    let careerPath = '';
+    let strengths: string[] = [];
+    let improvements: string[] = [];
+    let assessmentId: any = undefined;
+
+    if (verifiedAssessment) {
+      verifiedOverall = verifiedAssessment.overallScore;
+      technicalScore = verifiedAssessment.competencies?.technicalKnowledge || verifiedOverall;
+      communicationScore = verifiedAssessment.competencies?.communication || 75;
+      problemSolvingScore = verifiedAssessment.competencies?.problemSolving || 75;
+      confidenceScore = verifiedAssessment.competencies?.confidence || 75;
+      careerPath = verifiedAssessment.careerDomain || verifiedAssessment.targetRole || 'Career Development';
+      strengths = verifiedAssessment.strengths || [];
+      improvements = verifiedAssessment.weakTopics || [];
+      assessmentId = verifiedAssessment._id;
+    } else if (latestSession && latestSession.finalReport) {
+      const rep = latestSession.finalReport;
+      verifiedOverall = rep.overallScore || 0;
+      technicalScore = rep.competencies?.technical || latestSession.competencies?.technical || 0;
+      communicationScore = rep.competencies?.communication || latestSession.competencies?.communication || 0;
+      problemSolvingScore = rep.competencies?.problemSolving || latestSession.competencies?.problemSolving || 0;
+      confidenceScore = rep.competencies?.confidence || latestSession.competencies?.confidence || 0;
+      careerPath = latestSession.careerDomain || latestSession.field || 'Career Development';
+      strengths = rep.strengths || [];
+      improvements = rep.weaknesses || [];
+    }
+
+    // STRICT USER REQUIREMENT: Minimum 75% overall score required to generate certificate
+    if (verifiedOverall < 75) {
+      res.status(400).json({
+        error: `Your verified assessment score is ${verifiedOverall}%. A minimum passing score of ${75}% is required to generate or claim a SkillDNA Verified Certificate. Please review your personalized study notes, practice weak topics, and retake the assessment.`,
+      });
       return;
     }
 
-    const overallScore = Math.round((technicalScore + communicationScore + problemSolvingScore + confidenceScore) / 4);
+    // DUPLICATE CHECK: Prevent duplicate active certificate for same student and career
+    const escapedCareer = careerPath.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const existingActiveCert = await Certificate.findOne({
+      studentId,
+      careerPath: { $regex: new RegExp(`^${escapedCareer}$`, 'i') },
+      isActive: true,
+      status: 'APPROVED',
+    });
 
-    // USER REQUIREMENT: Minimum 75% overall score required to generate certificate
-    if (overallScore < 75) {
+    if (existingActiveCert) {
       res.status(400).json({
-        error: `Your overall interview evaluation score is ${overallScore}%. A minimum score of 75% is required to generate a SkillDNA Verified Certificate. Please review your Career Twin learning recommendations, practice weak areas, and retake the interview to qualify.`
+        error: `An active certificate (${existingActiveCert.certificateId}) has already been issued to you for '${careerPath}'. Duplicate certificates are not permitted.`,
+        certificate: existingActiveCert,
+        certificateId: existingActiveCert.certificateId,
       });
       return;
     }
 
     // Determine interview readiness status
     let interviewReadinessStatus: 'NOT_READY' | 'IN_PROGRESS' | 'READY' | 'ADVANCED';
-    if (overallScore >= 85) {
+    if (verifiedOverall >= 85) {
       interviewReadinessStatus = 'ADVANCED';
-    } else if (overallScore >= 70) {
+    } else if (verifiedOverall >= 75) {
       interviewReadinessStatus = 'READY';
-    } else if (overallScore >= 50) {
-      interviewReadinessStatus = 'IN_PROGRESS';
     } else {
-      interviewReadinessStatus = 'NOT_READY';
+      interviewReadinessStatus = 'IN_PROGRESS';
     }
+
+    // Fetch active template configuration
+    const activeTemplate = await CertificateTemplate.findOne({ isActive: true }) || await CertificateTemplate.findOne();
+    const templateId = activeTemplate?.templateId || 'template-01';
+
+    // Count sessions
+    const actualSessions = await QuestionInterviewSession.countDocuments({ studentId, status: 'Completed' });
 
     // Certificate valid for 1 year
     const expiryDate = new Date();
     expiryDate.setFullYear(expiryDate.getFullYear() + 1);
 
     const certificateId = generateCertificateId();
+    const baseUrl = env.appBaseUrl || 'http://localhost:4173';
+    const verificationUrl = `${baseUrl}/verify/${certificateId}`;
+
+    let qrCode = '';
+    try {
+      qrCode = await QRCode.toDataURL(verificationUrl, {
+        errorCorrectionLevel: 'H',
+        margin: 2,
+        width: 320,
+        color: { dark: '#0284c7', light: '#ffffff' },
+      });
+    } catch {
+      qrCode = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(verificationUrl)}`;
+    }
 
     const certificate = new Certificate({
       studentId,
       studentName: student.name,
       email: student.email,
       careerPath,
+      courseName: careerPath,
       certificateId,
       technicalScore,
       communicationScore,
       problemSolvingScore,
       confidenceScore,
-      overallScore,
-      sessionsCompleted,
+      overallScore: verifiedOverall,
+      passStatus: 'PASS',
+      templateId,
+      assessmentId,
+      sessionsCompleted: actualSessions || 1,
       interviewReadinessStatus,
-      strengths: strengths || [],
-      improvements: improvements || [],
+      strengths: strengths.length > 0 ? strengths : ['Technical Proficiency', 'Analytical Thinking'],
+      improvements: improvements.length > 0 ? improvements : ['Continuous Domain Exploration'],
+      status: 'APPROVED', // Auto-approved upon verified >= 75 assessment
+      qrCode,
+      verificationUrl,
       expiryDate,
       isActive: true,
     });
@@ -174,8 +197,12 @@ router.post(
 
     res.status(201).json({
       message: 'Certificate created successfully',
-      certificate,
+      certificate: {
+        ...certificate.toObject(),
+        certificateNumber: certificate.certificateId,
+      },
       certificateId,
+      certificateNumber: certificateId,
     });
   })
 );
@@ -238,10 +265,10 @@ router.get(
   })
 );
 
-// Verify certificate
+// GET /api/certificates/verify/:certificateId - Public verification endpoint (No auth required)
 router.get(
   '/verify/:certificateId',
-  asyncHandler(async (req: AuthRequest, res: Response) => {
+  asyncHandler(async (req: any, res: Response) => {
     const { certificateId } = req.params;
 
     const certificate = await Certificate.findOne({
@@ -250,27 +277,45 @@ router.get(
     });
 
     if (!certificate) {
-      res.status(404).json({ error: 'Certificate not found or has been revoked' });
+      res.status(404).json({ error: 'Certificate not found or has been revoked.', valid: false, verified: false });
       return;
     }
 
-    if (certificate.status !== 'APPROVED') {
-      res.status(400).json({ error: 'This certificate is not officially approved yet.' });
+    const isExpired = certificate.expiryDate && new Date() > new Date(certificate.expiryDate);
+    if (isExpired) {
+      res.status(410).json({ error: 'This certificate has expired.', valid: false, verified: false, certificate });
       return;
     }
 
-    if (new Date() > certificate.expiryDate) {
-      res.status(410).json({
-        error: 'Certificate has expired',
-        certificate,
-      });
-      return;
-    }
+    const template = await CertificateTemplate.findOne({ templateId: certificate.templateId }) ||
+      await CertificateTemplate.findOne({ isActive: true });
 
-    res.status(200).json({
-      message: 'Certificate is valid',
-      certificate,
+    res.json({
+      message: 'Certificate verified and authentic.',
+      valid: true,
       verified: true,
+      certificate: {
+        certificateId: certificate.certificateId,
+        studentName: certificate.studentName,
+        email: certificate.email ? `${certificate.email.slice(0, 3)}***@${certificate.email.split('@')[1]}` : 'N/A',
+        careerPath: certificate.careerPath,
+        overallScore: certificate.overallScore,
+        passStatus: certificate.overallScore >= 75 ? 'PASS' : 'FAIL',
+        technicalScore: certificate.technicalScore,
+        communicationScore: certificate.communicationScore,
+        problemSolvingScore: certificate.problemSolvingScore,
+        confidenceScore: certificate.confidenceScore,
+        issueDate: certificate.issueDate,
+        expiryDate: certificate.expiryDate,
+        interviewReadinessStatus: certificate.interviewReadinessStatus,
+        strengths: certificate.strengths,
+        improvements: certificate.improvements,
+        status: certificate.status,
+        qrCode: certificate.qrCode,
+        issuedByName: certificate.issuedByName || 'SkillDNA AI Certification Authority',
+        adminSignatureBase64: certificate.adminSignatureBase64,
+        template,
+      },
     });
   })
 );
@@ -624,4 +669,333 @@ router.post(
   })
 );
 
+// ===== ADMIN CERTIFICATE TEMPLATE & DESIGN SYSTEM ROUTES =====
+
+// GET /api/certificates/admin/templates - List all certificate design templates
+router.get(
+  '/admin/templates',
+  protect,
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    if (!req.user || !isAdminRole(req.user.role, req.user.email)) {
+      res.status(403).json({ error: 'Access denied. Administrator privileges required.' });
+      return;
+    }
+
+    let templates = await CertificateTemplate.find().sort({ createdAt: 1 });
+
+    // Auto-seed standard templates if none exist
+    if (templates.length === 0) {
+      const defaultTemplates = [
+        {
+          templateId: 'template-01',
+          name: 'Template 01 — Modern Cybernetic (Cyan)',
+          description: 'Contemporary high-tech design with neon cyan accents, dark backdrop, and digital security badge.',
+          primaryColor: '#0f172a',
+          secondaryColor: '#06b6d4',
+          accentColor: '#38bdf8',
+          fontFamily: 'Inter, sans-serif',
+          orgName: 'SkillDNA AI Global Certification Authority',
+          signatoryName: 'Dr. Evelyn Carter',
+          signatoryTitle: 'Head of AI Assessment & Verification',
+          layoutStyle: 'MODERN',
+          numberingFormat: 'SDNA-CERT-YYYY-XXXXXX',
+          headerText: 'Verified Competency Credential',
+          footerText: 'Officially verified and ledger-stamped by SkillDNA AI Autonomous Evaluator',
+          watermarkText: 'SKILLDNA VERIFIED',
+          showQrCode: true,
+          showCompetencies: true,
+          isActive: true,
+        },
+        {
+          templateId: 'template-02',
+          name: 'Template 02 — Executive Academic (Emerald)',
+          description: 'Formal credential aesthetic featuring emerald borders, ornate seal, and prestigious typographic balance.',
+          primaryColor: '#022c22',
+          secondaryColor: '#10b981',
+          accentColor: '#f59e0b',
+          fontFamily: 'Georgia, serif',
+          orgName: 'SkillDNA Institute of Professional Excellence',
+          signatoryName: 'Prof. Marcus Vance',
+          signatoryTitle: 'Dean of Industrial Employability',
+          layoutStyle: 'CLASSIC',
+          numberingFormat: 'SDNA-CERT-YYYY-XXXXXX',
+          headerText: 'Certificate of Professional Achievement',
+          footerText: 'Recognized by SkillDNA Partner Employers Worldwide',
+          watermarkText: 'ACADEMIC MERIT',
+          showQrCode: true,
+          showCompetencies: true,
+          isActive: false,
+        },
+        {
+          templateId: 'template-03',
+          name: 'Template 03 — Sovereign Gold (Luxury)',
+          description: 'Luxurious gold-gilded frame design tailored for top-tier candidates scoring 85%+ honors.',
+          primaryColor: '#18181b',
+          secondaryColor: '#f59e0b',
+          accentColor: '#fbbf24',
+          fontFamily: 'Cinzel, serif',
+          orgName: 'SkillDNA Global Honors Council',
+          signatoryName: 'Dame Sarah Jenkins',
+          signatoryTitle: 'Chief Examination Officer',
+          layoutStyle: 'ELEGANT',
+          numberingFormat: 'SDNA-CERT-YYYY-XXXXXX',
+          headerText: 'Distinguished Certificate of Excellence',
+          footerText: 'Awarded for exceptional performance exceeding top 90th percentile benchmarks',
+          watermarkText: 'HONORS DISTINCTION',
+          showQrCode: true,
+          showCompetencies: true,
+          isActive: false,
+        },
+        {
+          templateId: 'custom',
+          name: 'Custom Template — Bespoke Admin Layout',
+          description: 'Fully customizable canvas with user-defined hex colors, branding, custom signatures, and layout formatting.',
+          primaryColor: '#1e1b4b',
+          secondaryColor: '#818cf8',
+          accentColor: '#c084fc',
+          fontFamily: 'Inter, sans-serif',
+          orgName: 'SkillDNA Enterprise Academy',
+          signatoryName: 'Admin Director',
+          signatoryTitle: 'Director of Evaluation Operations',
+          layoutStyle: 'MINIMAL',
+          numberingFormat: 'SDNA-CERT-YYYY-XXXXXX',
+          headerText: 'Certificate of Verified Mastery',
+          footerText: 'Tamper-evident verification available via QR scan or URL lookup',
+          watermarkText: 'OFFICIAL RECORD',
+          showQrCode: true,
+          showCompetencies: true,
+          isActive: false,
+        },
+      ];
+
+      await CertificateTemplate.insertMany(defaultTemplates);
+      templates = await CertificateTemplate.find().sort({ createdAt: 1 });
+    }
+
+    res.json(templates);
+  })
+);
+
+// POST /api/certificates/admin/templates - Create new certificate design template
+router.post(
+  '/admin/templates',
+  protect,
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    if (!req.user || !isAdminRole(req.user.role, req.user.email)) {
+      res.status(403).json({ error: 'Access denied. Administrator privileges required.' });
+      return;
+    }
+
+    const {
+      templateId,
+      name,
+      description,
+      primaryColor,
+      secondaryColor,
+      accentColor,
+      fontFamily,
+      logoUrl,
+      orgName,
+      signatureUrl,
+      signatoryName,
+      signatoryTitle,
+      layoutStyle,
+      numberingFormat,
+      headerText,
+      footerText,
+      watermarkText,
+      showQrCode,
+      showCompetencies,
+      isActive,
+    } = req.body;
+
+    if (!name) {
+      res.status(400).json({ error: 'Template name is required.' });
+      return;
+    }
+
+    const template = new CertificateTemplate({
+      templateId: templateId || `custom-${Date.now()}`,
+      name,
+      description: description || '',
+      primaryColor: primaryColor || '#0f172a',
+      secondaryColor: secondaryColor || '#06b6d4',
+      accentColor: accentColor || '#f59e0b',
+      fontFamily: fontFamily || 'Inter, sans-serif',
+      logoUrl: logoUrl || '/brand/logo.svg',
+      orgName: orgName || 'SkillDNA AI Global Certification Authority',
+      signatureUrl: signatureUrl || '',
+      signatoryName: signatoryName || 'Dr. Evelyn Carter',
+      signatoryTitle: signatoryTitle || 'Head of AI Assessment',
+      layoutStyle: layoutStyle || 'MODERN',
+      numberingFormat: numberingFormat || 'SDNA-CERT-YYYY-XXXXXX',
+      headerText: headerText || 'Verified Competency Credential',
+      footerText: footerText || 'Officially verified and registered on SkillDNA AI Ledger',
+      watermarkText: watermarkText || 'SKILLDNA VERIFIED',
+      showQrCode: showQrCode !== undefined ? showQrCode : true,
+      showCompetencies: showCompetencies !== undefined ? showCompetencies : true,
+      isActive: Boolean(isActive),
+      createdBy: req.user._id,
+    });
+
+    if (isActive) {
+      await CertificateTemplate.updateMany({}, { isActive: false });
+    }
+
+    await template.save();
+
+    res.status(201).json({
+      message: 'Certificate design template created successfully',
+      template,
+    });
+  })
+);
+
+// PUT /api/certificates/admin/templates/:id - Update existing certificate template
+router.put(
+  '/admin/templates/:id',
+  protect,
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    if (!req.user || !isAdminRole(req.user.role, req.user.email)) {
+      res.status(403).json({ error: 'Access denied. Administrator privileges required.' });
+      return;
+    }
+
+    const template = await CertificateTemplate.findById(req.params.id);
+    if (!template) {
+      res.status(404).json({ error: 'Certificate template not found.' });
+      return;
+    }
+
+    const updatable = [
+      'name', 'description', 'primaryColor', 'secondaryColor', 'accentColor',
+      'fontFamily', 'logoUrl', 'orgName', 'signatureUrl', 'signatoryName',
+      'signatoryTitle', 'layoutStyle', 'numberingFormat', 'headerText',
+      'footerText', 'watermarkText', 'showQrCode', 'showCompetencies', 'isActive',
+    ];
+
+    for (const key of updatable) {
+      if (req.body[key] !== undefined) {
+        (template as any)[key] = req.body[key];
+      }
+    }
+
+    if (req.body.isActive) {
+      await CertificateTemplate.updateMany({ _id: { $ne: template._id } }, { isActive: false });
+    }
+
+    await template.save();
+
+    res.json({
+      message: 'Certificate template updated successfully',
+      template,
+    });
+  })
+);
+
+// POST or PATCH /api/certificates/admin/templates/:id/activate - Set template as active
+const activateTemplateHandler = asyncHandler(async (req: AuthRequest, res: Response) => {
+  if (!req.user || !isAdminRole(req.user.role, req.user.email)) {
+    res.status(403).json({ error: 'Access denied. Administrator privileges required.' });
+    return;
+  }
+
+  await CertificateTemplate.updateMany({}, { isActive: false });
+  const template = await CertificateTemplate.findByIdAndUpdate(
+    req.params.id,
+    { isActive: true },
+    { new: true }
+  );
+
+  if (!template) {
+    res.status(404).json({ error: 'Certificate template not found.' });
+    return;
+  }
+
+  res.json({
+    message: `Template "${template.name}" activated as the platform default`,
+    template,
+  });
+});
+
+router.post('/admin/templates/:id/activate', protect, activateTemplateHandler);
+router.patch('/admin/templates/:id/activate', protect, activateTemplateHandler);
+
+
+// GET /api/certificates/admin/all - Search, filter, and audit all certificates
+router.get(
+  '/admin/all',
+  protect,
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    if (!req.user || !isAdminRole(req.user.role, req.user.email)) {
+      res.status(403).json({ error: 'Access denied. Administrator privileges required.' });
+      return;
+    }
+
+    const { search = '', status = '', page = 1, limit = 20 } = req.query;
+
+    const query: any = {};
+    if (status) query.status = status;
+    if (search) {
+      query.$or = [
+        { studentName: new RegExp(String(search), 'i') },
+        { email: new RegExp(String(search), 'i') },
+        { certificateId: new RegExp(String(search), 'i') },
+        { careerPath: new RegExp(String(search), 'i') },
+      ];
+    }
+
+    const skip = (Number(page) - 1) * Number(limit);
+    const certificates = await Certificate.find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(Number(limit));
+    const total = await Certificate.countDocuments(query);
+
+    res.json({
+      certificates,
+      total,
+      page: Number(page),
+      totalPages: Math.ceil(total / Number(limit)),
+    });
+  })
+);
+
+// POST /api/certificates/admin/regenerate/:certificateId - Regenerate certificate with current active template
+router.post(
+  '/admin/regenerate/:certificateId',
+  protect,
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    if (!req.user || !isAdminRole(req.user.role, req.user.email)) {
+      res.status(403).json({ error: 'Access denied. Administrator privileges required.' });
+      return;
+    }
+
+    const certificate = await Certificate.findOne({ certificateId: req.params.certificateId });
+    if (!certificate) {
+      res.status(404).json({ error: 'Certificate not found.' });
+      return;
+    }
+
+    const activeTemplate = await CertificateTemplate.findOne({ isActive: true }) || await CertificateTemplate.findOne();
+    if (activeTemplate) {
+      certificate.templateId = activeTemplate.templateId;
+    }
+
+    // Refresh expiry
+    const expiry = new Date();
+    expiry.setFullYear(expiry.getFullYear() + 1);
+    certificate.expiryDate = expiry;
+    certificate.status = 'APPROVED';
+
+    await certificate.save();
+
+    res.json({
+      message: 'Certificate regenerated and updated with active template successfully',
+      certificate,
+    });
+  })
+);
+
 export default router;
+
