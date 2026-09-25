@@ -125,8 +125,11 @@ async def admin_otp_verify(payload: AdminVerifyOTPRequest, request: Request):
             detail="The verification code is invalid, expired, or has already been used."
         )
 
-    # Fetch admin details
+    # Fetch admin details from admins or users collection
     admin = await admins_collection.find_one({"email": email})
+    if not admin:
+        from database import users_collection
+        admin = await users_collection.find_one({"email": email, "role": {"$in": ["MAIN_ADMIN", "ADMIN", "admin", "SUPER_ADMIN", "SUPPORT_TEAM"]}})
     if not admin:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -141,10 +144,13 @@ async def admin_otp_verify(payload: AdminVerifyOTPRequest, request: Request):
 
     admin_role = admin.get("role") or "ADMIN"
 
-    # Generate Admin JWT
+    # Generate Admin JWT with standard claims
     token_data = {
         "sub": email,
-        "role": admin_role
+        "id": str(admin["_id"]),
+        "email": email,
+        "role": str(admin_role).strip().upper(),
+        "name": admin.get("name") or admin.get("full_name") or email.split("@")[0]
     }
     access_token = create_access_token(data=token_data)
 
@@ -162,7 +168,7 @@ async def admin_otp_verify(payload: AdminVerifyOTPRequest, request: Request):
         id=str(admin["_id"]),
         email=admin["email"],
         role=admin_role,
-        created_at=admin["created_at"]
+        created_at=admin.get("created_at") or datetime.utcnow()
     )
     logger.info(f"Admin verified successfully. JWT issued for {email} with role {admin_role}")
     return AdminTokenResponse(access_token=access_token, admin=admin_response)
@@ -173,18 +179,21 @@ async def get_admin_me(current_admin: dict = Depends(get_current_admin)):
     Fetch information about the currently logged-in admin.
     Uses JWT verification dependency.
     """
-    email = current_admin.get("sub")
+    email = current_admin.get("email") or current_admin.get("sub")
     admin = await admins_collection.find_one({"email": email})
+    if not admin:
+        from database import users_collection
+        admin = await users_collection.find_one({"email": email, "role": {"$in": ["MAIN_ADMIN", "ADMIN", "admin", "SUPER_ADMIN", "SUPPORT_TEAM"]}})
     if not admin:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Admin not found."
         )
         
-    admin_role = admin.get("role") or "ADMIN"
+    admin_role = admin.get("role") or current_admin.get("role") or "ADMIN"
     return AdminResponse(
         id=str(admin["_id"]),
         email=admin["email"],
         role=admin_role,
-        created_at=admin["created_at"]
+        created_at=admin.get("created_at") or datetime.utcnow()
     )

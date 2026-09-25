@@ -166,6 +166,8 @@ async def login(payload: StudentLogin, request: Request):
     # Generate JWT
     token_data = {
         "sub": email,
+        "id": str(user["_id"]),
+        "email": email,
         "role": user_role,
         "name": user.get("name", "User")
     }
