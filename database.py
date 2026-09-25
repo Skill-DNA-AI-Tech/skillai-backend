@@ -38,6 +38,9 @@ applications_collection = db["applications"]
 career_twin_memories_collection = db["career_twin_memories"]
 student_answers_collection = db["studentanswers"]
 audit_logs_collection = db["audit_logs"]
+certificate_templates_collection = db["certificate_templates"]
+reports_collection = db["reports"]
+assessments_collection = db["assessments"]
 
 async def init_db():
     """

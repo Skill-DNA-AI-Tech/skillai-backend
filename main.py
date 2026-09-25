@@ -59,10 +59,12 @@ async def root_health_check():
     }
 
 @app.get("/api")
+@app.get("/api/health")
+@app.get("/health")
 async def api_health_check():
     return {
         "status": "healthy",
-        "service": "SkillDNA Tech AI Auth Service",
+        "service": "SkillDNA Tech AI Backend Service",
         "version": "1.0.0",
         "message": "SkillDNA API is running"
     }
