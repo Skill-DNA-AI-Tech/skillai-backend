@@ -49,6 +49,7 @@ app.use('/api/interview', interviewRoutes);
 app.use('/api/resume', resumeRoutes);
 app.use('/api/recruiters', recruiterRoutes);
 app.use('/api/community', communityRoutes);
+app.use('/api/admin/notes', adminNotesRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/ai', aiRoutes);
@@ -58,7 +59,6 @@ app.use('/api/certificates', certificateRoutes);
 app.use('/api/feedback', feedbackRoutes);
 app.use('/api/mcq', mcqRoutes);
 app.use('/api/career-change-requests', careerChangeRoutes);
-app.use('/api/admin/notes', adminNotesRoutes);
 
 // Public Certificate Verification Endpoint (No login required for QR scans)
 app.get('/api/verify/:certificateId', async (req, res) => {

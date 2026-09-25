@@ -81,7 +81,7 @@ async function checkAllUsers() {
     }
 
     results.push({
-      id: u._id.toString(),
+      id: (u as any)._id?.toString() || 'unknown',
       name: u.name || u.full_name || 'N/A',
       email: u.email,
       role: u.role,

@@ -766,10 +766,8 @@ router.get('/admins/pending', asyncHandler(async (req: AuthRequest, res) => {
   res.json(pendingAdmins.map(serializeUserAccount));
 }));
 
-// GET /api/admin/admins - Retrieve all Admin accounts (Main Admin only)
+// GET /api/admin/admins - Retrieve all Admin accounts (Admin or Main Admin)
 router.get('/admins', asyncHandler(async (req: AuthRequest, res) => {
-  if (!requireMainAdmin(req, res)) return;
-
   const admins = await User.find({
     role: { $in: adminAccountRoles },
     email: { $nin: ['skilldnaai@ai.com'] },
@@ -1213,7 +1211,7 @@ router.post('/test-users', protect, asyncHandler(async (req: AuthRequest, res) =
 router.get('/test-users', protect, asyncHandler(async (req: AuthRequest, res) => {
   const testUsers = await User.find({
     $or: [{ isTestUser: true }, { isPreProductionUser: true }]
-  }).sort({ createdAt: -1 });
+  }).select('-password -otp.codeHash').sort({ createdAt: -1 });
 
   const result = await Promise.all(
     testUsers.map(async (u) => {
