@@ -34,6 +34,7 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 
 app.set('trust proxy', 1);
 app.use(cors({ origin: true, credentials: true }));
+app.options('*', cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
