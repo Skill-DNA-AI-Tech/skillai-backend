@@ -1,8 +1,8 @@
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    mongodb_uri: str
-    jwt_secret: str
+    mongodb_uri: str = "mongodb+srv://ajayrpatil96k:Ajay%401711@skillai.libipae.mongodb.net/test?retryWrites=true&w=majority"
+    jwt_secret: str = "super_secret_jwt_key_skilldna"
     google_client_id: str = "849754791910-kvubjul5bnqi8un3c38on96bdengsn37.apps.googleusercontent.com"
     resend_api_key: str = ""
     supabase_client_id: str = ""

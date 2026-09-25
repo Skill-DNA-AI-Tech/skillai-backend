@@ -8,6 +8,7 @@ from config import settings
 from database import init_db
 from routes.auth import router as student_auth_router
 from routes.admin import router as admin_auth_router
+from routes.admin_ops import router as admin_ops_router
 
 # Configure logging format and level
 logging.basicConfig(
@@ -41,10 +42,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register API Routers
-# # Register API Routers under consistent /api prefix
+# Register API Routers under consistent /api prefix as well as root prefix
 app.include_router(student_auth_router, prefix="/api")
 app.include_router(admin_auth_router, prefix="/api")
+app.include_router(admin_ops_router, prefix="/api")
+app.include_router(admin_ops_router, prefix="")
+app.include_router(admin_auth_router, prefix="")
+app.include_router(student_auth_router, prefix="")
 
 @app.get("/")
 async def root_health_check():
