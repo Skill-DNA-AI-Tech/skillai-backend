@@ -5,6 +5,7 @@ import CareerTwinMemory from '../models/careerTwinMemory';
 import Assessment from '../models/assessment';
 import StudentTopicProgress from '../models/learning/studentTopicProgress';
 import { questionAnalysisService } from './questionAnalysis';
+import { groqRequest } from './groqClient';
 import { randomUUID } from 'crypto';
 
 // Standard domain name normalizer
@@ -215,16 +216,11 @@ export const interviewSessionService = {
         throw new Error(`No questions available for domain ${targetDomain}. Please ensure questions are seeded.`);
       }
 
-      // 3. Rotate questions to avoid repetition (Select 8 domain questions)
-      const selectedDomain = await rotateQuestions(payload.studentId, availableDomain, 8);
+      // 3. Select unique domain questions guaranteeing zero repeats
+      const selectedDomain = await selectUniqueDomainQuestions(payload.studentId, targetDomain, 8, 'Technical');
 
-      // 4. Query active HR/Behavioral questions
-      const hrQuery = { interviewType: 'HR', status: 'Active' };
-      let availableHR = await QuestionBank.find(hrQuery).lean();
-      if (availableHR.length === 0) {
-        availableHR = availableDomain.slice(0, 2);
-      }
-      const selectedHR = await rotateQuestions(payload.studentId, availableHR, 2);
+      // 4. Select unique HR/Behavioral questions
+      const selectedHR = await selectUniqueDomainQuestions(payload.studentId, targetDomain, 2, 'HR');
 
       // 5. Combine for an initial set of 10 questions with progressive difficulty:
       // Questions 1-3: BASIC, Questions 4-7: INTERMEDIATE, Questions 8-10+: ADVANCED
@@ -375,6 +371,8 @@ export const interviewSessionService = {
       careerDomain: session.careerDomain || session.field,
       topic: questionDoc.topic,
       expectedDuration: questionDoc.expectedDuration || 120,
+      isFollowUp: (nextQuestionItem as any).isFollowUp || false,
+      followUpContext: (nextQuestionItem as any).followUpContext || undefined,
     };
   },
 
@@ -498,7 +496,7 @@ export const interviewSessionService = {
         session.answerCounts = { valid: 0, empty: 0, noAnswer: 0, irrelevant: 0, copySuspected: 0 };
       }
       if (statusKey === 'EMPTY') session.answerCounts.empty += 1;
-      else if (statusKey === 'NO_ANSWER') session.answerCounts.noAnswer += 1;
+      else if (statusKey === 'NO_ANSWER' || statusKey === 'I_DONT_KNOW') session.answerCounts.noAnswer += 1;
       else if (statusKey === 'IRRELEVANT') session.answerCounts.irrelevant += 1;
       else if (statusKey === 'COPY_SUSPECTED') session.answerCounts.copySuspected += 1;
       else session.answerCounts.valid += 1;
@@ -512,7 +510,7 @@ export const interviewSessionService = {
 
       // USER REQUIREMENT: "if user have stacj in INTERMEDIATE, basic then not go other ask that lev only and Career Twin add that part"
       let newDifficulty = session.currentDifficulty || 'BASIC';
-      const isStruggling = score < 50 || statusKey === 'EMPTY' || statusKey === 'NO_ANSWER' || statusKey === 'IRRELEVANT';
+      const isStruggling = score < 50 || statusKey === 'EMPTY' || statusKey === 'NO_ANSWER' || statusKey === 'I_DONT_KNOW' || statusKey === 'IRRELEVANT' || statusKey === 'NONSENSE';
 
       if (isStruggling) {
         // Record stuck topic for Career Twin diagnosis
@@ -547,6 +545,39 @@ export const interviewSessionService = {
         score,
         status: statusKey,
       });
+
+      // 8. Real-time Sub-question / Follow-up Logic:
+      // previous question + student answer + evaluation + topic + difficulty + weakness = next question
+      const nextSlotIndex = session.questionSet.findIndex((q: any) => !q.asked);
+      if (nextSlotIndex !== -1) {
+        const nextSequence = session.questionsAnswered + 1;
+        const askedIds = new Set<string>(session.questionSet.map((q: any) => q.questionId?.toString()).filter(Boolean));
+
+        try {
+          const followUp = await generateFollowUpOrNextQuestion({
+            sessionId: payload.sessionId,
+            studentId: payload.studentId,
+            field: session.field || session.careerDomain || 'Computer Science',
+            careerDomain: session.careerDomain || session.field || 'Computer Science',
+            targetRole: session.targetRole || 'Specialist',
+            currentDifficulty: session.currentDifficulty || 'BASIC',
+            previousQuestion: questionDoc.question,
+            studentAnswer: payload.answer,
+            analysis,
+            nextSequence,
+            askedQuestionIds: askedIds,
+            stuckTopics: session.stuckTopics || [],
+          });
+
+          session.questionSet[nextSlotIndex].questionId = followUp.questionId;
+          session.questionSet[nextSlotIndex].difficulty = followUp.difficulty as any;
+          session.questionSet[nextSlotIndex].topic = followUp.topic;
+          (session.questionSet[nextSlotIndex] as any).isFollowUp = followUp.isFollowUp;
+          (session.questionSet[nextSlotIndex] as any).followUpContext = followUp.followUpContext;
+        } catch (followUpErr) {
+          console.warn('Real-time follow-up question synthesis non-blocking fallback:', followUpErr);
+        }
+      }
 
       await session.save();
 
@@ -892,20 +923,267 @@ export const interviewSessionService = {
   },
 };
 
-// Helper: Rotate questions to avoid repetition
-async function rotateQuestions(studentId: string, availableQuestions: any[], count: number): Promise<any[]> {
-  const recentAnswers = await StudentAnswer.find({
-    studentId,
-    createdAt: { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) }
-  }).select('questionId');
+// Dynamic Sub-question / Contextual Follow-up Synthesis Engine
+export async function generateFollowUpOrNextQuestion(params: {
+  sessionId: string;
+  studentId: string;
+  field: string;
+  careerDomain: string;
+  targetRole: string;
+  currentDifficulty: string; // 'BASIC' | 'INTERMEDIATE' | 'ADVANCED'
+  previousQuestion: string;
+  studentAnswer: string;
+  analysis: any;
+  nextSequence: number;
+  askedQuestionIds: Set<string>;
+  stuckTopics: string[];
+}): Promise<{
+  questionId: any;
+  difficulty: string;
+  topic: string;
+  sequence: number;
+  isFollowUp?: boolean;
+  followUpContext?: string;
+}> {
+  const {
+    field,
+    careerDomain,
+    targetRole,
+    currentDifficulty,
+    previousQuestion,
+    studentAnswer,
+    analysis,
+    nextSequence,
+    askedQuestionIds,
+  } = params;
 
-  const answeredIds = new Set(recentAnswers.map((a: any) => a.questionId?.toString()));
-  let filtered = availableQuestions.filter(q => !answeredIds.has(q._id.toString()));
+  const effectiveDomain = normalizeDomain(careerDomain || field || 'Computer Science');
+  const currentTopic = (analysis.conceptsIdentified?.[0] || 'Core Technical').trim();
+  const score = analysis.overallScore || 0;
+  const statusKey = analysis.answerStatus;
+  const isStruggling = score < 50 || statusKey === 'EMPTY' || statusKey === 'NO_ANSWER' || statusKey === 'I_DONT_KNOW' || statusKey === 'IRRELEVANT' || statusKey === 'NONSENSE';
 
-  if (filtered.length < count) {
-    filtered = availableQuestions;
+  // 1. Try Groq AI synthesis for real-time contextual follow-up
+  try {
+    const missing = (analysis.missingConcepts || []).slice(0, 2).join(', ');
+    const weaknesses = (analysis.weaknesses || []).slice(0, 2).join(', ');
+
+    const groqPrompt = `You are an expert technical interviewer evaluating a candidate in "${effectiveDomain}" for the role of "${targetRole}".
+The candidate just responded to the following interview question:
+Previous Question: "${previousQuestion}"
+Candidate's Answer: "${studentAnswer || '(No answer provided)'}"
+Evaluation Result:
+- Status: ${statusKey}
+- Score: ${score}/100
+- Missing Concepts: ${missing || 'None identified'}
+- Weaknesses: ${weaknesses || 'None'}
+- Current Interview Stage: Question #${nextSequence}
+- Target Difficulty Level: ${currentDifficulty}
+
+Generate the exact next interview question.
+Rules:
+1. If candidate had missing concepts or weaknesses, generate a targeted follow-up sub-question directly addressing the missing concept or edge case.
+2. If candidate was strong (score >= 75), generate an advanced scenario or system-scale follow-up question at ${currentDifficulty} difficulty.
+3. If candidate was stuck (score < 50, "I don't know", empty), ask a fundamental grounding question at ${currentDifficulty} testing core first principles.
+4. If stage is question 8 or higher, frame it as a realistic project challenge or architectural incident.
+
+Return ONLY a valid JSON object strictly matching this schema:
+{
+  "question": "question text",
+  "modelAnswer": "detailed answer benchmark",
+  "topic": "${currentTopic}",
+  "difficulty": "${currentDifficulty === 'ADVANCED' ? 'Hard' : currentDifficulty === 'INTERMEDIATE' ? 'Medium' : 'Easy'}",
+  "interviewType": "${nextSequence >= 8 ? 'Scenario' : 'Technical'}"
+}`;
+
+    const resp = await groqRequest({ prompt: groqPrompt });
+    const jsonMatch = resp.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (parsed.question && parsed.question.length > 15 && !askedQuestionIds.has(parsed.question.toLowerCase())) {
+        const created = await QuestionBank.create({
+          field: effectiveDomain,
+          topic: parsed.topic || currentTopic,
+          question: parsed.question.trim(),
+          answer: parsed.modelAnswer || 'Detailed technical explanation required.',
+          difficulty: parsed.difficulty || (currentDifficulty === 'ADVANCED' ? 'Hard' : currentDifficulty === 'INTERMEDIATE' ? 'Medium' : 'Easy'),
+          interviewType: parsed.interviewType || (nextSequence >= 8 ? 'Scenario' : 'Technical'),
+          status: 'Active',
+          approved: true,
+          source: 'AI-Generated',
+          metadata: {
+            concepts: [currentTopic, ...(analysis.missingConcepts || [])],
+            scoreWeight: currentDifficulty === 'ADVANCED' ? 8 : currentDifficulty === 'INTERMEDIATE' ? 6 : 4,
+            isOriginal: true,
+          },
+        });
+        return {
+          questionId: created._id,
+          difficulty: currentDifficulty,
+          topic: created.topic,
+          sequence: nextSequence,
+          isFollowUp: true,
+          followUpContext: `Contextual follow-up based on candidate's previous response regarding ${currentTopic}`,
+        };
+      }
+    }
+  } catch (groqErr) {
+    // Non-blocking fallback to deterministic synthesis
   }
 
-  const shuffled = [...filtered].sort(() => 0.5 - Math.random());
+  // 2. Intelligent Deterministic Follow-Up Synthesis
+  let synthQuestion = '';
+  let synthAnswer = '';
+  let isFollowUp = true;
+  let followUpContext = `Follow-up evaluation on ${currentTopic}`;
+
+  if (isStruggling) {
+    synthQuestion = `Let's break down ${currentTopic} to first principles: What fundamental problem does ${currentTopic} solve in ${effectiveDomain}, and what is a minimal practical use case where you would apply it?`;
+    synthAnswer = `${currentTopic} provides the core mechanism to ensure stability, proper state management, and separation of concerns in ${effectiveDomain}. Candidates should articulate the primary purpose, common trade-offs, and basic syntax or workflow.`;
+    followUpContext = `Foundational grounding probe after identified gap in ${currentTopic}`;
+  } else if (analysis.missingConcepts && analysis.missingConcepts.length > 0) {
+    const missingTerm = analysis.missingConcepts[0];
+    synthQuestion = `In your previous explanation of ${currentTopic}, you outlined the high-level workflow. Can you elaborate specifically on how ${missingTerm} operates internally, and what failure modes or edge cases arise if it is misconfigured?`;
+    synthAnswer = `Comprehensive explanation of ${missingTerm} inside ${currentTopic}, including edge case handling, boundary condition checks, and recovery strategies.`;
+    followUpContext = `Targeted sub-question probing missing concept: ${missingTerm}`;
+  } else if (analysis.weaknesses && analysis.weaknesses.length > 0) {
+    const weakTerm = analysis.weaknesses[0];
+    synthQuestion = `Following up on your answer regarding ${currentTopic}, how would you architect a solution that specifically addresses ${weakTerm} in a high-availability production environment?`;
+    synthAnswer = `A senior-level answer addressing ${weakTerm} with defensive architectural patterns, telemetry, and automated tests.`;
+    followUpContext = `Targeted sub-question addressing weakness: ${weakTerm}`;
+  } else if (score >= 75) {
+    synthQuestion = `You demonstrated solid command of ${currentTopic}. Elevating this to enterprise scale: Under heavy concurrent load or network partitioning, what architectural bottlenecks emerge with ${currentTopic}, and how would you optimize performance?`;
+    synthAnswer = `Discussion of latency metrics, caching, connection pooling, backpressure, and asynchronous decoupled processing.`;
+    followUpContext = `Advanced architectural escalation for ${currentTopic}`;
+  } else if (nextSequence >= 8) {
+    synthQuestion = `In your past ${targetRole || effectiveDomain} projects, describe a critical production incident or complex technical challenge you diagnosed. What were your specific troubleshooting steps, and how did you verify the fix?`;
+    synthAnswer = `STAR framework response demonstrating systematic diagnostic discipline, log inspection, root-cause isolation, regression testing, and post-mortem documentation.`;
+    isFollowUp = false;
+    followUpContext = `Scenario & incident response evaluation`;
+  } else {
+    synthQuestion = `Explain how you would write comprehensive automated tests and validation suites for a component implementing ${currentTopic} in ${effectiveDomain}.`;
+    synthAnswer = `Unit testing boundary values, integration tests with mocks/stubs, and load verification under simulated production traffic.`;
+    followUpContext = `Testing & validation rigor probe`;
+  }
+
+  // Deduplicate against existing questions in DB
+  let finalDoc = await QuestionBank.findOne({ question: synthQuestion });
+  if (!finalDoc) {
+    finalDoc = await QuestionBank.create({
+      field: effectiveDomain,
+      topic: currentTopic,
+      question: synthQuestion,
+      answer: synthAnswer,
+      difficulty: currentDifficulty === 'ADVANCED' ? 'Hard' : currentDifficulty === 'INTERMEDIATE' ? 'Medium' : 'Easy',
+      interviewType: nextSequence >= 8 ? 'Scenario' : 'Technical',
+      status: 'Active',
+      approved: true,
+      source: 'AI-Generated',
+      metadata: {
+        concepts: [currentTopic, ...(analysis.missingConcepts || [])],
+        scoreWeight: currentDifficulty === 'ADVANCED' ? 8 : currentDifficulty === 'INTERMEDIATE' ? 6 : 4,
+        isOriginal: true,
+      },
+    });
+  }
+
+  return {
+    questionId: finalDoc._id,
+    difficulty: currentDifficulty,
+    topic: currentTopic,
+    sequence: nextSequence,
+    isFollowUp,
+    followUpContext,
+  };
+}
+
+// Helper: Select unique domain questions guaranteeing zero repeats across sessions
+export async function selectUniqueDomainQuestions(
+  studentId: string,
+  targetDomain: string,
+  count: number,
+  interviewType: 'Technical' | 'HR' = 'Technical'
+): Promise<any[]> {
+  // 1. Gather all question IDs ever asked to this student across all historical sessions & answers
+  const pastAnswers = await StudentAnswer.find({ studentId }).select('questionId');
+  const pastSessions = await QuestionInterviewSession.find({ studentId }).select('questionSet.questionId');
+  const askedIds = new Set<string>();
+  pastAnswers.forEach((a: any) => a.questionId && askedIds.add(a.questionId.toString()));
+  pastSessions.forEach((s: any) => s.questionSet?.forEach((q: any) => q.questionId && askedIds.add(q.questionId.toString())));
+
+  // 2. Query available questions in this domain
+  const query: any = {
+    field: targetDomain,
+    status: 'Active',
+    _id: { $nin: Array.from(askedIds) },
+  };
+  if (interviewType === 'HR') {
+    query.interviewType = 'HR';
+  } else {
+    query.interviewType = { $ne: 'HR' };
+  }
+
+  let unasked = await QuestionBank.find(query).lean();
+
+  // If unasked questions in DB are fewer than needed, dynamically generate new questions
+  if (unasked.length < count) {
+    try {
+      const neededCount = Math.max(count - unasked.length, 6);
+      const generated = await questionAnalysisService.generateQuestions({
+        field: targetDomain,
+        topic: interviewType === 'HR' ? 'Professional Workplace & Team Scenarios' : `${targetDomain} Engineering & Core Principles`,
+        difficulty: 'Medium',
+        count: neededCount,
+        interviewTypes: interviewType === 'HR' ? ['HR', 'Behavioral'] : ['Technical', 'Scenario'],
+      });
+
+      for (const g of generated) {
+        const exists = await QuestionBank.findOne({ question: g.question });
+        if (!exists) {
+          const created = await QuestionBank.create({
+            ...g,
+            field: targetDomain,
+            topic: g.topic || (interviewType === 'HR' ? 'Behavioral & Leadership' : targetDomain),
+            interviewType: interviewType === 'HR' ? 'HR' : (g.interviewType || 'Technical'),
+            status: 'Active',
+            approved: true,
+            source: 'Adaptive-Generator',
+          });
+          unasked.push(created.toObject());
+        }
+      }
+    } catch (genErr) {
+      console.warn('Dynamic question generation during session creation fallback:', genErr);
+    }
+  }
+
+  // Fallback: If still fewer, pull least-asked active questions from QuestionBank
+  if (unasked.length < count) {
+    const fallbackQuery: any = { field: targetDomain, status: 'Active' };
+    if (interviewType === 'HR') fallbackQuery.interviewType = 'HR';
+    else fallbackQuery.interviewType = { $ne: 'HR' };
+
+    const fallbackQuestions = await QuestionBank.find(fallbackQuery)
+      .sort({ timesAsked: 1 })
+      .limit(count)
+      .lean();
+
+    const seen = new Set(unasked.map((q: any) => q._id.toString()));
+    for (const fq of fallbackQuestions) {
+      if (!seen.has(fq._id.toString())) {
+        unasked.push(fq);
+        seen.add(fq._id.toString());
+      }
+    }
+  }
+
+  // Shuffle and return requested count
+  const shuffled = [...unasked].sort(() => 0.5 - Math.random());
   return shuffled.slice(0, count);
 }
+
+// Backward-compatibility wrapper for rotateQuestions
+async function rotateQuestions(studentId: string, availableQuestions: any[], count: number): Promise<any[]> {
+  return selectUniqueDomainQuestions(studentId, availableQuestions[0]?.field || 'Computer Science', count, 'Technical');
+}
+

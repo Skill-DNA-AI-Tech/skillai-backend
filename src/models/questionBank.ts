@@ -149,6 +149,8 @@ const QuestionInterviewSessionSchema = new mongoose.Schema(
         asked: { type: Boolean, default: false },
         askedAt: Date,
         answerSubmitted: Boolean,
+        isFollowUp: { type: Boolean, default: false },
+        followUpContext: String,
       }
     ],
     

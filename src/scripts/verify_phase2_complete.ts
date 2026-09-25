@@ -231,6 +231,70 @@ async function runPhase2EndToEndVerification() {
     });
     assert(weakAnswer.answerStatus === 'I_DONT_KNOW', 'Unanswered/unfamiliar concept is flagged as I_DONT_KNOW for Career Twin capture');
 
+    // 2.4 Verify dynamic session initialization, question rotation & zero duplication
+    console.log('\n--- [Module 2.4: Real-Time Dynamic Sub-Question & Zero Repetition Engine] ---');
+    const session1 = await interviewSessionService.createSession({
+      studentId: studentUser._id.toString(),
+      field: 'Computer Science',
+      careerDomain: 'Computer Science',
+      targetRole: 'Full Stack Engineer',
+      questionCount: 10,
+    });
+    assert(session1.sessionId !== undefined, 'Live adaptive session created successfully');
+    assert(session1.currentDifficulty === 'BASIC', 'Session starts at baseline BASIC difficulty');
+
+    // Fetch first question
+    const liveQ1 = await interviewSessionService.getNextQuestion(session1.sessionId, studentUser._id.toString());
+    assert(liveQ1.questionId !== undefined, 'First live question retrieved from session');
+    assert(liveQ1.sequence === 1, 'Question sequence correctly starts at 1');
+
+    // Submit strong answer to Question 1 matching question topic
+    const qDoc1 = await QuestionBank.findById(liveQ1.questionId);
+    const submitRes1 = await interviewSessionService.submitAnswer({
+      sessionId: session1.sessionId,
+      studentId: studentUser._id.toString(),
+      questionId: liveQ1.questionId.toString(),
+      answer: qDoc1?.answer || `${liveQ1.topic} implements core architectural principles, state isolation, and predictable lifecycle guarantees.`,
+    });
+    assert(submitRes1.saved === true, 'Answer saved and evaluated by backend');
+    assert(submitRes1.score >= 75, 'Heuristic or AI evaluation awards >= 75% for comprehensive answer');
+    assert(submitRes1.currentDifficulty === 'INTERMEDIATE', 'Strong answer promotes difficulty from BASIC to INTERMEDIATE');
+
+    // Fetch Question 2 - should be the dynamically injected follow-up question
+    const liveQ2 = await interviewSessionService.getNextQuestion(session1.sessionId, studentUser._id.toString());
+    assert(liveQ2.sequence === 2, 'Question 2 sequence verified');
+    assert(liveQ2.currentDifficulty === 'INTERMEDIATE', 'Question 2 difficulty reflects promoted INTERMEDIATE level');
+    assert(liveQ2.isFollowUp === true, 'Question 2 is dynamically injected contextual follow-up sub-question');
+
+    // Submit "I don't know" answer to Question 2
+    const submitRes2 = await interviewSessionService.submitAnswer({
+      sessionId: session1.sessionId,
+      studentId: studentUser._id.toString(),
+      questionId: liveQ2.questionId.toString(),
+      answer: 'I do not know the answer to this question, please skip.',
+    });
+    assert(submitRes2.answerStatus === 'I_DONT_KNOW', 'Input classified strictly as I_DONT_KNOW');
+    assert(submitRes2.score === 0, 'I_DONT_KNOW strictly receives 0 score');
+    assert(submitRes2.currentDifficulty === 'INTERMEDIATE', 'Difficulty remains at INTERMEDIATE when struggling (does not promote)');
+
+    // Fetch Question 3 - should be grounding question
+    const liveQ3 = await interviewSessionService.getNextQuestion(session1.sessionId, studentUser._id.toString());
+    assert(liveQ3.sequence === 3, 'Question 3 sequence verified');
+
+    // Zero Question Repetition across sessions test
+    console.log('Testing zero question repetition across distinct sessions...');
+    const session2 = await interviewSessionService.createSession({
+      studentId: studentUser._id.toString(),
+      field: 'Computer Science',
+      careerDomain: 'Computer Science',
+      targetRole: 'Full Stack Engineer',
+      questionCount: 10,
+    });
+    const s1Questions = new Set([liveQ1.questionId.toString(), liveQ2.questionId.toString()]);
+    const s2Questions = (await QuestionInterviewSession.findOne({ sessionId: session2.sessionId }))?.questionSet.map((q: any) => q.questionId.toString()) || [];
+    const hasOverlap = s2Questions.some((qId: string) => s1Questions.has(qId));
+    assert(!hasOverlap, 'Zero question repetition: New session excludes questions already answered by student');
+
     // -------------------------------------------------------------
     // MODULE 3: Complete Session, AI Final Remark & Remediation Plan
     // -------------------------------------------------------------
