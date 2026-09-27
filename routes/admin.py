@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, status, Depends, Request
 
-from database import admins_collection, otp_logs_collection, login_logs_collection
+from database import admins_collection, users_collection, otp_logs_collection, login_logs_collection
 from schemas import (
     AdminLoginRequest,
     AdminVerifyOTPRequest,

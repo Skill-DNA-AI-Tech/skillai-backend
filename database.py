@@ -1,11 +1,16 @@
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient
-from config import settings
+from config import settings, sanitize_mongodb_uri
 
 logger = logging.getLogger(__name__)
 
-# Initialize MongoDB Async Client
-client = AsyncIOMotorClient(settings.mongodb_uri)
+# Initialize MongoDB Async Client with sanitized URI and safe fallback
+_raw_uri = sanitize_mongodb_uri(settings.mongodb_uri) if settings.mongodb_uri else ""
+if not _raw_uri:
+    logger.warning("No MongoDB URI configured in environment; falling back to mongodb://localhost:27017/test")
+    _raw_uri = "mongodb://localhost:27017/test"
+
+client = AsyncIOMotorClient(_raw_uri)
 
 # Select Database
 # Extract database name from URI if present, fallback to 'test' (single unified database)

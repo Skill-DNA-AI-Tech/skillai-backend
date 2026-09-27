@@ -11,6 +11,11 @@ const numberFromEnv = (value: string | undefined, fallback: number) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+const resolveMongoUri = (): string => {
+  const uri = process.env.MONGODB_URI || process.env.MONGO_URI || process.env.DATABASE_URL || '';
+  return uri.trim().replace(/^['"]|['"]$/g, '').replace(/[,;]+$/, '');
+};
+
 export const env = {
   aiServiceUrl: process.env.AI_SERVICE_URL ?? '',
   appBaseUrl: process.env.APP_BASE_URL ?? 'http://localhost:4173',
@@ -21,7 +26,7 @@ export const env = {
   groqModel: process.env.GROQ_MODEL ?? 'llama-3.1-8b-instant',
   jwtSecret: process.env.JWT_SECRET ?? 'super_secret_jwt_key_skilldna',
   jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? '30d',
-  mongodbUri: process.env.MONGODB_URI ?? 'mongodb+srv://ajayrpatil96k:Ajay%401711@skillai.libipae.mongodb.net/test?retryWrites=true&w=majority',
+  mongodbUri: resolveMongoUri() || 'mongodb://localhost:27017/test',
   nodeEnv: process.env.NODE_ENV ?? 'development',
   port: numberFromEnv(process.env.PORT, 5000),
   registrationMode: (process.env.REGISTRATION_MODE || 'ADMIN_ONLY').toUpperCase(),

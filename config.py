@@ -13,9 +13,75 @@ if os.path.exists(_env_path):
     load_dotenv(_env_path)
 load_dotenv()
 
+def sanitize_mongodb_uri(uri: str) -> str:
+    """
+    Sanitize and clean MongoDB connection string.
+    Removes quotes, trailing commas/semicolons, extra commas in host list,
+    which prevents 'pymongo.errors.ConfigurationError: Empty host (or extra comma in host list)'.
+    """
+    if not uri or not isinstance(uri, str):
+        return ""
+    uri = uri.strip().strip("'\"").strip()
+    while uri.endswith(",") or uri.endswith(";"):
+        uri = uri[:-1].strip()
+    if not uri.startswith("mongodb://") and not uri.startswith("mongodb+srv://"):
+        return uri
+
+    scheme, rest = uri.split("://", 1)
+
+    slash_idx = rest.find("/")
+    question_idx = rest.find("?")
+    delims = [i for i in (slash_idx, question_idx) if i != -1]
+    split_idx = min(delims) if delims else len(rest)
+
+    authority = rest[:split_idx]
+    path_and_query = rest[split_idx:].rstrip(",;").strip()
+
+    if "@" in authority:
+        userinfo, host_part = authority.rsplit("@", 1)
+        userinfo_prefix = f"{userinfo}@"
+    else:
+        userinfo_prefix = ""
+        host_part = authority
+
+    hosts = [h.strip() for h in host_part.split(",") if h.strip()]
+    if not hosts:
+        return ""
+    clean_host_part = ",".join(hosts)
+    return f"{scheme}://{userinfo_prefix}{clean_host_part}{path_and_query}"
+
+
+def resolve_mongodb_uri() -> str:
+    """
+    Check common environment variable names for MongoDB connection string:
+    - MONGODB_URI
+    - MONGO_URI
+    - DATABASE_URL
+    - MONGO_URL
+    - MONGODB_URL
+    - MONGODB_CONNECTION_STRING
+    Sanitizes and cleans against malformed commas or quotes.
+    """
+    possible_keys = [
+        "MONGODB_URI",
+        "MONGO_URI",
+        "DATABASE_URL",
+        "MONGO_URL",
+        "MONGODB_URL",
+        "MONGODB_CONNECTION_STRING",
+    ]
+    for key in possible_keys:
+        val = os.getenv(key)
+        if val and val.strip():
+            cleaned = sanitize_mongodb_uri(val)
+            if cleaned:
+                return cleaned
+    return ""
+
+
 class Settings(BaseSettings):
     mongodb_uri: str = Field(
-        default_factory=lambda: os.getenv("MONGODB_URI", "")
+        default_factory=resolve_mongodb_uri
     )
     jwt_secret: str = Field(
         default_factory=lambda: os.getenv("JWT_SECRET", "skilldna_default_jwt_secret_change_in_production")
