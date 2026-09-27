@@ -92,17 +92,16 @@ async function runE2EVerification() {
       skills: ['Java', 'Spring Boot', 'MongoDB'],
     });
 
-    assert(Boolean(betaUser._id), 'Pre-production beta student created in User collection');
-    assert(betaUser.isPreProductionUser === true, 'Pre-production flag isPreProductionUser is set to true');
-    assert(betaUser.betaAccess === true, 'Beta access flag is enabled');
-    assert(await betaUser.matchPassword(betaPassword), 'Beta student password validates correctly for student login');
+    assert(Boolean(betaUser._id), 'Student user created in User collection');
+    assert(betaUser.role === 'student', 'Student role is set correctly');
+    assert(await betaUser.matchPassword(betaPassword), 'Student password validates correctly for student login');
 
-    // Retrieve via test-users query
-    const queriedBetaUsers = await User.find({
-      $or: [{ isTestUser: true }, { isPreProductionUser: true }],
+    // Retrieve via user query
+    const queriedStudents = await User.find({
+      role: 'student',
       _id: betaUser._id,
     });
-    assert(queriedBetaUsers.length === 1, 'Pre-production user retrieved via admin test-users query');
+    assert(queriedStudents.length === 1, 'Student user retrieved via user management query');
 
     // 3. Question Bank & AI Question Generation Flow
     console.log('\n--- 3. Testing Question Bank & AI Question Flow ---');

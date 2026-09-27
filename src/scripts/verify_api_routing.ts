@@ -96,25 +96,24 @@ const runAudit = async () => {
     const modBody: any = await modRes.json();
     console.log(`Moderation metrics: pendingCompanies=${modBody.pendingCompanies}, pendingJobs=${modBody.pendingJobs}`);
 
-    // 8. Test GET /api/admin/test-users (Protected)
-    console.log('\n7. Testing GET /api/admin/test-users (Protected)...');
-    const testUsersRes = await fetch(`${baseUrl}/api/admin/test-users`, {
+    // 8. Test GET /api/admin/users (Protected)
+    console.log('\n7. Testing GET /api/admin/users (Protected)...');
+    const usersRes = await fetch(`${baseUrl}/api/admin/users`, {
       headers: { Authorization: `Bearer ${adminToken}` }
     });
-    console.log(`Status: ${testUsersRes.status} (Expected: 200)`);
-    if (testUsersRes.status !== 200) throw new Error(`GET /api/admin/test-users failed with ${testUsersRes.status}`);
-    const testUsersBody: any = await testUsersRes.json();
-    console.log('Test users count: ' + (Array.isArray(testUsersBody) ? testUsersBody.length : 0));
+    console.log(`Status: ${usersRes.status} (Expected: 200)`);
+    if (usersRes.status !== 200) throw new Error(`GET /api/admin/users failed with ${usersRes.status}`);
+    const usersBody: any = await usersRes.json();
+    const userList = Array.isArray(usersBody) ? usersBody : (usersBody.users || []);
+    console.log('Platform users count: ' + userList.length);
 
-    // Security Audit on /api/admin/test-users
-    if (Array.isArray(testUsersBody)) {
-      for (const tu of testUsersBody) {
-        if (tu.password || tu.passwordHash || (tu.password && String(tu.password).startsWith('$2'))) {
-          throw new Error(`CRITICAL SECURITY FAILURE: Password hash exposed in test user ${tu.email}`);
-        }
+    // Security Audit on /api/admin/users
+    for (const tu of userList) {
+      if (tu.password || tu.passwordHash || (tu.password && String(tu.password).startsWith('$2'))) {
+        throw new Error(`CRITICAL SECURITY FAILURE: Password hash exposed in user ${tu.email}`);
       }
-      console.log('Security check passed: Zero password hashes leaked in GET /api/admin/test-users response.');
     }
+    console.log('Security check passed: Zero password hashes leaked in GET /api/admin/users response.');
 
     // 9. Frontend Routing Logic Verification
     console.log('\n8. Simulating Frontend Route Routing Logic...');
@@ -158,7 +157,7 @@ const runAudit = async () => {
       { path: '/api/admin/admins', expected: AUTHORITATIVE_EXPRESS_URL },
       { path: '/api/admin/overview', expected: AUTHORITATIVE_EXPRESS_URL },
       { path: '/api/admin/moderation', expected: AUTHORITATIVE_EXPRESS_URL },
-      { path: '/api/admin/test-users', expected: AUTHORITATIVE_EXPRESS_URL },
+      { path: '/api/admin/users', expected: AUTHORITATIVE_EXPRESS_URL },
       { path: '/api/questions', expected: AUTHORITATIVE_EXPRESS_URL },
       { path: '/api/certificates', expected: AUTHORITATIVE_EXPRESS_URL },
       { path: '/api/auth/admin/login', expected: AUTHORITATIVE_FASTAPI_URL },

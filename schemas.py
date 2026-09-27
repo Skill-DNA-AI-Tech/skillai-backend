@@ -272,3 +272,85 @@ class QuestionGenerateRequest(BaseModel):
     topic: str
     count: Optional[int] = 5
     difficulty: Optional[str] = "Medium"
+
+class QuestionUpdateRequest(BaseModel):
+    question: Optional[str] = None
+    field: Optional[str] = None
+    topic: Optional[str] = None
+    difficulty: Optional[str] = None
+    bloomLevel: Optional[str] = None
+    expectedAnswer: Optional[str] = None
+    status: Optional[str] = None
+
+# ==========================================
+# 10. HELPDESK & SUPPORT SCHEMAS
+# ==========================================
+
+class HelpdeskTicketCreateRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    email: EmailStr
+    phone: str = Field(..., min_length=7, max_length=20)
+    issue_type: str = Field(..., min_length=2, max_length=50)
+    message: str = Field(..., min_length=10, max_length=2000)
+
+class HelpdeskStatusUpdateRequest(BaseModel):
+    status: str = Field(..., pattern="^(NEW|IN_PROGRESS|RESOLVED|CLOSED)$")
+    admin_response: Optional[str] = None
+
+# ==========================================
+# 11. USER MANAGEMENT SCHEMAS
+# ==========================================
+
+class UserStatusUpdateRequest(BaseModel):
+    status: Optional[str] = None  # ACTIVE, SUSPENDED
+    is_verified: Optional[bool] = None
+
+class UserUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    role: Optional[str] = None
+    college: Optional[str] = None
+    degree: Optional[str] = None
+    branch: Optional[str] = None
+    mobile: Optional[str] = None
+    status: Optional[str] = None
+    is_verified: Optional[bool] = None
+
+class UserCreateAdminRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+    role: str = "student"  # student, teacher, hr, admin
+    college: Optional[str] = None
+    degree: Optional[str] = None
+    branch: Optional[str] = None
+    mobile: Optional[str] = None
+
+# ==========================================
+# 12. CERTIFICATE VERSIONING & VERIFY
+# ==========================================
+
+class CertificateEditRequest(BaseModel):
+    studentName: Optional[str] = None
+    careerPath: Optional[str] = None
+    technicalScore: Optional[int] = None
+    communicationScore: Optional[int] = None
+    problemSolvingScore: Optional[int] = None
+    confidenceScore: Optional[int] = None
+    overallScore: Optional[int] = None
+    notes: Optional[str] = None
+
+class PublicCertificateVerifyResponse(BaseModel):
+    valid: bool
+    verificationStatus: str  # VERIFIED, REVOKED, EXPIRED, NOT_FOUND
+    certificateId: Optional[str] = None
+    studentName: Optional[str] = None
+    certificateTitle: Optional[str] = None
+    achievement: Optional[str] = None
+    careerPath: Optional[str] = None
+    issueDate: Optional[str] = None
+    issuer: Optional[str] = None
+    seal: Optional[str] = None
+    verificationUrl: Optional[str] = None
+    scores: Optional[Dict[str, Any]] = None
+    message: Optional[str] = None
+

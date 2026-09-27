@@ -4,7 +4,7 @@ import csv
 import uuid
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Any, Dict
 from fastapi import APIRouter, HTTPException, status, Depends, Request, Query, Response
 from bson import ObjectId
@@ -29,6 +29,7 @@ from database import (
     career_twin_memories_collection,
     student_answers_collection,
     audit_logs_collection,
+    helpdesk_tickets_collection,
 )
 from auth_handler import (
     get_current_admin,
@@ -44,8 +45,6 @@ from schemas import (
     AdminUpdateRequest,
     HRCreateRequest,
     HRUpdateRequest,
-    TestUserCreateRequest,
-    TestUserStatusUpdateRequest,
     FeedbackStatusUpdateRequest,
     InterviewStartRequest,
     InterviewAnswerRequest,
@@ -68,6 +67,14 @@ from schemas import (
     CertificateSignatureRequest,
     QuestionCreateRequest,
     QuestionGenerateRequest,
+    QuestionUpdateRequest,
+    UserStatusUpdateRequest,
+    UserUpdateRequest,
+    UserCreateAdminRequest,
+    CertificateEditRequest,
+    PublicCertificateVerifyResponse,
+    HelpdeskTicketCreateRequest,
+    HelpdeskStatusUpdateRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,7 +97,7 @@ def serialize_doc(doc: Any) -> Any:
     if isinstance(doc, dict):
         clean = {}
         for k, v in doc.items():
-            if k in ("password", "hashed_password", "otp_hash"):
+            if k in ("password", "hashed_password", "password_hash", "otp", "otp_hash", "raw_otp", "token", "refresh_token", "secret"):
                 continue
             clean[k] = serialize_doc(v)
         if "_id" in clean:
@@ -505,229 +512,244 @@ async def get_moderation(current_admin: dict = Depends(get_current_admin)):
     }
 
 # ==========================================
-# 7. TEST USERS / PRE-PRODUCTION MANAGEMENT
+# 7. ADMIN USER / STUDENT MANAGEMENT SUITE
 # ==========================================
 
-@router.get("/admin/test-users")
-async def get_test_users(current_admin: dict = Depends(get_current_admin)):
-    """List all pre-production test users (Admin only, passwords sanitized)."""
-    test_users = await users_collection.find({
-        "$or": [{"isTestUser": True}, {"isPreProductionUser": True}]
-    }).to_list(200)
+@router.get("/admin/users")
+async def get_admin_users(
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=100),
+    search: str = Query(""),
+    role: str = Query("all"),
+    status: str = Query("all"),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Search and filter platform users across all supported roles (Student, Teacher, HR, Admin).
+    Supports status filtering (Active, Suspended, Unverified).
+    Strict RBAC: Admin only. Passwords and secrets are never returned.
+    """
+    query: Dict[str, Any] = {}
 
-    result = []
-    for u in test_users:
+    # Role filter
+    if role and role.lower() != "all":
+        r = role.strip().lower()
+        if r in ["student", "students"]:
+            query["role"] = {"$in": ["STUDENT", "student", "USER", "user"]}
+        elif r in ["teacher", "teachers", "instructor"]:
+            query["role"] = {"$in": ["TEACHER", "teacher", "INSTRUCTOR", "instructor"]}
+        elif r in ["hr", "recruiter"]:
+            query["role"] = {"$in": ["HR", "hr", "RECRUITER", "recruiter"]}
+        elif r in ["admin", "admins"]:
+            query["role"] = {"$in": ["ADMIN", "admin", "MAIN_ADMIN", "SUPER_ADMIN", "SUPPORT_TEAM"]}
+        else:
+            query["role"] = {"$regex": f"^{re.escape(role)}$", "$options": "i"}
+
+    # Status filter
+    if status and status.lower() != "all":
+        s = status.strip().upper()
+        if s == "SUSPENDED":
+            query["status"] = "SUSPENDED"
+        elif s == "UNVERIFIED":
+            query["is_verified"] = False
+        elif s == "ACTIVE":
+            query["status"] = {"$ne": "SUSPENDED"}
+
+    # Search filter
+    if search and search.strip():
+        term = search.strip()
+        query["$or"] = [
+            {"name": {"$regex": term, "$options": "i"}},
+            {"email": {"$regex": term, "$options": "i"}},
+            {"mobile": {"$regex": term, "$options": "i"}},
+            {"college": {"$regex": term, "$options": "i"}},
+            {"degree": {"$regex": term, "$options": "i"}},
+            {"careerDomain": {"$regex": term, "$options": "i"}},
+        ]
+
+    total = await users_collection.count_documents(query)
+    user_docs = await users_collection.find(query).sort("created_at", -1).skip((page - 1) * limit).limit(limit).to_list(limit)
+
+    enriched_users = []
+    for u in user_docs:
         u_id = u["_id"]
         profile = await profiles_collection.find_one({"user": u_id})
-        total_sessions = await question_sessions_collection.count_documents({"studentId": u_id, "status": "Completed"})
-        latest_session = await question_sessions_collection.find_one({"studentId": u_id, "status": "Completed"}, sort=[("endTime", -1)])
+        cert_count = await certificates_collection.count_documents({"studentId": u_id, "status": "APPROVED"})
+        session_count = await question_sessions_collection.count_documents({"studentId": u_id, "status": "Completed"})
 
-        clean = serialize_doc(u)
-        test_creds = clean.get("testCredentials") or {}
-        if not isinstance(test_creds, dict):
-            test_creds = {}
-        clean["testUserId"] = clean.get("testUserId") or test_creds.get("userId") or clean.get("email")
-        clean["temporaryPassword"] = test_creds.get("temporaryPassword")
-        clean["totalSessions"] = total_sessions
+        clean_u = serialize_doc(u)
+        clean_u["certificatesCount"] = cert_count
+        clean_u["interviewsCount"] = session_count
+        clean_u["college"] = u.get("college") or (profile or {}).get("college", "SkillDNA Institute")
+        clean_u["degree"] = u.get("degree") or (profile or {}).get("degree", "B.Tech")
+        clean_u["branch"] = u.get("branch") or (profile or {}).get("branch", "Computer Science")
+        clean_u["status"] = u.get("status") or "ACTIVE"
+        clean_u["is_verified"] = bool(u.get("is_verified", False) or u.get("google_id"))
+        clean_u["createdAt"] = clean_u.get("created_at") or clean_u.get("createdAt")
+        enriched_users.append(clean_u)
 
-        comp = ((latest_session or {}).get("competencies") or {}) if isinstance((latest_session or {}).get("competencies"), dict) else {}
-        skill_dna = ((profile or {}).get("skillDNA") or {}) if isinstance((profile or {}).get("skillDNA"), dict) else {}
-        clean["latestScore"] = comp.get("overall", skill_dna.get("score", 0))
+    return {
+        "users": enriched_users,
+        "total": total,
+        "page": page,
+        "totalPages": max(1, (total + limit - 1) // limit)
+    }
 
-        final_rep = ((latest_session or {}).get("finalReport") or {}) if isinstance((latest_session or {}).get("finalReport"), dict) else {}
-        clean["latestReadiness"] = final_rep.get("readinessStatus", "NOT_READY")
-        result.append(clean)
+@router.get("/admin/users/{id}")
+async def get_admin_user_detail(id: str, current_admin: dict = Depends(get_current_admin)):
+    """
+    Retrieve full safe profile, registration details, and activity status for a user (Admin only).
+    """
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        obj_id = id
 
-    return result
+    user = await users_collection.find_one({"$or": [{"_id": obj_id}, {"email": id}]})
+    if not user:
+        user = await admins_collection.find_one({"$or": [{"_id": obj_id}, {"email": id}]})
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found")
 
-@router.post("/admin/test-users")
-async def create_test_user(
-    payload: TestUserCreateRequest,
+    u_id = user["_id"]
+    profile = await profiles_collection.find_one({"user": u_id})
+    sessions = await question_sessions_collection.find({"studentId": u_id}).sort("createdAt", -1).limit(10).to_list(10)
+    certs = await certificates_collection.find({"studentId": u_id}).sort("issueDate", -1).to_list(20)
+
+    clean_user = serialize_doc(user)
+    clean_user["profile"] = serialize_doc(profile)
+    clean_user["recentSessions"] = [serialize_doc(s) for s in sessions]
+    clean_user["certificates"] = [serialize_doc(c) for c in certs]
+    clean_user["status"] = user.get("status") or "ACTIVE"
+    clean_user["is_verified"] = bool(user.get("is_verified", False) or user.get("google_id"))
+
+    return clean_user
+
+@router.patch("/admin/users/{id}/status")
+async def update_user_status(
+    id: str,
+    payload: UserStatusUpdateRequest,
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Create a new pre-production test user (Admin only)."""
-    name = (payload.name or "Beta Student").strip()
-    test_id = f"BETA-{int(datetime.utcnow().timestamp()) % 10000}"
-    email = payload.email.strip().lower()
-    raw_password = payload.password or "BetaStudentPass@123"
-    domain = "Computer Science"
-    role = (payload.role or "STUDENT").upper()
+    """
+    Update user account status (e.g. suspend/reactivate) or account verification (Admin only).
+    """
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        obj_id = id
 
-    existing = await users_collection.find_one({"$or": [{"email": email}, {"testUserId": test_id}]})
+    update_fields: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    if payload.status is not None:
+        status_norm = payload.status.strip().upper()
+        if status_norm not in ["ACTIVE", "SUSPENDED", "PENDING"]:
+            raise HTTPException(status_code=400, detail="Status must be ACTIVE, SUSPENDED, or PENDING")
+        update_fields["status"] = status_norm
+
+    if payload.is_verified is not None:
+        update_fields["is_verified"] = payload.is_verified
+
+    res = await users_collection.update_one(
+        {"$or": [{"_id": obj_id}, {"email": id}]},
+        {"$set": update_fields}
+    )
+    if res.matched_count == 0:
+        res_admin = await admins_collection.update_one(
+            {"$or": [{"_id": obj_id}, {"email": id}]},
+            {"$set": update_fields}
+        )
+        if res_admin.matched_count == 0:
+            raise HTTPException(status_code=404, detail="User account not found")
+
+    return {"message": "User status updated successfully", "status": "success"}
+
+@router.put("/admin/users/{id}")
+async def update_user_details(
+    id: str,
+    payload: UserUpdateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Admin update of safe user profile metadata (Admin only).
+    """
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        obj_id = id
+
+    update_dict = payload.model_dump(exclude_unset=True)
+    if not update_dict:
+        raise HTTPException(status_code=400, detail="No fields provided for update")
+
+    update_dict["updated_at"] = datetime.utcnow()
+    res = await users_collection.update_one(
+        {"$or": [{"_id": obj_id}, {"email": id}]},
+        {"$set": update_dict}
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"message": "User details updated successfully", "status": "success"}
+
+@router.post("/admin/users")
+async def create_user_admin(
+    payload: UserCreateAdminRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Create a new user account across supported roles: Student, Teacher, HR, Admin (Admin only).
+    """
+    email = payload.email.lower().strip()
+    existing = await users_collection.find_one({"email": email}) or await admins_collection.find_one({"email": email})
     if existing:
-        raise HTTPException(status_code=400, detail=f"User with email {email} already exists")
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
 
-    hashed = get_password_hash(raw_password)
-    user_doc = {
-        "name": name,
-        "full_name": name,
-        "email": email,
-        "password": hashed,
-        "hashed_password": hashed,
-        "role": role,
-        "status": "ACTIVE",
-        "emailVerified": True,
-        "requiresPasswordChange": False,
-        "isTestUser": True,
-        "isPreProductionUser": True,
-        "betaAccess": True,
-        "testUserId": test_id,
-        "careerDomain": domain,
-        "targetRole": "Specialist",
-        "testCredentials": {
-            "userId": test_id,
-            "temporaryPassword": raw_password,
-        },
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow()
-    }
-    result = await users_collection.insert_one(user_doc)
-    user_doc["_id"] = result.inserted_id
+    hashed_pw = get_password_hash(payload.password)
+    role_norm = payload.role.strip().lower()
 
-    profile_doc = {
-        "user": user_doc["_id"],
-        "name": name,
-        "email": email,
-        "domain": domain,
-        "skills": [domain],
-        "degree": "B.Tech",
-        "branch": domain,
-        "college": "SkillDNA Pre-Production Beta Program",
-        "skillDNA": {
-            "score": 0,
-            "technicalScore": 0,
-            "communicationScore": 0,
-            "confidenceScore": 0,
-            "strengths": [],
-            "weaknesses": []
-        }
-    }
-    await profiles_collection.insert_one(profile_doc)
-
-    serialized = serialize_doc(user_doc)
-    return {
-        **serialized,
-        "user": serialized,
-        "credentials": {
-            "userId": test_id,
-            "temporaryPassword": raw_password,
+    if role_norm in ["admin", "main_admin", "super_admin"]:
+        doc = {
             "email": email,
+            "name": payload.name.strip(),
+            "hashed_password": hashed_pw,
+            "role": "ADMIN",
+            "is_verified": True,
+            "status": "ACTIVE",
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
         }
-    }
+        res = await admins_collection.insert_one(doc)
+        doc["_id"] = res.inserted_id
+        return serialize_doc(doc)
+    else:
+        doc = {
+            "name": payload.name.strip(),
+            "email": email,
+            "hashed_password": hashed_pw,
+            "password": hashed_pw,
+            "role": role_norm,
+            "college": payload.college or "SkillDNA Institute",
+            "degree": payload.degree or "B.Tech",
+            "branch": payload.branch or "Engineering",
+            "mobile": payload.mobile or "",
+            "is_verified": True,
+            "status": "ACTIVE",
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        res = await users_collection.insert_one(doc)
+        doc["_id"] = res.inserted_id
 
-@router.get("/admin/test-users/{id}")
-async def get_test_user_details(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Inspect full pre-production user state (Admin only)."""
-    try:
-        obj_id = ObjectId(id)
-    except Exception:
-        obj_id = id
-
-    user = await users_collection.find_one({"_id": obj_id})
-    if not user:
-        user = await users_collection.find_one({"email": id})
-    if not user:
-        raise HTTPException(status_code=404, detail="Pre-production user not found")
-
-    profile = await profiles_collection.find_one({"user": user["_id"]})
-    sessions = await question_sessions_collection.find({"studentId": user["_id"]}).to_list(50)
-
-    return {
-        "user": serialize_doc(user),
-        "profile": serialize_doc(profile) if profile else None,
-        "sessions": [serialize_doc(s) for s in sessions],
-    }
-
-@router.patch("/admin/test-users/{id}/status")
-async def toggle_test_user_status(
-    id: str,
-    payload: TestUserStatusUpdateRequest,
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Toggle test user active/disabled status (Admin only)."""
-    try:
-        obj_id = ObjectId(id)
-    except Exception:
-        obj_id = id
-    new_status = payload.status or ("ACTIVE" if payload.isActive is not False else "DISABLED")
-    user = await users_collection.find_one_and_update(
-        {"_id": obj_id},
-        {"$set": {"status": new_status, "updated_at": datetime.utcnow()}},
-        return_document=True
-    )
-    if not user:
-        raise HTTPException(status_code=404, detail="Test user not found")
-    return serialize_doc(user)
-
-@router.post("/admin/test-users/{id}/login-token")
-async def generate_test_user_token(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Generate an instant login token for pre-production test user (Admin only)."""
-    try:
-        obj_id = ObjectId(id)
-    except Exception:
-        obj_id = id
-    user = await users_collection.find_one({"_id": obj_id})
-    if not user:
-        raise HTTPException(status_code=404, detail="Test user not found")
-
-    token = create_access_token({
-        "sub": user["email"],
-        "id": str(user["_id"]),
-        "email": user["email"],
-        "role": "STUDENT",
-        "name": user.get("name", "Test Candidate")
-    })
-
-    return {
-        "token": token,
-        "access_token": token,
-        "token_type": "bearer",
-        "user": serialize_doc(user)
-    }
-
-@router.post("/admin/test-users/{id}/reset")
-async def reset_test_user_data(
-    id: str,
-    payload: Dict[str, Any] = {},
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Reset interviews, career twin, and skill score for test user (Admin only)."""
-    try:
-        obj_id = ObjectId(id)
-    except Exception:
-        obj_id = id
-    user = await users_collection.find_one({"_id": obj_id})
-    if not user:
-        raise HTTPException(status_code=404, detail="Test user not found")
-
-    await question_sessions_collection.delete_many({"studentId": obj_id})
-    await student_answers_collection.delete_many({"studentId": obj_id})
-    await profiles_collection.update_one(
-        {"user": obj_id},
-        {"$set": {
-            "skillDNA.score": 0,
-            "skillDNA.technicalScore": 0,
-            "skillDNA.communicationScore": 0,
-            "skillDNA.confidenceScore": 0,
-            "skillDNA.strengths": [],
-            "skillDNA.weaknesses": []
-        }}
-    )
-    await certificates_collection.delete_many({"studentId": obj_id})
-
-    return {"message": "User test data successfully reset", "status": "success"}
-
-@router.delete("/admin/test-users/{id}")
-async def delete_test_user(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Delete pre-production test user (Admin only)."""
-    try:
-        obj_id = ObjectId(id)
-    except Exception:
-        obj_id = id
-    await users_collection.delete_one({"_id": obj_id})
-    await profiles_collection.delete_one({"user": obj_id})
-    await question_sessions_collection.delete_many({"studentId": obj_id})
-    return {"message": "Test user deleted successfully"}
+        await profiles_collection.insert_one({
+            "user": doc["_id"],
+            "name": doc["name"],
+            "college": doc["college"],
+            "degree": doc["degree"],
+            "branch": doc["branch"],
+            "careerDomain": doc["branch"],
+            "createdAt": datetime.utcnow()
+        })
+        return serialize_doc(doc)
 
 # ==========================================
 # 8. STUDENTS & CERTIFICATES LISTING
@@ -904,6 +926,99 @@ async def approve_certificate(id: str, current_admin: dict = Depends(get_current
     )
     return {"message": f"Certificate {id} approved"}
 
+@router.put("/certificates/admin/{id}")
+async def edit_certificate_version(
+    id: str,
+    payload: CertificateEditRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Edit certificate with version preservation (Admin only).
+    Never silently overwrites historical certificate records.
+    Marks the old certificate version as SUPERSEDED and creates a new revision with audit metadata.
+    """
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        obj_id = id
+
+    current_cert = await certificates_collection.find_one({"$or": [{"certificateId": id}, {"_id": obj_id}]})
+    if not current_cert:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+
+    cert_id = current_cert.get("certificateId") or str(current_cert["_id"])
+    curr_ver = current_cert.get("version", 1)
+    new_ver = curr_ver + 1
+
+    # 1. Archive current active certificate
+    await certificates_collection.update_one(
+        {"_id": current_cert["_id"]},
+        {"$set": {
+            "isCurrentVersion": False,
+            "status": "SUPERSEDED",
+            "supersededAt": datetime.utcnow(),
+            "supersededByVersion": new_ver,
+            "updatedAt": datetime.utcnow()
+        }}
+    )
+
+    # 2. Build new version document
+    new_cert_doc = dict(current_cert)
+    new_cert_doc.pop("_id", None)
+    new_cert_doc["version"] = new_ver
+    new_cert_doc["isCurrentVersion"] = True
+    new_cert_doc["status"] = "APPROVED"
+    new_cert_doc["previousVersionId"] = str(current_cert["_id"])
+    new_cert_doc["updatedAt"] = datetime.utcnow()
+
+    # Apply edits
+    if payload.studentName:
+        new_cert_doc["studentName"] = payload.studentName.strip()
+    if payload.careerPath:
+        new_cert_doc["careerPath"] = payload.careerPath.strip()
+    if payload.technicalScore is not None:
+        new_cert_doc["technicalScore"] = payload.technicalScore
+    if payload.communicationScore is not None:
+        new_cert_doc["communicationScore"] = payload.communicationScore
+    if payload.problemSolvingScore is not None:
+        new_cert_doc["problemSolvingScore"] = payload.problemSolvingScore
+    if payload.confidenceScore is not None:
+        new_cert_doc["confidenceScore"] = payload.confidenceScore
+    if payload.overallScore is not None:
+        new_cert_doc["overallScore"] = payload.overallScore
+
+    # Audit trail
+    new_cert_doc["audit"] = {
+        "editedBy": current_admin.get("email") or current_admin.get("sub"),
+        "editedAt": datetime.utcnow(),
+        "changeNotes": payload.notes or f"Updated to version {new_ver}"
+    }
+
+    res = await certificates_collection.insert_one(new_cert_doc)
+    new_cert_doc["_id"] = str(res.inserted_id) if hasattr(res, "inserted_id") and res.inserted_id else ObjectId()
+
+    return {
+        "success": True,
+        "version": new_ver,
+        "message": f"Certificate version {new_ver} created successfully without overwriting history",
+        "certificate": serialize_doc(new_cert_doc)
+    }
+
+@router.post("/certificates/admin/revoke/{id}")
+async def revoke_certificate(id: str, current_admin: dict = Depends(get_current_admin)):
+    """Revoke an issued certificate (Admin only)."""
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        obj_id = id
+    res = await certificates_collection.update_many(
+        {"$or": [{"certificateId": id}, {"_id": obj_id}]},
+        {"$set": {"status": "REVOKED", "revokedAt": datetime.utcnow(), "revokedBy": current_admin.get("email"), "updatedAt": datetime.utcnow()}}
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    return {"message": f"Certificate {id} revoked successfully", "status": "REVOKED"}
+
 # ==========================================
 # 10. QUESTIONS MANAGEMENT SUITE
 # ==========================================
@@ -1069,6 +1184,32 @@ async def delete_question(id: str, current_admin: dict = Depends(get_current_adm
     await question_bank_collection.delete_one({"_id": obj_id})
     return {"message": "Question deleted successfully"}
 
+@router.put("/questions/admin/{id}")
+async def update_question(
+    id: str,
+    payload: QuestionUpdateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Update an existing question's content, category, difficulty, or active status (Admin only)."""
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        obj_id = id
+
+    update_dict = payload.model_dump(exclude_unset=True)
+    if not update_dict:
+        raise HTTPException(status_code=400, detail="No fields provided for update")
+
+    update_dict["updatedAt"] = datetime.utcnow()
+    res = await question_bank_collection.find_one_and_update(
+        {"_id": obj_id},
+        {"$set": update_dict},
+        return_document=True
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Question not found")
+    return serialize_doc(res)
+
 # ==========================================
 # 11. FEEDBACK ENDPOINTS
 # ==========================================
@@ -1162,20 +1303,107 @@ async def get_my_scorecards(current_user: dict = Depends(get_current_user)):
     }
 
 # ==========================================
-# 13. PUBLIC CERTIFICATE VERIFICATION
+# 13. PUBLIC CERTIFICATE VERIFICATION (NO LOGIN REQUIRED)
 # ==========================================
 
-@router.get("/verify/{certificate_id}")
+@router.get("/public/certificates/verify/{certificate_id}", response_model=PublicCertificateVerifyResponse)
+@router.get("/verify/{certificate_id}", response_model=PublicCertificateVerifyResponse)
+@router.get("/certificates/verify/{certificate_id}", response_model=PublicCertificateVerifyResponse)
 async def verify_certificate_public(certificate_id: str):
-    """Public verification endpoint for QR scans and employer verification (Public)."""
-    cert = await certificates_collection.find_one({"certificateId": certificate_id})
+    """
+    Public verification endpoint for QR scans, employers, and LinkedIn credentials.
+    Works strictly WITHOUT login (no JWT required).
+    Returns ONLY safe public verification information (zero internal IDs, passwords, emails, or phone numbers).
+    Handles VALID, REVOKED, EXPIRED, and NOT_FOUND statuses.
+    """
+    # Look for active/current version first
+    cert = await certificates_collection.find_one(
+        {"certificateId": certificate_id, "isCurrentVersion": True}
+    )
     if not cert:
-        raise HTTPException(status_code=404, detail="Certificate not found or revoked")
-    return {
-        "valid": True,
-        "verified": True,
-        "certificate": serialize_doc(cert)
+        # Fallback to latest version by certificateId
+        cert = await certificates_collection.find_one(
+            {"certificateId": certificate_id},
+            sort=[("version", -1), ("createdAt", -1)]
+        )
+
+    if not cert:
+        raise HTTPException(
+            status_code=404,
+            detail="Certificate not found. The specified certificate ID does not match any issued credential."
+        )
+
+    cert_status = str(cert.get("status") or "APPROVED").strip().upper()
+    student_name = cert.get("studentName") or "SkillDNA Candidate"
+    career_path = cert.get("careerPath") or "Software Engineering"
+    title = cert.get("title") or f"SkillDNA AI Certified {career_path} Specialist"
+    achievement = cert.get("achievement") or f"Demonstrated technical and interview competency in {career_path}"
+    issuer = cert.get("issuer") or "SkillDNA Tech AI Certification Authority"
+    seal = "SKILLDNA AI • VERIFIED AUTHENTIC CERTIFICATE"
+    verify_url = f"https://skillai-frontend.pages.dev/verify/{certificate_id}"
+
+    issue_date_val = cert.get("issueDate") or cert.get("createdAt")
+    issue_date_str = issue_date_val.strftime("%B %d, %Y") if isinstance(issue_date_val, datetime) else str(issue_date_val or "")
+
+    # Check Revocation
+    if cert_status in ["REVOKED", "REJECTED"]:
+        return PublicCertificateVerifyResponse(
+            valid=False,
+            verificationStatus="REVOKED",
+            certificateId=certificate_id,
+            studentName=student_name,
+            certificateTitle=title,
+            achievement=achievement,
+            careerPath=career_path,
+            issueDate=issue_date_str,
+            issuer=issuer,
+            seal=seal,
+            verificationUrl=verify_url,
+            message="This certificate was officially REVOKED by the issuing authority and is no longer valid."
+        )
+
+    # Check Expiration
+    expiry = cert.get("expiryDate")
+    if expiry and isinstance(expiry, datetime) and expiry < datetime.utcnow():
+        return PublicCertificateVerifyResponse(
+            valid=False,
+            verificationStatus="EXPIRED",
+            certificateId=certificate_id,
+            studentName=student_name,
+            certificateTitle=title,
+            achievement=achievement,
+            careerPath=career_path,
+            issueDate=issue_date_str,
+            issuer=issuer,
+            seal=seal,
+            verificationUrl=verify_url,
+            message="This certificate has EXPIRED."
+        )
+
+    # Valid Verified Certificate
+    scores = {
+        "overall": cert.get("overallScore") or cert.get("technicalScore", 85),
+        "technical": cert.get("technicalScore", 85),
+        "communication": cert.get("communicationScore", 80),
+        "problemSolving": cert.get("problemSolvingScore", 80),
+        "confidence": cert.get("confidenceScore", 80),
     }
+
+    return PublicCertificateVerifyResponse(
+        valid=True,
+        verificationStatus="VERIFIED",
+        certificateId=certificate_id,
+        studentName=student_name,
+        certificateTitle=title,
+        achievement=achievement,
+        careerPath=career_path,
+        issueDate=issue_date_str,
+        issuer=issuer,
+        seal=seal,
+        verificationUrl=verify_url,
+        scores=scores,
+        message="This certificate is verified authentic and active."
+    )
 
 @router.get("/certificates/{certificate_id}/pdf")
 async def download_certificate_pdf(certificate_id: str):
@@ -1971,4 +2199,153 @@ async def create_student_certificate(
         "status": "success",
         "message": "Certificate issued successfully",
         "certificate": serialize_doc(cert_doc)
+    }
+
+
+# ==========================================
+# 20. PUBLIC HELPDESK & ADMIN TICKET SUITE
+# ==========================================
+
+@router.post("/public/helpdesk")
+@router.post("/helpdesk")
+async def create_public_helpdesk_ticket(
+    payload: HelpdeskTicketCreateRequest,
+    request: Request
+):
+    """
+    Public support/helpdesk ticket submission (Public - no JWT required).
+    Creates a unique support ticket number (SDNA-HD-2026-XXXXXX).
+    Anti-spam protection and input validation included.
+    """
+    email = payload.email.lower().strip()
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+    recent_count = await helpdesk_tickets_collection.count_documents({
+        "email": email,
+        "createdAt": {"$gt": one_hour_ago}
+    })
+    if recent_count >= 5:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many support requests submitted recently. Please wait before submitting again."
+        )
+
+    ticket_seq = f"{random.randint(100000, 999999)}"
+    ticket_id = f"SDNA-HD-2026-{ticket_seq}"
+
+    ip_address = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+
+    ticket_doc = {
+        "ticketId": ticket_id,
+        "name": payload.name.strip(),
+        "email": email,
+        "phone": payload.phone.strip(),
+        "issueType": payload.issue_type.strip(),
+        "message": payload.message.strip(),
+        "status": "NEW",
+        "adminResponse": None,
+        "ipAddress": ip_address,
+        "userAgent": user_agent,
+        "createdAt": datetime.utcnow(),
+        "updatedAt": datetime.utcnow()
+    }
+
+    res = await helpdesk_tickets_collection.insert_one(ticket_doc)
+    ticket_doc["_id"] = res.inserted_id
+
+    logger.info("Created support ticket %s for %s", ticket_id, email)
+
+    return {
+        "status": "success",
+        "ticketId": ticket_id,
+        "ticket_id": ticket_id,
+        "ticketStatus": "NEW",
+        "message": "Your support request has been submitted successfully. Our team will review it shortly.",
+        "createdAt": ticket_doc["createdAt"].isoformat()
+    }
+
+@router.get("/admin/helpdesk")
+async def get_admin_helpdesk_tickets(
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=100),
+    search: str = Query(""),
+    status: str = Query("all"),
+    issue_type: str = Query("all"),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """List and filter support tickets (Admin only)."""
+    query: Dict[str, Any] = {}
+    if status and status.lower() != "all":
+        query["status"] = status.strip().upper()
+    if issue_type and issue_type.lower() != "all":
+        query["issueType"] = {"$regex": f"^{re.escape(issue_type)}$", "$options": "i"}
+    if search and search.strip():
+        term = search.strip()
+        query["$or"] = [
+            {"ticketId": {"$regex": term, "$options": "i"}},
+            {"name": {"$regex": term, "$options": "i"}},
+            {"email": {"$regex": term, "$options": "i"}},
+            {"phone": {"$regex": term, "$options": "i"}},
+            {"message": {"$regex": term, "$options": "i"}},
+        ]
+
+    total = await helpdesk_tickets_collection.count_documents(query)
+    tickets = await helpdesk_tickets_collection.find(query).sort("createdAt", -1).skip((page - 1) * limit).limit(limit).to_list(limit)
+
+    return {
+        "tickets": [serialize_doc(t) for t in tickets],
+        "total": total,
+        "page": page,
+        "totalPages": max(1, (total + limit - 1) // limit)
+    }
+
+@router.get("/admin/helpdesk/{ticket_id}")
+async def get_admin_helpdesk_ticket_detail(ticket_id: str, current_admin: dict = Depends(get_current_admin)):
+    """Inspect full details of a support ticket (Admin only)."""
+    try:
+        obj_id = ObjectId(ticket_id)
+    except Exception:
+        obj_id = ticket_id
+
+    ticket = await helpdesk_tickets_collection.find_one({"$or": [{"ticketId": ticket_id}, {"_id": obj_id}]})
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Support ticket not found")
+
+    return serialize_doc(ticket)
+
+@router.patch("/admin/helpdesk/{ticket_id}")
+async def update_admin_helpdesk_ticket(
+    ticket_id: str,
+    payload: HelpdeskStatusUpdateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Update support ticket status and add admin response notes (Admin only)."""
+    try:
+        obj_id = ObjectId(ticket_id)
+    except Exception:
+        obj_id = ticket_id
+
+    update_fields: Dict[str, Any] = {
+        "status": payload.status,
+        "updatedAt": datetime.utcnow()
+    }
+    if payload.admin_response:
+        update_fields["adminResponse"] = payload.admin_response.strip()
+        update_fields["respondedBy"] = current_admin.get("email") or current_admin.get("sub")
+        update_fields["respondedAt"] = datetime.utcnow()
+
+    if payload.status == "RESOLVED":
+        update_fields["resolvedAt"] = datetime.utcnow()
+
+    res = await helpdesk_tickets_collection.find_one_and_update(
+        {"$or": [{"ticketId": ticket_id}, {"_id": obj_id}]},
+        {"$set": update_fields},
+        return_document=True
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Support ticket not found")
+
+    return {
+        "message": "Ticket status updated successfully",
+        "ticket": serialize_doc(res)
     }

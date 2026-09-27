@@ -46,12 +46,15 @@ audit_logs_collection = db["audit_logs"]
 certificate_templates_collection = db["certificate_templates"]
 reports_collection = db["reports"]
 assessments_collection = db["assessments"]
+helpdesk_tickets_collection = db["helpdesk_tickets"]
 
 async def init_db():
     """
     Initialize database indexes:
     - Unique index on user and admin emails
     - TTL index on otp_logs (expires_at) for automatic garbage collection of expired OTPs
+    - Unique index on helpdesk ticketId
+    - Indexes on certificates for fast verification and versioning
     - Verify super admin account exists without deleting real users or existing admins
     """
     try:
@@ -60,8 +63,11 @@ async def init_db():
         # Admin unique email index
         await admins_collection.create_index("email", unique=True)
         # OTP logs TTL index (expires_at)
-        # expireAfterSeconds=0 means the document expires at the exact datetime of expires_at
         await otp_logs_collection.create_index("expires_at", expireAfterSeconds=0)
+        # Helpdesk ticketId index
+        await helpdesk_tickets_collection.create_index("ticketId", unique=True)
+        # Certificates lookup and versioning index
+        await certificates_collection.create_index([("certificateId", 1), ("isCurrentVersion", -1)])
         logger.info("MongoDB indexes created successfully on unified database: %s", db_name)
 
         from auth_handler import get_password_hash
