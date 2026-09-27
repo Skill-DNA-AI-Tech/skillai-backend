@@ -192,14 +192,6 @@ async def get_current_admin(
     raw_role = payload.get("role")
     normalized_role = str(raw_role).strip().upper() if raw_role else ""
 
-    if normalized_role in ADMIN_ROLES:
-        payload["role"] = normalized_role
-        return payload
-
-    # 2. Database cross-check by email or ID if role is missing or needs reconciliation
-    from database import admins_collection, users_collection
-    from bson import ObjectId
-
     sub = str(payload.get("sub") or "").strip()
     user_id = str(payload.get("id") or payload.get("userId") or "").strip()
     email = str(payload.get("email") or "").strip()
@@ -208,6 +200,17 @@ async def get_current_admin(
         email = sub
     elif not user_id and sub and "@" not in sub:
         user_id = sub
+
+    payload["email"] = email
+    payload["id"] = user_id or sub
+
+    if normalized_role in ADMIN_ROLES:
+        payload["role"] = normalized_role
+        return payload
+
+    # 2. Database cross-check by email or ID if role is missing or needs reconciliation
+    from database import admins_collection, users_collection
+    from bson import ObjectId
 
     # Check in admins_collection
     admin_doc = None

@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field, EmailStr
-from typing import Optional, Any, List, Dict
+from pydantic import BaseModel, Field, EmailStr, ConfigDict
+from typing import Optional, Any, List, Dict, Union
 from datetime import datetime
 
 # ==========================================
@@ -222,6 +222,8 @@ class MCQSubmitRequest(BaseModel):
 # ==========================================
 
 class ProfileUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: Optional[str] = None
     headline: Optional[str] = None
     bio: Optional[str] = None
@@ -230,25 +232,94 @@ class ProfileUpdateRequest(BaseModel):
     linkedin: Optional[str] = None
     resumeUrl: Optional[str] = None
     targetRole: Optional[str] = None
+    mobile: Optional[str] = None
+    phone: Optional[str] = None
+    location: Optional[str] = None
+    college: Optional[str] = None
+    degree: Optional[str] = None
+    branch: Optional[str] = None
+    semester: Optional[Union[str, int]] = None
+    experienceLevel: Optional[str] = None
+    interests: Optional[List[str]] = None
+    preferredRoles: Optional[List[str]] = None
+    career: Optional[str] = None
+    career_aspirations: Optional[str] = None
+    domain: Optional[str] = None
+    isProfileCompleted: Optional[bool] = None
+    skillDNA: Optional[Dict[str, Any]] = None
+
+class ProfileCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: Optional[str] = None
+    headline: Optional[str] = None
+    bio: Optional[str] = None
+    skills: Optional[List[str]] = None
+    github: Optional[str] = None
+    linkedin: Optional[str] = None
+    resumeUrl: Optional[str] = None
+    targetRole: Optional[str] = None
+    mobile: Optional[str] = None
+    phone: Optional[str] = None
+    location: Optional[str] = None
+    college: Optional[str] = None
+    degree: Optional[str] = None
+    branch: Optional[str] = None
+    semester: Optional[Union[str, int]] = None
+    experienceLevel: Optional[str] = None
+    interests: Optional[List[str]] = None
+    preferredRoles: Optional[List[str]] = None
+    career: Optional[str] = None
+    career_aspirations: Optional[str] = None
+    domain: Optional[str] = None
+    isProfileCompleted: Optional[bool] = None
+    skillDNA: Optional[Dict[str, Any]] = None
 
 class CareerChangeRequestCreate(BaseModel):
     fromRole: Optional[str] = "General"
     toRole: str = Field(..., description="Target role to transition to")
     reason: Optional[str] = Field(None, description="Reason for requesting career track transition")
 
+class CareerChangeReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    status: str = Field(..., description="APPROVED or REJECTED")
+    reviewNotes: Optional[str] = None
+
 # ==========================================
 # 9. CERTIFICATES & QUESTION BANK SCHEMAS
 # ==========================================
 
 class CertificateCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    assessmentId: Optional[str] = None
+    sessionId: Optional[str] = None
     careerPath: Optional[str] = "Software Engineering"
     technicalScore: Optional[int] = 80
     communicationScore: Optional[int] = 80
     problemSolvingScore: Optional[int] = 80
     confidenceScore: Optional[int] = 80
+    overallScore: Optional[int] = None
     sessionsCompleted: Optional[int] = 1
     strengths: Optional[List[str]] = None
     improvements: Optional[List[str]] = None
+    adminRemark: Optional[str] = None
+    officialRemark: Optional[str] = None
+
+class CertificateShareRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    recruiterEmail: EmailStr
+    message: Optional[str] = None
+
+class ReportCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    profileId: Optional[str] = None
+    interviewScore: Optional[int] = 0
+
+class ReportShareRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    recruiterEmail: EmailStr
+    company: Optional[str] = "Hiring Partner"
+    expiryDays: Optional[int] = 14
 
 class CertificateTemplateCreateRequest(BaseModel):
     templateName: str
@@ -353,4 +424,57 @@ class PublicCertificateVerifyResponse(BaseModel):
     verificationUrl: Optional[str] = None
     scores: Optional[Dict[str, Any]] = None
     message: Optional[str] = None
+
+# ==========================================
+# 13. BULK USER ACTION & AI STUDY NOTES SCHEMAS
+# ==========================================
+
+class BulkUserActionRequest(BaseModel):
+    user_ids: Optional[List[str]] = None
+    userIds: Optional[List[str]] = None
+    action: str = Field(..., pattern="^(?i)(DEACTIVATE|ACTIVATE|DELETE|VERIFY)$")
+    reason: Optional[str] = None
+
+    def get_user_ids(self) -> List[str]:
+        ids = self.user_ids or self.userIds or []
+        if isinstance(ids, list):
+            return [str(x) for x in ids if str(x).strip()]
+        return []
+
+class AINotesGenerateRequest(BaseModel):
+    topic: Optional[str] = None
+    domain: Optional[str] = None
+    discipline: Optional[str] = None
+    detail_level: Optional[str] = "comprehensive"
+    sourceText: Optional[str] = None
+    level: Optional[str] = "Intermediate"
+
+class StudentNoteSaveRequest(BaseModel):
+    topic: str
+    domain: Optional[str] = "General"
+    discipline: Optional[str] = None
+    artifacts: Optional[Dict[str, Any]] = None
+    summary: Optional[str] = None
+    detailedNotes: Optional[str] = None
+    keyPoints: Optional[List[str]] = []
+    quickRevision: Optional[List[str]] = []
+    questions: Optional[List[Dict[str, Any]]] = []
+    flashcards: Optional[List[Dict[str, str]]] = []
+    quiz: Optional[List[Dict[str, Any]]] = []
+
+class StudentNoteUpdateRequest(BaseModel):
+    topic: Optional[str] = None
+    domain: Optional[str] = None
+    discipline: Optional[str] = None
+    artifacts: Optional[Dict[str, Any]] = None
+    summary: Optional[str] = None
+    detailedNotes: Optional[str] = None
+    keyPoints: Optional[List[str]] = None
+    quickRevision: Optional[List[str]] = None
+    questions: Optional[List[Dict[str, Any]]] = None
+    flashcards: Optional[List[Dict[str, str]]] = None
+    quiz: Optional[List[Dict[str, Any]]] = None
+
+class NoteQuizSubmitRequest(BaseModel):
+    answers: Dict[str, Any]
 

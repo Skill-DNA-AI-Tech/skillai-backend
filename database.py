@@ -4,10 +4,27 @@ from config import settings, sanitize_mongodb_uri
 
 logger = logging.getLogger(__name__)
 
+import os
+
 # Initialize MongoDB Async Client with sanitized URI and safe fallback
 _raw_uri = sanitize_mongodb_uri(settings.mongodb_uri) if settings.mongodb_uri else ""
+is_prod = (
+    os.getenv("RENDER") is not None
+    or os.getenv("ENVIRONMENT", "").lower() == "production"
+    or getattr(settings, "environment", "").lower() == "production"
+)
+
 if not _raw_uri:
-    logger.warning("No MongoDB URI configured in environment; falling back to mongodb://localhost:27017/test")
+    if is_prod:
+        logger.critical(
+            "CRITICAL: No MongoDB URI configured in production environment! "
+            "Please check MONGODB_URI, MONGO_URI, or ATLAS_URI in Render dashboard."
+        )
+        raise RuntimeError(
+            "Production MongoDB configuration missing. "
+            "Ensure MONGODB_URI (or MONGO_URI, ATLAS_URI) is set in your Render environment variables."
+        )
+    logger.warning("No MongoDB URI configured in local environment; falling back to mongodb://localhost:27017/test")
     _raw_uri = "mongodb://localhost:27017/test"
 
 client = AsyncIOMotorClient(_raw_uri)
@@ -47,6 +64,8 @@ certificate_templates_collection = db["certificate_templates"]
 reports_collection = db["reports"]
 assessments_collection = db["assessments"]
 helpdesk_tickets_collection = db["helpdesk_tickets"]
+student_notes_collection = db["student_notes"]
+career_change_requests_collection = db["career_change_requests"]
 
 async def init_db():
     """

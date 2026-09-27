@@ -69,6 +69,10 @@ def resolve_mongodb_uri() -> str:
         "MONGO_URL",
         "MONGODB_URL",
         "MONGODB_CONNECTION_STRING",
+        "ATLAS_URI",
+        "MONGODB_ATLAS_URI",
+        "MONGO_ATLAS_URI",
+        "MONGO_CONNECTION_STRING",
     ]
     for key in possible_keys:
         val = os.getenv(key)

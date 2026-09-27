@@ -12,7 +12,15 @@ const numberFromEnv = (value: string | undefined, fallback: number) => {
 };
 
 const resolveMongoUri = (): string => {
-  const uri = process.env.MONGODB_URI || process.env.MONGO_URI || process.env.DATABASE_URL || '';
+  const uri =
+    process.env.MONGODB_URI ||
+    process.env.MONGO_URI ||
+    process.env.DATABASE_URL ||
+    process.env.MONGO_URL ||
+    process.env.MONGODB_URL ||
+    process.env.ATLAS_URI ||
+    process.env.MONGODB_ATLAS_URI ||
+    '';
   return uri.trim().replace(/^['"]|['"]$/g, '').replace(/[,;]+$/, '');
 };
 
