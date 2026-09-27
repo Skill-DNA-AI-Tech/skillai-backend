@@ -61,26 +61,26 @@ async def init_db():
 
         from auth_handler import get_password_hash
         from datetime import datetime
-        super_email = settings.super_admin_email
-        super_pass = settings.super_admin_password
-        hashed_pass = get_password_hash(super_pass)
-
-        super_admin = await admins_collection.find_one({"email": super_email})
-        if not super_admin:
-            await admins_collection.insert_one({
-                "email": super_email,
-                "hashed_password": hashed_pass,
-                "role": "MAIN_ADMIN",
-                "created_at": datetime.utcnow()
-            })
-            logger.info(f"Seeded super admin account: {super_email}")
-        else:
-            # Preserve existing administrator password; only assign default MAIN_ADMIN role if missing
-            if not super_admin.get("role"):
-                await admins_collection.update_one(
-                    {"email": super_email},
-                    {"$set": {"role": "MAIN_ADMIN"}}
-                )
-            logger.info(f"Verified existing super admin account (credentials preserved): {super_email}")
+        super_email = (settings.super_admin_email or "").strip().lower()
+        super_pass = (settings.super_admin_password or "").strip()
+        if super_email and super_pass:
+            hashed_pass = get_password_hash(super_pass)
+            super_admin = await admins_collection.find_one({"email": super_email})
+            if not super_admin:
+                await admins_collection.insert_one({
+                    "email": super_email,
+                    "hashed_password": hashed_pass,
+                    "role": "MAIN_ADMIN",
+                    "created_at": datetime.utcnow()
+                })
+                logger.info(f"Seeded super admin account: {super_email}")
+            else:
+                # Preserve existing administrator password; only assign default MAIN_ADMIN role if missing
+                if not super_admin.get("role"):
+                    await admins_collection.update_one(
+                        {"email": super_email},
+                        {"$set": {"role": "MAIN_ADMIN"}}
+                    )
+                logger.info(f"Verified existing super admin account (credentials preserved): {super_email}")
     except Exception as e:
         logger.error(f"Error initializing database indexes / seeding super admin: {e}")

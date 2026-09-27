@@ -1,6 +1,7 @@
+import os
 import jwt
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
@@ -14,18 +15,31 @@ JWT_SECRET = settings.jwt_secret
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
-# Security scheme for FastAPI dependencies (auto_error=False ensures missing tokens return 401 instead of 403)
-security_scheme = HTTPBearer(auto_error=False)
+# Security scheme for FastAPI dependencies and OpenAPI/Swagger documentation
+# scheme_name="JWTBearer" ensures Swagger displays "Authorize (JWTBearer)"
+security_scheme = HTTPBearer(
+    scheme_name="JWTBearer",
+    description="Enter your JWT Bearer token (obtained from /api/auth/login or /api/auth/admin/verify)",
+    auto_error=False
+)
 
-# Legitimate Admin roles across platform
-ADMIN_ROLES = {"ADMIN", "MAIN_ADMIN", "SUPER_ADMIN", "SUPPORT_TEAM", "EMPLOYEE", "STAFF"}
+# Legitimate platform roles
+ADMIN_ROLES: Set[str] = {"ADMIN", "MAIN_ADMIN", "SUPER_ADMIN", "SUPPORT_TEAM", "EMPLOYEE", "STAFF"}
+HR_ROLES: Set[str] = {"HR", "RECRUITER"}
+STUDENT_ROLES: Set[str] = {"STUDENT", "USER"}
 
-# Known platform JWT secrets to support tokens across microservices and deployments
-KNOWN_SECRETS = [
-    settings.jwt_secret,
-    "super_secret_jwt_key_skilldna",
-    "super_secret_jwt_sign_key_for_skilldna_tech_ai_2026",
-]
+def get_known_secrets() -> list:
+    """Retrieve configured JWT secrets from environment without hardcoded strings in code."""
+    secrets = []
+    if settings.jwt_secret:
+        secrets.append(settings.jwt_secret)
+    sec_env = getattr(settings, "secondary_jwt_secrets", None) or os.getenv("SECONDARY_JWT_SECRETS", "")
+    if sec_env:
+        for s in sec_env.split(","):
+            s_clean = s.strip()
+            if s_clean and s_clean not in secrets:
+                secrets.append(s_clean)
+    return secrets
 
 def get_password_hash(password: str) -> str:
     """Hash a plain text password using bcrypt."""
@@ -39,7 +53,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Create a JWT access token containing the provided payload data."""
+    """Create a standard JWT access token containing the provided payload data."""
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
@@ -47,7 +61,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
         expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, settings.jwt_secret, algorithm=ALGORITHM)
     return encoded_jwt
 
 def decode_access_token(token: str) -> Optional[dict]:
@@ -59,7 +73,7 @@ def decode_access_token(token: str) -> Optional[dict]:
     if clean_token.lower().startswith("bearer "):
         clean_token = clean_token[7:].strip()
 
-    # 1. Attempt to decode using Supabase client secret (HS256 key)
+    # 1. Attempt to decode using Supabase client secret if present
     supabase_secret = getattr(settings, "supabase_client_secret", None)
     if supabase_secret:
         try:
@@ -78,7 +92,8 @@ def decode_access_token(token: str) -> Optional[dict]:
             pass
 
     # 2. Attempt with known platform JWT secrets
-    for secret in KNOWN_SECRETS:
+    known_secrets = get_known_secrets()
+    for secret in known_secrets:
         if not secret:
             continue
         try:
@@ -113,8 +128,9 @@ async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme)
 ) -> dict:
     """
-    FastAPI dependency to extract and verify JWT for a student.
-    Returns the token payload if valid.
+    FastAPI dependency to extract and verify JWT for any authenticated user (Student, HR, or Admin).
+    Returns the enriched user token payload.
+    Raises 401 if missing, invalid, or expired.
     """
     token = extract_token_from_request(request, credentials)
     if not token:
@@ -131,7 +147,20 @@ async def get_current_user(
             detail="Could not validate credentials or token expired",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
+    # Reconcile user identity & role
+    raw_role = payload.get("role")
+    normalized_role = str(raw_role).strip().upper() if raw_role else "STUDENT"
+    payload["role"] = normalized_role
+
+    sub = str(payload.get("sub") or "").strip()
+    user_id = str(payload.get("id") or payload.get("userId") or "").strip()
+    email = str(payload.get("email") or "").strip()
+    if not email and "@" in sub:
+        email = sub
+    payload["email"] = email
+    payload["id"] = user_id or sub
+
     return payload
 
 async def get_current_admin(
@@ -221,4 +250,32 @@ async def get_current_admin(
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Forbidden: Admin role required",
+    )
+
+async def get_current_hr_or_admin(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme)
+) -> dict:
+    """
+    FastAPI dependency to extract and verify JWT for an HR recruiter or administrator.
+    """
+    user = await get_current_user(request, credentials)
+    role = str(user.get("role", "")).upper()
+    if role in HR_ROLES or role in ADMIN_ROLES:
+        return user
+    
+    # Check DB in case role needs reconciliation
+    from database import users_collection
+    email = user.get("email") or user.get("sub")
+    if email:
+        doc = await users_collection.find_one({"email": email.lower()})
+        if doc:
+            db_role = str(doc.get("role", "")).upper()
+            if db_role in HR_ROLES or db_role in ADMIN_ROLES:
+                user["role"] = db_role
+                return user
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Forbidden: HR or Admin role required",
     )

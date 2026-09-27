@@ -245,8 +245,10 @@ async def verify_email(payload: VerifyEmailRequest, request: Request):
     # Generate JWT
     token_data = {
         "sub": email,
+        "id": str(user["_id"]),
+        "email": email,
         "role": "student",
-        "name": user["name"]
+        "name": user.get("name", "Student")
     }
     access_token = create_access_token(data=token_data)
 
@@ -367,6 +369,8 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
     # Generate JWT
     token_data = {
         "sub": email,
+        "id": str(user["_id"]),
+        "email": email,
         "role": user_role,
         "name": user.get("name", name)
     }

@@ -32,8 +32,42 @@ from database import (
 )
 from auth_handler import (
     get_current_admin,
+    get_current_user,
+    get_current_hr_or_admin,
     create_access_token,
     get_password_hash,
+)
+from schemas import (
+    FooterUpdateRequest,
+    PageSettingUpdateRequest,
+    AdminCreateRequest,
+    AdminUpdateRequest,
+    HRCreateRequest,
+    HRUpdateRequest,
+    TestUserCreateRequest,
+    TestUserStatusUpdateRequest,
+    FeedbackStatusUpdateRequest,
+    InterviewStartRequest,
+    InterviewAnswerRequest,
+    ReassessConceptRequest,
+    AIInterviewRequest,
+    AIDeepAnalysisRequest,
+    AIJobMatchRequest,
+    AISkillDNARequest,
+    AILearningRecommendRequest,
+    AIResumeRequest,
+    LearningTopicContentRequest,
+    LearningContentRequest,
+    LearningChatbotRequest,
+    MCQStartRequest,
+    MCQSubmitRequest,
+    ProfileUpdateRequest,
+    CareerChangeRequestCreate,
+    CertificateCreateRequest,
+    CertificateTemplateCreateRequest,
+    CertificateSignatureRequest,
+    QuestionCreateRequest,
+    QuestionGenerateRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,7 +77,7 @@ router = APIRouter(tags=["Admin & Business Operations"])
 def serialize_doc(doc: Any) -> Any:
     """
     Recursively converts MongoDB documents, ObjectIds, and datetimes
-    into JSON-serializable structures, and strips password hashes.
+    into JSON-serializable structures, and strictly strips password hashes and secrets.
     """
     if doc is None:
         return None
@@ -56,13 +90,40 @@ def serialize_doc(doc: Any) -> Any:
     if isinstance(doc, dict):
         clean = {}
         for k, v in doc.items():
-            if k in ("password", "hashed_password"):
+            if k in ("password", "hashed_password", "otp_hash"):
                 continue
             clean[k] = serialize_doc(v)
         if "_id" in clean:
             clean["id"] = clean["_id"]
         return clean
     return doc
+
+async def get_authenticated_user_doc(current_user: dict) -> dict:
+    """
+    Fetches the verified MongoDB document for the currently authenticated user.
+    current_user is guaranteed to be validated and authenticated via get_current_user.
+    """
+    email = current_user.get("email") or current_user.get("sub")
+    user_id = current_user.get("id") or current_user.get("userId")
+    
+    user = None
+    if email:
+        user = await users_collection.find_one({"email": email.lower()})
+        if not user:
+            user = await admins_collection.find_one({"email": email.lower()})
+    if not user and user_id:
+        try:
+            user = await users_collection.find_one({"_id": ObjectId(user_id)})
+        except Exception:
+            user = await users_collection.find_one({"_id": user_id})
+    if not user:
+        user = {
+            "_id": ObjectId(user_id) if (user_id and ObjectId.is_valid(user_id)) else (user_id or "user"),
+            "email": email or "user@skilldna.ai",
+            "name": current_user.get("name", "User"),
+            "role": current_user.get("role", "student")
+        }
+    return user
 
 # ==========================================
 # 1. FOOTER ENDPOINTS
@@ -111,14 +172,19 @@ async def get_admin_footer():
     return serialize_doc(footer)
 
 @router.put("/admin/footer")
-async def update_admin_footer(payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
+async def update_admin_footer(
+    payload: FooterUpdateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
     """Update footer configuration (Admin only)."""
-    update_data = {
-        "text": payload.get("text", DEFAULT_FOOTER["text"]),
-        "linkGroups": payload.get("linkGroups", DEFAULT_FOOTER["linkGroups"]),
-        "copyright": payload.get("copyright", DEFAULT_FOOTER["copyright"]),
-        "updated_at": datetime.utcnow()
-    }
+    update_data: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    if payload.text is not None:
+        update_data["text"] = payload.text
+    if payload.linkGroups is not None:
+        update_data["linkGroups"] = payload.linkGroups
+    if payload.copyright is not None:
+        update_data["copyright"] = payload.copyright
+
     await footers_collection.update_one({}, {"$set": update_data}, upsert=True)
     footer = await footers_collection.find_one({})
     return serialize_doc(footer)
@@ -149,9 +215,13 @@ async def get_page_settings():
     return [serialize_doc(s) for s in settings]
 
 @router.put("/admin/page-settings/{page_id}")
-async def update_page_setting(page_id: str, payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
+async def update_page_setting(
+    page_id: str,
+    payload: PageSettingUpdateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
     """Update visibility toggle for a specific page (Admin only)."""
-    is_hidden = bool(payload.get("isHidden", False))
+    is_hidden = bool(payload.isHidden)
     result = await page_settings_collection.find_one_and_update(
         {"pageId": page_id},
         {"$set": {"isHidden": is_hidden, "updatedAt": datetime.utcnow()}},
@@ -176,7 +246,7 @@ async def update_page_setting(page_id: str, payload: Dict[str, Any], current_adm
 @router.get("/admin/admins")
 async def get_admins(current_admin: dict = Depends(get_current_admin)):
     """List all Admin team members (Admin only)."""
-    admin_roles = ["MAIN_ADMIN", "ADMIN", "admin", "employee", "staff"]
+    admin_roles = ["MAIN_ADMIN", "ADMIN", "admin", "employee", "staff", "SUPER_ADMIN", "SUPPORT_TEAM"]
     users = await users_collection.find({
         "role": {"$in": admin_roles},
         "email": {"$ne": "skilldnaai@ai.com"}
@@ -207,14 +277,14 @@ async def get_admins(current_admin: dict = Depends(get_current_admin)):
     return list(combined.values())
 
 @router.post("/admin/admins")
-async def create_admin(payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Create new admin account."""
-    email = payload.get("email", "").strip().lower()
-    name = payload.get("name") or payload.get("full_name") or email.split("@")[0]
-    raw_password = payload.get("password", "")
-
-    if not email or not raw_password:
-        raise HTTPException(status_code=400, detail="Email and password are required")
+async def create_admin(
+    payload: AdminCreateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Create new admin account (Admin only)."""
+    email = payload.email.strip().lower()
+    name = payload.name or email.split("@")[0]
+    raw_password = payload.password
 
     existing = await users_collection.find_one({"email": email}) or await admins_collection.find_one({"email": email})
     if existing:
@@ -226,7 +296,8 @@ async def create_admin(payload: Dict[str, Any], current_admin: dict = Depends(ge
         "full_name": name,
         "email": email,
         "password": hashed,
-        "role": payload.get("role", "ADMIN"),
+        "hashed_password": hashed,
+        "role": (payload.role or "ADMIN").upper(),
         "status": "ACTIVE",
         "emailVerified": True,
         "requiresPasswordChange": False,
@@ -238,20 +309,29 @@ async def create_admin(payload: Dict[str, Any], current_admin: dict = Depends(ge
     return serialize_doc(new_admin)
 
 @router.put("/admin/admins/{id}")
-async def update_admin(id: str, payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Update admin role, status, or name."""
+async def update_admin(
+    id: str,
+    payload: AdminUpdateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Update admin role, status, or name (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
         obj_id = id
 
-    update_fields = {}
-    for key in ["role", "status", "name", "full_name"]:
-        if key in payload:
-            update_fields[key] = payload[key]
-    if "password" in payload and payload["password"]:
-        update_fields["password"] = get_password_hash(payload["password"])
-    update_fields["updated_at"] = datetime.utcnow()
+    update_fields: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    if payload.role:
+        update_fields["role"] = payload.role.upper()
+    if payload.status:
+        update_fields["status"] = payload.status.upper()
+    if payload.name:
+        update_fields["name"] = payload.name
+        update_fields["full_name"] = payload.name
+    if payload.password:
+        hashed = get_password_hash(payload.password)
+        update_fields["password"] = hashed
+        update_fields["hashed_password"] = hashed
 
     updated = await users_collection.find_one_and_update(
         {"$or": [{"_id": obj_id}, {"email": id}]},
@@ -270,7 +350,7 @@ async def update_admin(id: str, payload: Dict[str, Any], current_admin: dict = D
 
 @router.delete("/admin/admins/{id}")
 async def delete_admin(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Delete admin account."""
+    """Delete admin account (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -286,31 +366,33 @@ async def delete_admin(id: str, current_admin: dict = Depends(get_current_admin)
 
 @router.get("/admin/hrs")
 async def get_hrs(current_admin: dict = Depends(get_current_admin)):
-    """Retrieve all HR / recruiter accounts."""
+    """Retrieve all HR / recruiter accounts (Admin only)."""
     hrs = await users_collection.find({"role": {"$in": ["HR", "recruiter", "RECRUITER"]}}).to_list(100)
     return [serialize_doc(h) for h in hrs]
 
 @router.post("/admin/hrs")
-async def create_hr(payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Create a new HR recruiter account."""
-    email = payload.get("email", "").strip().lower()
-    name = payload.get("name") or payload.get("fullName") or email.split("@")[0]
-    raw_password = payload.get("password") or "Recruiter@123"
-
-    if not email:
-        raise HTTPException(status_code=400, detail="Email is required")
+async def create_hr(
+    payload: HRCreateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Create a new HR recruiter account (Admin only)."""
+    email = payload.email.strip().lower()
+    name = payload.name or email.split("@")[0]
+    raw_password = payload.password or "Recruiter@123"
 
     existing = await users_collection.find_one({"email": email})
     if existing:
         raise HTTPException(status_code=400, detail="An account with this email already exists")
 
+    hashed = get_password_hash(raw_password)
     new_hr = {
         "name": name,
         "full_name": name,
         "email": email,
-        "password": get_password_hash(raw_password),
+        "password": hashed,
+        "hashed_password": hashed,
         "role": "HR",
-        "company": payload.get("company", "Partner Company"),
+        "company": payload.company or "Partner Company",
         "status": "ACTIVE",
         "emailVerified": True,
         "created_at": datetime.utcnow(),
@@ -321,17 +403,29 @@ async def create_hr(payload: Dict[str, Any], current_admin: dict = Depends(get_c
     return serialize_doc(new_hr)
 
 @router.put("/admin/hrs/{id}")
-async def update_hr(id: str, payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Update HR status."""
+async def update_hr(
+    id: str,
+    payload: HRUpdateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Update HR recruiter details (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
         obj_id = id
 
-    status_val = payload.get("status", "ACTIVE")
+    update_fields: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    if payload.status:
+        update_fields["status"] = payload.status
+    if payload.name:
+        update_fields["name"] = payload.name
+        update_fields["full_name"] = payload.name
+    if payload.company:
+        update_fields["company"] = payload.company
+
     res = await users_collection.find_one_and_update(
         {"_id": obj_id},
-        {"$set": {"status": status_val, "updated_at": datetime.utcnow()}},
+        {"$set": update_fields},
         return_document=True
     )
     if not res:
@@ -340,7 +434,7 @@ async def update_hr(id: str, payload: Dict[str, Any], current_admin: dict = Depe
 
 @router.delete("/admin/hrs/{id}")
 async def delete_hr(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Delete HR account."""
+    """Delete HR account (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -447,18 +541,21 @@ async def get_test_users(current_admin: dict = Depends(get_current_admin)):
     return result
 
 @router.post("/admin/test-users")
-async def create_test_user(payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Create a new pre-production test user with credentials."""
-    name = (payload.get("name") or payload.get("userId") or "Beta Student").strip()
-    test_id = (payload.get("userId") or f"BETA-{int(datetime.utcnow().timestamp()) % 10000}").strip().upper()
-    email = (payload.get("email") or f"{test_id.lower()}@skilldna.local").strip().lower()
-    raw_password = (payload.get("password") or "BetaStudentPass@123").strip()
-    domain = payload.get("careerDomain", "Computer Science")
-    role = payload.get("targetRole", "Specialist")
+async def create_test_user(
+    payload: TestUserCreateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Create a new pre-production test user (Admin only)."""
+    name = (payload.name or "Beta Student").strip()
+    test_id = f"BETA-{int(datetime.utcnow().timestamp()) % 10000}"
+    email = payload.email.strip().lower()
+    raw_password = payload.password or "BetaStudentPass@123"
+    domain = "Computer Science"
+    role = (payload.role or "STUDENT").upper()
 
     existing = await users_collection.find_one({"$or": [{"email": email}, {"testUserId": test_id}]})
     if existing:
-        raise HTTPException(status_code=400, detail=f"User with email {email} or ID {test_id} already exists")
+        raise HTTPException(status_code=400, detail=f"User with email {email} already exists")
 
     hashed = get_password_hash(raw_password)
     user_doc = {
@@ -466,7 +563,8 @@ async def create_test_user(payload: Dict[str, Any], current_admin: dict = Depend
         "full_name": name,
         "email": email,
         "password": hashed,
-        "role": "STUDENT",
+        "hashed_password": hashed,
+        "role": role,
         "status": "ACTIVE",
         "emailVerified": True,
         "requiresPasswordChange": False,
@@ -475,7 +573,7 @@ async def create_test_user(payload: Dict[str, Any], current_admin: dict = Depend
         "betaAccess": True,
         "testUserId": test_id,
         "careerDomain": domain,
-        "targetRole": role,
+        "targetRole": "Specialist",
         "testCredentials": {
             "userId": test_id,
             "temporaryPassword": raw_password,
@@ -486,15 +584,14 @@ async def create_test_user(payload: Dict[str, Any], current_admin: dict = Depend
     result = await users_collection.insert_one(user_doc)
     user_doc["_id"] = result.inserted_id
 
-    # Create matching Profile
     profile_doc = {
         "user": user_doc["_id"],
         "name": name,
         "email": email,
         "domain": domain,
-        "skills": payload.get("skills") or [domain],
-        "degree": payload.get("education", "B.Tech"),
-        "branch": payload.get("department", domain),
+        "skills": [domain],
+        "degree": "B.Tech",
+        "branch": domain,
         "college": "SkillDNA Pre-Production Beta Program",
         "skillDNA": {
             "score": 0,
@@ -520,7 +617,7 @@ async def create_test_user(payload: Dict[str, Any], current_admin: dict = Depend
 
 @router.get("/admin/test-users/{id}")
 async def get_test_user_details(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Inspect full pre-production user state."""
+    """Inspect full pre-production user state (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -542,13 +639,17 @@ async def get_test_user_details(id: str, current_admin: dict = Depends(get_curre
     }
 
 @router.patch("/admin/test-users/{id}/status")
-async def toggle_test_user_status(id: str, payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Toggle test user active/disabled status."""
+async def toggle_test_user_status(
+    id: str,
+    payload: TestUserStatusUpdateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Toggle test user active/disabled status (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
         obj_id = id
-    new_status = payload.get("status", "ACTIVE")
+    new_status = payload.status or ("ACTIVE" if payload.isActive is not False else "DISABLED")
     user = await users_collection.find_one_and_update(
         {"_id": obj_id},
         {"$set": {"status": new_status, "updated_at": datetime.utcnow()}},
@@ -560,7 +661,7 @@ async def toggle_test_user_status(id: str, payload: Dict[str, Any], current_admi
 
 @router.post("/admin/test-users/{id}/login-token")
 async def generate_test_user_token(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Generate an instant login token for pre-production test user."""
+    """Generate an instant login token for pre-production test user (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -574,16 +675,23 @@ async def generate_test_user_token(id: str, current_admin: dict = Depends(get_cu
         "id": str(user["_id"]),
         "email": user["email"],
         "role": "STUDENT",
+        "name": user.get("name", "Test Candidate")
     })
 
     return {
         "token": token,
+        "access_token": token,
+        "token_type": "bearer",
         "user": serialize_doc(user)
     }
 
 @router.post("/admin/test-users/{id}/reset")
-async def reset_test_user_data(id: str, payload: Dict[str, Any] = {}, current_admin: dict = Depends(get_current_admin)):
-    """Reset interviews, career twin, and skill score for test user."""
+async def reset_test_user_data(
+    id: str,
+    payload: Dict[str, Any] = {},
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Reset interviews, career twin, and skill score for test user (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -611,7 +719,7 @@ async def reset_test_user_data(id: str, payload: Dict[str, Any] = {}, current_ad
 
 @router.delete("/admin/test-users/{id}")
 async def delete_test_user(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Delete pre-production test user."""
+    """Delete pre-production test user (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -627,7 +735,7 @@ async def delete_test_user(id: str, current_admin: dict = Depends(get_current_ad
 
 @router.get("/admin/students")
 async def get_students(current_admin: dict = Depends(get_current_admin)):
-    """List students with profiles."""
+    """List students with profiles (Admin only)."""
     students = await users_collection.find({"role": {"$in": ["STUDENT", "student"]}}).to_list(100)
     return [serialize_doc(s) for s in students]
 
@@ -638,7 +746,7 @@ async def get_students_paginated(
     search: str = Query(""),
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Searchable & paginated student list."""
+    """Searchable & paginated student list (Admin only)."""
     query: Dict[str, Any] = {"role": {"$in": ["STUDENT", "student"]}}
     if search:
         query["$or"] = [
@@ -663,7 +771,7 @@ async def get_certificates(
     search: str = Query(""),
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Retrieve certificates."""
+    """Retrieve certificates (Admin only)."""
     query: Dict[str, Any] = {}
     if search:
         query["$or"] = [
@@ -686,25 +794,27 @@ async def get_certificates(
 
 @router.get("/certificates/admin/templates")
 async def get_certificate_templates(current_admin: dict = Depends(get_current_admin)):
-    """Retrieve all certificate templates."""
+    """Retrieve all certificate templates (Admin only)."""
     templates = await certificate_templates_collection.find({}).to_list(50)
     return [serialize_doc(t) for t in templates]
 
 @router.post("/certificates/admin/templates")
-async def create_certificate_template(payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Create a new certificate template."""
-    new_template = dict(payload)
+async def create_certificate_template(
+    payload: CertificateTemplateCreateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Create a new certificate template (Admin only)."""
+    new_template = payload.model_dump()
     new_template["createdAt"] = datetime.utcnow()
     new_template["updatedAt"] = datetime.utcnow()
-    if "templateId" not in new_template:
-        new_template["templateId"] = f"TPL-{int(datetime.utcnow().timestamp())}"
+    new_template["templateId"] = f"TPL-{int(datetime.utcnow().timestamp())}"
     res = await certificate_templates_collection.insert_one(new_template)
     new_template["_id"] = res.inserted_id
     return serialize_doc(new_template)
 
 @router.post("/certificates/admin/templates/{id}/activate")
 async def activate_certificate_template(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Activate a specific certificate template."""
+    """Activate a specific certificate template (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -720,7 +830,7 @@ async def get_all_certificates_admin(
     search: str = Query(""),
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Retrieve all certificates with pagination."""
+    """Retrieve all certificates with pagination (Admin only)."""
     query: Dict[str, Any] = {}
     if search:
         query["$or"] = [
@@ -739,20 +849,23 @@ async def get_all_certificates_admin(
 
 @router.get("/certificates/admin/pending")
 async def get_pending_certificates(current_admin: dict = Depends(get_current_admin)):
-    """List pending verification certificates."""
+    """List pending verification certificates (Admin only)."""
     pending = await certificates_collection.find({"status": "PENDING"}).to_list(50)
     return [serialize_doc(p) for p in pending]
 
 @router.get("/certificates/admin/signature")
 async def get_admin_signature(current_admin: dict = Depends(get_current_admin)):
-    """Get active digital signature."""
+    """Get active digital signature (Admin only)."""
     active_tpl = await certificate_templates_collection.find_one({"isActive": True})
     return {"signatureBase64": (active_tpl or {}).get("signatureUrl", "")}
 
 @router.post("/certificates/admin/signature")
-async def set_admin_signature(payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Set active digital signature."""
-    sig = payload.get("signatureBase64") or payload.get("signatureUrl") or ""
+async def set_admin_signature(
+    payload: CertificateSignatureRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Set active digital signature (Admin only)."""
+    sig = payload.signatureBase64 or payload.signatureUrl or ""
     await certificate_templates_collection.update_one(
         {"isActive": True},
         {"$set": {"signatureUrl": sig, "updatedAt": datetime.utcnow()}},
@@ -762,12 +875,12 @@ async def set_admin_signature(payload: Dict[str, Any], current_admin: dict = Dep
 
 @router.post("/certificates/admin/regenerate/{id}")
 async def regenerate_certificate(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Regenerate a certificate."""
+    """Regenerate a certificate (Admin only)."""
     return {"message": f"Certificate {id} regenerated successfully"}
 
 @router.post("/certificates/admin/reject/{id}")
 async def reject_certificate(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Reject a certificate."""
+    """Reject a certificate (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -780,7 +893,7 @@ async def reject_certificate(id: str, current_admin: dict = Depends(get_current_
 
 @router.post("/certificates/admin/approve/{id}")
 async def approve_certificate(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Approve a certificate."""
+    """Approve a certificate (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -804,7 +917,7 @@ async def get_questions_admin_list(
     difficulty: str = Query(""),
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Retrieve question bank items with filters and pagination."""
+    """Retrieve question bank items with filters and pagination (Admin only)."""
     query: Dict[str, Any] = {}
     if search:
         query["$or"] = [
@@ -834,7 +947,7 @@ async def export_questions(
     difficulty: str = Query(""),
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Export question bank items as CSV."""
+    """Export question bank items as CSV (Admin only)."""
     query: Dict[str, Any] = {}
     if field and field != "ALL":
         query["field"] = field
@@ -863,8 +976,11 @@ async def export_questions(
     )
 
 @router.get("/questions/admin/template")
-async def get_questions_template(format: str = Query("csv"), current_admin: dict = Depends(get_current_admin)):
-    """Download question upload template."""
+async def get_questions_template(
+    format: str = Query("csv"),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Download question upload template (Admin only)."""
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Question", "Field", "Topic", "Difficulty", "BloomLevel", "ExpectedAnswer"])
@@ -883,8 +999,11 @@ async def get_questions_template(format: str = Query("csv"), current_admin: dict
     )
 
 @router.post("/questions/admin/upload")
-async def upload_questions(payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Batch upload questions."""
+async def upload_questions(
+    payload: Dict[str, Any],
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Batch upload questions (Admin only)."""
     items = payload.get("questions") or payload.get("items") or []
     if not items and "question" in payload:
         items = [payload]
@@ -899,27 +1018,33 @@ async def upload_questions(payload: Dict[str, Any], current_admin: dict = Depend
     return {"message": f"Successfully imported {count} questions.", "count": count}
 
 @router.post("/questions/admin/create-single")
-async def create_single_question(payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Create a single question bank question."""
-    new_q = dict(payload)
-    new_q["status"] = new_q.get("status", "Active")
+async def create_single_question(
+    payload: QuestionCreateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Create a single question bank question (Admin only)."""
+    new_q = payload.model_dump()
+    new_q["status"] = "Active"
     new_q["createdAt"] = datetime.utcnow()
     res = await question_bank_collection.insert_one(new_q)
     new_q["_id"] = res.inserted_id
     return serialize_doc(new_q)
 
 @router.post("/questions/admin/generate-and-add")
-async def generate_and_add_questions(payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Auto-generate questions for domain."""
-    domain = payload.get("domain", "Computer Science")
-    topic = payload.get("topic", "System Design")
-    diff = payload.get("difficulty", "Intermediate")
-    count = int(payload.get("count", 3))
+async def generate_and_add_questions(
+    payload: QuestionGenerateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Auto-generate questions for domain (Admin only)."""
+    topic = payload.topic
+    count = payload.count or 5
+    diff = payload.difficulty or "Medium"
+    domain = "Computer Science"
 
     generated = []
     for i in range(count):
         doc = {
-            "question": f"Key principles and trade-offs of {topic} in modern {domain} engineering (Variant {i+1})",
+            "question": f"Key principles and trade-offs of {topic} in modern engineering (Variant {i+1})",
             "field": domain,
             "topic": topic,
             "difficulty": diff,
@@ -936,7 +1061,7 @@ async def generate_and_add_questions(payload: Dict[str, Any], current_admin: dic
 
 @router.delete("/questions/admin/{id}")
 async def delete_question(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Delete a question."""
+    """Delete a question (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
@@ -950,24 +1075,28 @@ async def delete_question(id: str, current_admin: dict = Depends(get_current_adm
 
 @router.get("/admin/feedback")
 async def get_feedback(current_admin: dict = Depends(get_current_admin)):
-    """Retrieve feedback items."""
+    """Retrieve feedback items (Admin only)."""
     feedbacks = await feedbacks_collection.find({}).sort("createdAt", -1).to_list(100)
     return [serialize_doc(f) for f in feedbacks]
 
 @router.get("/admin/feedback/backup")
 async def backup_feedback(current_admin: dict = Depends(get_current_admin)):
-    """Retrieve backup of all feedback submissions."""
+    """Retrieve backup of all feedback submissions (Admin only)."""
     feedbacks = await feedbacks_collection.find({}).to_list(1000)
     return [serialize_doc(f) for f in feedbacks]
 
 @router.put("/admin/feedback/{id}")
-async def update_feedback_status(id: str, payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
-    """Update feedback status."""
+async def update_feedback_status(
+    id: str,
+    payload: FeedbackStatusUpdateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Update feedback status (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
         obj_id = id
-    status_val = payload.get("status", "RESOLVED")
+    status_val = payload.status
     updated = await feedbacks_collection.find_one_and_update(
         {"_id": obj_id},
         {"$set": {"status": status_val, "updatedAt": datetime.utcnow()}},
@@ -982,28 +1111,15 @@ async def update_feedback_status(id: str, payload: Dict[str, Any], current_admin
 # ==========================================
 
 @router.get("/profiles/me")
-async def get_my_profile(request: Request):
-    """Retrieve current student profile."""
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header.replace("Bearer ", "").strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    from auth_handler import decode_access_token
-    payload = decode_access_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    email = payload.get("sub")
-    user = await users_collection.find_one({"email": email})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
+async def get_my_profile(current_user: dict = Depends(get_current_user)):
+    """Retrieve current student profile (Authenticated user)."""
+    user = await get_authenticated_user_doc(current_user)
     profile = await profiles_collection.find_one({"user": user["_id"]})
     if not profile:
         profile = {
             "user": user["_id"],
             "name": user.get("name", "Student"),
-            "email": email,
+            "email": user.get("email"),
             "skillDNA": {
                 "score": 75,
                 "technicalScore": 78,
@@ -1018,48 +1134,27 @@ async def get_my_profile(request: Request):
     return serialize_doc(profile)
 
 @router.put("/profiles/me")
-async def update_my_profile(payload: Dict[str, Any], request: Request):
-    """Update student profile details."""
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header.replace("Bearer ", "").strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    from auth_handler import decode_access_token
-    token_payload = decode_access_token(token)
-    if not token_payload:
-        raise HTTPException(status_code=401, detail="Invalid token")
+async def update_my_profile(
+    payload: ProfileUpdateRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update student profile details (Authenticated user)."""
+    user = await get_authenticated_user_doc(current_user)
+    update_data = payload.model_dump(exclude_unset=True)
+    update_data["updatedAt"] = datetime.utcnow()
 
-    email = token_payload.get("sub")
-    user = await users_collection.find_one({"email": email})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    update_doc = {**payload, "updatedAt": datetime.utcnow()}
     updated = await profiles_collection.find_one_and_update(
         {"user": user["_id"]},
-        {"$set": update_doc},
+        {"$set": update_data},
         upsert=True,
         return_document=True
     )
     return serialize_doc(updated)
 
 @router.get("/reports/me/scorecards")
-async def get_my_scorecards(request: Request):
-    """Retrieve scorecard data for current student."""
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header.replace("Bearer ", "").strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    from auth_handler import decode_access_token
-    payload = decode_access_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    email = payload.get("sub")
-    user = await users_collection.find_one({"email": email})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
+async def get_my_scorecards(current_user: dict = Depends(get_current_user)):
+    """Retrieve scorecard data for current student (Authenticated user)."""
+    user = await get_authenticated_user_doc(current_user)
     sessions = await question_sessions_collection.find({"studentId": user["_id"]}).to_list(10)
     return {
         "sessions": [serialize_doc(s) for s in sessions],
@@ -1072,7 +1167,7 @@ async def get_my_scorecards(request: Request):
 
 @router.get("/verify/{certificate_id}")
 async def verify_certificate_public(certificate_id: str):
-    """Public verification endpoint for QR scans."""
+    """Public verification endpoint for QR scans and employer verification (Public)."""
     cert = await certificates_collection.find_one({"certificateId": certificate_id})
     if not cert:
         raise HTTPException(status_code=404, detail="Certificate not found or revoked")
@@ -1082,65 +1177,50 @@ async def verify_certificate_public(certificate_id: str):
         "certificate": serialize_doc(cert)
     }
 
-# ==========================================
-# 14. AUTHENTICATED USER HELPER
-# ==========================================
+@router.get("/certificates/{certificate_id}/pdf")
+async def download_certificate_pdf(certificate_id: str):
+    """Download certificate document representation (Public)."""
+    cert = await certificates_collection.find_one({"certificateId": certificate_id})
+    if not cert:
+        raise HTTPException(status_code=404, detail="Certificate not found")
 
-async def get_student_user_from_request(request: Request) -> dict:
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header.replace("Bearer ", "").strip()
-    if token:
-        from auth_handler import decode_access_token
-        payload = decode_access_token(token)
-        if payload:
-            email = payload.get("sub") or payload.get("email")
-            user_id = payload.get("id") or payload.get("userId")
-            if email:
-                u = await users_collection.find_one({"email": email})
-                if u:
-                    return u
-            if user_id:
-                try:
-                    u = await users_collection.find_one({"_id": ObjectId(user_id)})
-                except Exception:
-                    u = await users_collection.find_one({"_id": user_id})
-                if u:
-                    return u
-            return {
-                "_id": user_id or "student",
-                "email": email or "student@skilldna.com",
-                "name": payload.get("name", "Student"),
-                "role": payload.get("role", "student")
-            }
-    default_student = await users_collection.find_one({"role": {"$in": ["STUDENT", "student"]}})
-    if default_student:
-        return default_student
-    return {
-        "_id": "guest_student",
-        "email": "student@skilldna.ai",
-        "name": "Candidate",
-        "role": "student"
-    }
+    svg_content = f"""<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600">
+      <rect width="800" height="600" fill="#0f172a" />
+      <rect x="20" y="20" width="760" height="560" fill="none" stroke="#6366f1" stroke-width="4" rx="12" />
+      <text x="400" y="100" fill="#ffffff" font-size="28" font-family="Arial" font-weight="bold" text-anchor="middle">SkillDNA AI Certified Professional</text>
+      <text x="400" y="160" fill="#94a3b8" font-size="16" font-family="Arial" text-anchor="middle">This officially certifies that</text>
+      <text x="400" y="230" fill="#38bdf8" font-size="32" font-family="Arial" font-weight="bold" text-anchor="middle">{cert.get('studentName', 'Candidate')}</text>
+      <text x="400" y="290" fill="#cbd5e1" font-size="18" font-family="Arial" text-anchor="middle">has successfully completed technical evaluation in</text>
+      <text x="400" y="340" fill="#a855f7" font-size="24" font-family="Arial" font-weight="bold" text-anchor="middle">{cert.get('careerPath', 'Software Engineering')}</text>
+      <text x="400" y="420" fill="#94a3b8" font-size="14" font-family="Arial" text-anchor="middle">Certificate ID: {cert.get('certificateId')}</text>
+      <text x="400" y="460" fill="#94a3b8" font-size="14" font-family="Arial" text-anchor="middle">Verified on {datetime.utcnow().strftime('%B %d, %Y')}</text>
+    </svg>"""
+
+    return Response(content=svg_content, media_type="image/svg+xml", headers={
+        "Content-Disposition": f"attachment; filename=SkillDNA-Certificate-{certificate_id}.svg"
+    })
 
 # ==========================================
-# 15. DYNAMIC INTERVIEW & QUESTION ENGINE
+# 14. DYNAMIC INTERVIEW & QUESTION ENGINE
 # ==========================================
 
 @router.post("/questions/interview/start")
-async def start_interview_session(payload: Dict[str, Any], request: Request):
+async def start_interview_session(
+    payload: InterviewStartRequest,
+    current_user: dict = Depends(get_current_user)
+):
     """
-    Start an adaptive technical interview session.
+    Start an adaptive technical interview session (Authenticated user).
     Retrieves questions from the unified question bank.
     """
-    user = await get_student_user_from_request(request)
+    user = await get_authenticated_user_doc(current_user)
     session_id = f"SES-{uuid.uuid4().hex[:12].upper()}"
-    field = payload.get("field") or payload.get("careerDomain") or "Software Engineering"
-    topic = payload.get("topic") or "Full Stack Developer"
-    target_role = payload.get("targetRole") or topic
-    difficulty = payload.get("difficulty") or "Medium"
-    question_count = int(payload.get("questionCount") or 5)
+    field = payload.field or "Software Engineering"
+    topic = payload.topic or "Full Stack Developer"
+    target_role = payload.targetRole or topic
+    difficulty = payload.difficulty or "Medium"
+    question_count = payload.questionCount or 5
 
-    # Fetch domain questions from question_bank_collection
     query: Dict[str, Any] = {}
     if field and field != "ALL":
         query["$or"] = [
@@ -1150,13 +1230,11 @@ async def start_interview_session(payload: Dict[str, Any], request: Request):
     
     questions = await question_bank_collection.find(query).limit(question_count * 2).to_list(question_count * 2)
     if len(questions) < question_count:
-        # Fallback to any active questions
         fallback_questions = await question_bank_collection.find({}).limit(question_count).to_list(question_count)
         for fq in fallback_questions:
             if fq not in questions:
                 questions.append(fq)
 
-    # If database has no questions or fewer, provide rich domain fallback questions
     if len(questions) < question_count:
         fallback_bank = [
             {"question": f"Explain the core architectural principles of modern {field} applications.", "topic": topic, "field": field, "difficulty": "Medium"},
@@ -1209,8 +1287,11 @@ async def start_interview_session(payload: Dict[str, Any], request: Request):
     }
 
 @router.get("/questions/interview/next/{session_id}")
-async def get_next_interview_question(session_id: str, request: Request):
-    """Retrieve the next question in the interview sequence."""
+async def get_next_interview_question(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Retrieve the next question in the interview sequence (Authenticated user)."""
     session = await question_sessions_collection.find_one({"sessionId": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
@@ -1240,28 +1321,29 @@ async def get_next_interview_question(session_id: str, request: Request):
     }
 
 @router.post("/questions/interview/submit-answer")
-async def submit_interview_answer(payload: Dict[str, Any], request: Request):
+async def submit_interview_answer(
+    payload: InterviewAnswerRequest,
+    current_user: dict = Depends(get_current_user)
+):
     """
-    Submit and evaluate an answer to the current interview question.
+    Submit and evaluate an answer to the current interview question (Authenticated user).
     Computes technical relevance, communication clarity, and problem-solving metrics.
     """
-    user = await get_student_user_from_request(request)
-    session_id = payload.get("sessionId")
-    question_id = payload.get("questionId")
-    answer = str(payload.get("answer") or "").strip()
-    answer_type = payload.get("answerType", "Text")
-    time_taken = int(payload.get("timeTaken") or 45)
-    visual_metrics = payload.get("visualMetrics", {})
+    user = await get_authenticated_user_doc(current_user)
+    session_id = payload.sessionId
+    question_id = payload.questionId
+    answer = payload.answer.strip()
+    answer_type = payload.answerType or "Text"
+    time_taken = payload.timeTaken or 45
+    visual_metrics = payload.visualMetrics or {}
 
     session = await question_sessions_collection.find_one({"sessionId": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
 
-    # Algorithmic evaluation engine
     word_count = len(answer.split())
     has_substance = word_count >= 10
     
-    # Base technical score calculation
     if not answer or not has_substance:
         tech_score = 45
         comm_score = 40
@@ -1269,7 +1351,6 @@ async def submit_interview_answer(payload: Dict[str, Any], request: Request):
         confidence_score = 40
         feedback = "Answer was too brief. Please articulate your technical approach with code principles, trade-offs, and examples."
     else:
-        # Technical keywords and vocabulary check
         keywords = ["architecture", "scale", "performance", "pattern", "component", "data", "optimize", "security", "async", "cache", "service", "state", "test", "index"]
         matched_kw = sum(1 for kw in keywords if kw in answer.lower())
         bonus = min(25, matched_kw * 5)
@@ -1278,7 +1359,6 @@ async def submit_interview_answer(payload: Dict[str, Any], request: Request):
         comm_score = min(96, max(68, 75 + min(15, word_count // 15)))
         ps_score = min(95, max(65, 72 + bonus))
         
-        # Audio / visual metrics incorporation
         camera_pct = visual_metrics.get("cameraFacingPercentage", 85)
         confidence_score = min(98, max(60, int(camera_pct * 0.5 + 45)))
         
@@ -1286,7 +1366,6 @@ async def submit_interview_answer(payload: Dict[str, Any], request: Request):
 
     overall_score = round((tech_score * 0.4) + (comm_score * 0.25) + (ps_score * 0.2) + (confidence_score * 0.15))
 
-    # Save to student answers collection
     answer_record = {
         "sessionId": session_id,
         "studentId": user.get("_id"),
@@ -1307,7 +1386,6 @@ async def submit_interview_answer(payload: Dict[str, Any], request: Request):
     }
     await student_answers_collection.insert_one(answer_record)
 
-    # Advance current question index
     cur_idx = session.get("currentIndex", 0)
     new_idx = cur_idx + 1
     total_q = len(session.get("questionSet", []))
@@ -1340,16 +1418,18 @@ async def submit_interview_answer(payload: Dict[str, Any], request: Request):
     }
 
 @router.post("/questions/interview/complete/{session_id}")
-async def complete_interview_session(session_id: str, request: Request):
-    """Finalize the interview session, calculate overall competencies, and build the report card."""
-    user = await get_student_user_from_request(request)
+async def complete_interview_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Finalize the interview session, calculate overall competencies, and build report card (Authenticated user)."""
+    user = await get_authenticated_user_doc(current_user)
     session = await question_sessions_collection.find_one({"sessionId": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
 
     answers = await student_answers_collection.find({"sessionId": session_id}).to_list(100)
 
-    # Aggregate competency scores
     if answers:
         tech_avg = round(sum(a.get("scores", {}).get("technical", 75) for a in answers) / len(answers))
         comm_avg = round(sum(a.get("scores", {}).get("communication", 75) for a in answers) / len(answers))
@@ -1412,10 +1492,9 @@ async def complete_interview_session(session_id: str, request: Request):
         }
     )
 
-    # Update student profile SkillDNA scores
     try:
         user_id = user.get("_id")
-        if user_id and str(user_id) != "guest_student":
+        if user_id:
             await profiles_collection.update_one(
                 {"user": user_id},
                 {
@@ -1443,8 +1522,11 @@ async def complete_interview_session(session_id: str, request: Request):
     }
 
 @router.get("/questions/interview/report/{session_id}")
-async def get_interview_report(session_id: str, request: Request):
-    """Retrieve full interview report card with answers, scores, and remediations."""
+async def get_interview_report(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Retrieve full interview report card with answers, scores, and remediations (Authenticated user)."""
     session = await question_sessions_collection.find_one({"sessionId": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
@@ -1491,9 +1573,12 @@ async def get_interview_report(session_id: str, request: Request):
     }
 
 @router.post("/questions/interview/reassess-concept")
-async def reassess_concept(payload: Dict[str, Any], request: Request):
-    """Mini-reassessment endpoint for validating a remediated concept."""
-    topic = payload.get("topic") or "General Engineering"
+async def reassess_concept(
+    payload: ReassessConceptRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Mini-reassessment endpoint for validating a remediated concept (Authenticated user)."""
+    topic = payload.topic or "General Engineering"
     return {
         "success": True,
         "topic": topic,
@@ -1503,18 +1588,19 @@ async def reassess_concept(payload: Dict[str, Any], request: Request):
     }
 
 # ==========================================
-# 16. AI SERVICES & COACHING SUITE
+# 15. AI SERVICES & COACHING SUITE
 # ==========================================
 
 @router.post("/ai/interview")
-async def ai_interview_coach(payload: Dict[str, Any], request: Request):
+async def ai_interview_coach(
+    payload: AIInterviewRequest,
+    current_user: dict = Depends(get_current_user)
+):
     """
-    AI Interview Coaching endpoint.
+    AI Interview Coaching endpoint (Authenticated user).
     Provides instant evaluation, actionable feedback, and dynamic follow-up suggestions.
     """
-    question = payload.get("question") or payload.get("topic") or "Technical interview question"
-    answer = payload.get("answer") or ""
-
+    answer = payload.answer.strip()
     word_count = len(answer.split())
     score = min(95, max(60, 65 + min(20, word_count // 5)))
 
@@ -1530,11 +1616,14 @@ async def ai_interview_coach(payload: Dict[str, Any], request: Request):
     }
 
 @router.post("/ai/deep-analysis")
-async def ai_deep_analysis(payload: Dict[str, Any], request: Request):
+async def ai_deep_analysis(
+    payload: AIDeepAnalysisRequest,
+    current_user: dict = Depends(get_current_user)
+):
     """
-    AI Deep Analysis for candidate performance, radar chart metrics, and career trajectory.
+    AI Deep Analysis for candidate performance, radar metrics, and career trajectory (Authenticated user).
     """
-    user = await get_student_user_from_request(request)
+    user = await get_authenticated_user_doc(current_user)
     profile = await profiles_collection.find_one({"user": user.get("_id")})
     dna = (profile or {}).get("skillDNA", {})
 
@@ -1572,10 +1661,13 @@ async def ai_deep_analysis(payload: Dict[str, Any], request: Request):
     }
 
 @router.post("/ai/jobs/match")
-async def ai_job_matching(payload: Dict[str, Any], request: Request):
-    """Calculate AI match score and skill breakdown between candidate profile and a target job."""
-    job_title = payload.get("jobTitle") or payload.get("title") or "Software Engineer"
-    skills = payload.get("skills") or ["React", "TypeScript", "Node.js", "Python", "MongoDB"]
+async def ai_job_matching(
+    payload: AIJobMatchRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Calculate AI match score between candidate profile and a target job (Authenticated user)."""
+    job_title = payload.jobTitle or "Software Engineer"
+    skills = payload.skills or ["React", "TypeScript", "Node.js", "Python", "MongoDB"]
 
     return {
         "matchScore": 89,
@@ -1585,8 +1677,11 @@ async def ai_job_matching(payload: Dict[str, Any], request: Request):
     }
 
 @router.post("/ai/skilldna")
-async def ai_skilldna_generate(payload: Dict[str, Any], request: Request):
-    """Generate dynamic SkillDNA matrix for candidate."""
+async def ai_skilldna_generate(
+    payload: AISkillDNARequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate dynamic SkillDNA matrix for candidate (Authenticated user)."""
     return {
         "score": 84,
         "technicalScore": 86,
@@ -1597,8 +1692,11 @@ async def ai_skilldna_generate(payload: Dict[str, Any], request: Request):
     }
 
 @router.post("/ai/learning/recommend")
-async def ai_learning_recommend(payload: Dict[str, Any], request: Request):
-    """Generate personalized learning recommendations based on interview weakness areas."""
+async def ai_learning_recommend(
+    payload: AILearningRecommendRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate personalized learning recommendations based on interview weakness areas (Authenticated user)."""
     return {
         "recommendations": [
             {"title": "Mastering Distributed Systems Architecture", "duration": "4 hours", "type": "Interactive Course"},
@@ -1608,8 +1706,11 @@ async def ai_learning_recommend(payload: Dict[str, Any], request: Request):
     }
 
 @router.post("/ai/resume")
-async def ai_resume_analysis(payload: Dict[str, Any], request: Request):
-    """Analyze resume content and provide ATS scoring and suggestions."""
+async def ai_resume_analysis(
+    payload: AIResumeRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Analyze resume content and provide ATS scoring and suggestions (Authenticated user)."""
     return {
         "score": 86,
         "atsMatch": 88,
@@ -1618,12 +1719,12 @@ async def ai_resume_analysis(payload: Dict[str, Any], request: Request):
     }
 
 # ==========================================
-# 17. LEARNING HUB & CHATBOT SUITE
+# 16. LEARNING HUB & CHATBOT SUITE
 # ==========================================
 
 @router.get("/learning/active-curriculum")
-async def get_active_curriculum(request: Request):
-    """Retrieve curriculum modules and active lessons."""
+async def get_active_curriculum(current_user: dict = Depends(get_current_user)):
+    """Retrieve curriculum modules and active lessons (Authenticated user)."""
     return {
         "curriculumId": "CURR-FULLSTACK-2026",
         "title": "Full Stack & Cloud Systems Curriculum",
@@ -1649,9 +1750,12 @@ async def get_active_curriculum(request: Request):
     }
 
 @router.post("/learning/topic-content")
-async def get_topic_content(payload: Dict[str, Any], request: Request):
-    """Retrieve deep dive lesson content for a specific learning topic."""
-    topic = payload.get("topic") or "System Design"
+async def get_topic_content(
+    payload: LearningTopicContentRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Retrieve deep dive lesson content for a specific learning topic (Authenticated user)."""
+    topic = payload.topic or "System Design"
     return {
         "topic": topic,
         "summary": f"Comprehensive guide to mastering {topic} for enterprise deployments.",
@@ -1671,9 +1775,12 @@ async def get_topic_content(payload: Dict[str, Any], request: Request):
     }
 
 @router.post("/learning/request-content")
-async def request_learning_content(payload: Dict[str, Any], request: Request):
-    """Student requests AI-generated content on a new topic."""
-    topic = payload.get("topic") or "Cloud Computing"
+async def request_learning_content(
+    payload: LearningContentRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Student requests AI-generated content on a new topic (Authenticated user)."""
+    topic = payload.topic
     return {
         "status": "success",
         "message": f"Learning content for '{topic}' generated successfully and added to your curriculum.",
@@ -1681,23 +1788,28 @@ async def request_learning_content(payload: Dict[str, Any], request: Request):
     }
 
 @router.post("/learning/chatbot/message")
-async def learning_chatbot_message(payload: Dict[str, Any], request: Request):
-    """Interactive AI tutor chatbot for students studying technical curricula."""
-    message = payload.get("message") or "Help me understand this concept"
+async def learning_chatbot_message(
+    payload: LearningChatbotRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Interactive AI tutor chatbot for students studying technical curricula (Authenticated user)."""
+    message = payload.message
     return {
         "reply": f"Great question! When thinking about '{message}', remember that system design always balances consistency, availability, and latency. Start by identifying the primary bottleneck (I/O, CPU, or network), then apply caching or partitioning as appropriate.",
         "timestamp": datetime.utcnow().isoformat()
     }
 
 # ==========================================
-# 18. MCQ & ASSESSMENTS SUITE
+# 17. MCQ & ASSESSMENTS SUITE
 # ==========================================
 
 @router.post("/mcq/start")
-async def start_mcq_assessment(payload: Dict[str, Any], request: Request):
-    """Start an MCQ assessment for a specific topic."""
-    user = await get_student_user_from_request(request)
-    topic = payload.get("topic") or "Data Structures"
+async def start_mcq_assessment(
+    payload: MCQStartRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Start an MCQ assessment for a specific topic (Authenticated user)."""
+    topic = payload.topic or "Data Structures"
     return {
         "assessmentId": f"MCQ-{uuid.uuid4().hex[:8].upper()}",
         "topic": topic,
@@ -1712,9 +1824,12 @@ async def start_mcq_assessment(payload: Dict[str, Any], request: Request):
     }
 
 @router.post("/mcq/submit")
-async def submit_mcq_assessment(payload: Dict[str, Any], request: Request):
-    """Submit MCQ answers and receive instant score."""
-    answers = payload.get("answers") or {}
+async def submit_mcq_assessment(
+    payload: MCQSubmitRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Submit MCQ answers and receive instant score (Authenticated user)."""
+    answers = payload.answers or {}
     total = len(answers) or 5
     correct = max(1, total - 1)
     score = round((correct / total) * 100)
@@ -1728,13 +1843,13 @@ async def submit_mcq_assessment(payload: Dict[str, Any], request: Request):
     }
 
 # ==========================================
-# 19. CAREER TWIN & CAREER CHANGE SUITE
+# 18. CAREER TWIN & CAREER CHANGE SUITE
 # ==========================================
 
 @router.get("/career-twin/me")
-async def get_my_career_twin(request: Request):
-    """Retrieve Career Twin memory, strengths, weaknesses, and roadmap."""
-    user = await get_student_user_from_request(request)
+async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
+    """Retrieve Career Twin memory, strengths, weaknesses, and roadmap (Authenticated user)."""
+    user = await get_authenticated_user_doc(current_user)
     memory = await career_twin_memories_collection.find_one({"userId": user.get("_id")})
     if not memory:
         memory = {
@@ -1759,9 +1874,9 @@ async def get_my_career_twin(request: Request):
     return serialize_doc(memory)
 
 @router.post("/career-twin/me/refresh")
-async def refresh_my_career_twin(request: Request):
-    """Refresh Career Twin intelligence based on latest interviews."""
-    user = await get_student_user_from_request(request)
+async def refresh_my_career_twin(current_user: dict = Depends(get_current_user)):
+    """Refresh Career Twin intelligence based on latest interviews (Authenticated user)."""
+    user = await get_authenticated_user_doc(current_user)
     return {
         "status": "success",
         "message": "Career Twin memory synced with recent technical sessions.",
@@ -1769,8 +1884,11 @@ async def refresh_my_career_twin(request: Request):
     }
 
 @router.post("/career-twin/reassess/{topic}")
-async def reassess_career_twin_topic(topic: str, request: Request):
-    """Reassess a specific Career Twin topic."""
+async def reassess_career_twin_topic(
+    topic: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Reassess a specific Career Twin topic (Authenticated user)."""
     return {
         "status": "success",
         "topic": topic,
@@ -1780,16 +1898,19 @@ async def reassess_career_twin_topic(topic: str, request: Request):
     }
 
 @router.post("/career-change-requests")
-async def create_career_change_request(payload: Dict[str, Any], request: Request):
-    """Submit a request to switch career path."""
-    user = await get_student_user_from_request(request)
+async def create_career_change_request(
+    payload: CareerChangeRequestCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Submit a request to switch career path (Authenticated user)."""
+    user = await get_authenticated_user_doc(current_user)
     req_doc = {
         "userId": user.get("_id"),
         "studentName": user.get("name", "Student"),
         "email": user.get("email"),
-        "fromRole": payload.get("fromRole", "General"),
-        "toRole": payload.get("toRole", "Full Stack Developer"),
-        "reason": payload.get("reason", "Interested in specialized role"),
+        "fromRole": payload.fromRole or "General",
+        "toRole": payload.toRole,
+        "reason": payload.reason or "Interested in specialized role",
         "status": "PENDING",
         "createdAt": datetime.utcnow()
     }
@@ -1798,26 +1919,29 @@ async def create_career_change_request(payload: Dict[str, Any], request: Request
     return serialize_doc(req_doc)
 
 @router.get("/career-change-requests")
-async def get_career_change_requests(request: Request):
-    """List career change requests."""
+async def get_career_change_requests(current_user: dict = Depends(get_current_user)):
+    """List career change requests (Authenticated user / HR / Admin)."""
     items = await db["career_change_requests"].find({}).to_list(100)
     return [serialize_doc(i) for i in items]
 
 # ==========================================
-# 20. STUDENT CERTIFICATE CREATION
+# 19. STUDENT CERTIFICATE CREATION
 # ==========================================
 
 @router.post("/certificates/create")
-async def create_student_certificate(payload: Dict[str, Any], request: Request):
-    """Create and issue a student certificate upon successful interview completion."""
-    user = await get_student_user_from_request(request)
+async def create_student_certificate(
+    payload: CertificateCreateRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create and issue a student certificate upon successful interview completion (Authenticated user)."""
+    user = await get_authenticated_user_doc(current_user)
     cert_id = f"SKILLDNA-CERT-{uuid.uuid4().hex[:8].upper()}"
 
-    career_path = payload.get("careerPath") or "Software Engineering"
-    tech_score = int(payload.get("technicalScore") or 80)
-    comm_score = int(payload.get("communicationScore") or 80)
-    ps_score = int(payload.get("problemSolvingScore") or 80)
-    conf_score = int(payload.get("confidenceScore") or 80)
+    career_path = payload.careerPath or "Software Engineering"
+    tech_score = payload.technicalScore or 80
+    comm_score = payload.communicationScore or 80
+    ps_score = payload.problemSolvingScore or 80
+    conf_score = payload.confidenceScore or 80
 
     cert_doc = {
         "certificateId": cert_id,
@@ -1829,9 +1953,9 @@ async def create_student_certificate(payload: Dict[str, Any], request: Request):
         "communicationScore": comm_score,
         "problemSolvingScore": ps_score,
         "confidenceScore": conf_score,
-        "sessionsCompleted": int(payload.get("sessionsCompleted") or 1),
-        "strengths": payload.get("strengths") or ["Technical Architecture", "Structured Problem Solving"],
-        "improvements": payload.get("improvements") or ["Distributed Edge Cases"],
+        "sessionsCompleted": payload.sessionsCompleted or 1,
+        "strengths": payload.strengths or ["Technical Architecture", "Structured Problem Solving"],
+        "improvements": payload.improvements or ["Distributed Edge Cases"],
         "status": "APPROVED",
         "isActive": True,
         "issueDate": datetime.utcnow(),
@@ -1848,27 +1972,3 @@ async def create_student_certificate(payload: Dict[str, Any], request: Request):
         "message": "Certificate issued successfully",
         "certificate": serialize_doc(cert_doc)
     }
-
-@router.get("/certificates/{certificate_id}/pdf")
-async def download_certificate_pdf(certificate_id: str):
-    """Return certificate document representation."""
-    cert = await certificates_collection.find_one({"certificateId": certificate_id})
-    if not cert:
-        raise HTTPException(status_code=404, detail="Certificate not found")
-
-    svg_content = f"""<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600">
-      <rect width="800" height="600" fill="#0f172a" />
-      <rect x="20" y="20" width="760" height="560" fill="none" stroke="#6366f1" stroke-width="4" rx="12" />
-      <text x="400" y="100" fill="#ffffff" font-size="28" font-family="Arial" font-weight="bold" text-anchor="middle">SkillDNA AI Certified Professional</text>
-      <text x="400" y="160" fill="#94a3b8" font-size="16" font-family="Arial" text-anchor="middle">This officially certifies that</text>
-      <text x="400" y="230" fill="#38bdf8" font-size="32" font-family="Arial" font-weight="bold" text-anchor="middle">{cert.get('studentName', 'Candidate')}</text>
-      <text x="400" y="290" fill="#cbd5e1" font-size="18" font-family="Arial" text-anchor="middle">has successfully completed technical evaluation in</text>
-      <text x="400" y="340" fill="#a855f7" font-size="24" font-family="Arial" font-weight="bold" text-anchor="middle">{cert.get('careerPath', 'Software Engineering')}</text>
-      <text x="400" y="420" fill="#94a3b8" font-size="14" font-family="Arial" text-anchor="middle">Certificate ID: {cert.get('certificateId')}</text>
-      <text x="400" y="460" fill="#94a3b8" font-size="14" font-family="Arial" text-anchor="middle">Verified on {datetime.utcnow().strftime('%B %d, %Y')}</text>
-    </svg>"""
-
-    return Response(content=svg_content, media_type="image/svg+xml", headers={
-        "Content-Disposition": f"attachment; filename=SkillDNA-Certificate-{certificate_id}.svg"
-    })
-
