@@ -68,6 +68,8 @@ student_notes_collection = db["student_notes"]
 career_change_requests_collection = db["career_change_requests"]
 topic_notes_collection = db["topic_notes"]
 content_requests_collection = db["contentrequests"]
+pdf_watermark_settings_collection = db["pdf_watermark_settings"]
+
 
 async def init_db():
     """

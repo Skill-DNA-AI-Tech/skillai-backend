@@ -34,7 +34,9 @@ from database import (
     career_change_requests_collection,
     topic_notes_collection,
     content_requests_collection,
+    pdf_watermark_settings_collection,
 )
+from utils.pdf_generator import build_notes_pdf
 from auth_handler import (
     get_current_admin,
     get_current_user,
@@ -93,6 +95,9 @@ from schemas import (
     TopicNoteUpdateRequest,
     TopicNoteAiGenerateRequest,
     ContentRequestFulfillRequest,
+    PdfWatermarkSettingsRequest,
+    PdfWatermarkSettingsResponse,
+    NotePdfExportRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -263,6 +268,66 @@ async def update_page_setting(
         await page_settings_collection.insert_one(new_doc)
         result = new_doc
     return serialize_doc(result)
+
+# ==========================================
+# 2B. PDF WATERMARK SETTINGS (ADMIN CONFIGURABLE)
+# ==========================================
+
+DEFAULT_WATERMARK_SETTINGS = {
+    "enabled": True,
+    "text": "SkillDNA AI",
+    "opacity": 0.08,
+    "fontSize": 52,
+    "rotation": 45,
+    "position": "center",
+    "colorHex": "#0f172a",
+    "customLogoUrl": None,
+}
+
+async def get_active_watermark_dict() -> dict:
+    """Helper to safely fetch active watermark settings with fallback defaults."""
+    try:
+        doc = await pdf_watermark_settings_collection.find_one({"isDefault": True})
+        if not doc:
+            doc = await pdf_watermark_settings_collection.find_one({})
+        if doc:
+            return doc
+    except Exception:
+        pass
+    return DEFAULT_WATERMARK_SETTINGS
+
+@router.get("/admin/settings/watermark")
+async def get_pdf_watermark_settings(current_admin: dict = Depends(get_current_admin)):
+    """Retrieve PDF watermark configuration for study guides and certificates (Admin only)."""
+    settings_doc = await pdf_watermark_settings_collection.find_one({"isDefault": True})
+    if not settings_doc:
+        settings_doc = await pdf_watermark_settings_collection.find_one({})
+    if not settings_doc:
+        doc = dict(DEFAULT_WATERMARK_SETTINGS)
+        doc["isDefault"] = True
+        doc["createdAt"] = datetime.utcnow()
+        doc["updatedAt"] = datetime.utcnow()
+        await pdf_watermark_settings_collection.insert_one(doc)
+        settings_doc = doc
+    return serialize_doc(settings_doc)
+
+@router.put("/admin/settings/watermark")
+async def update_pdf_watermark_settings(
+    payload: PdfWatermarkSettingsRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Update PDF watermark configuration (Admin only)."""
+    update_data = payload.model_dump()
+    update_data["updatedAt"] = datetime.utcnow()
+    update_data["isDefault"] = True
+
+    await pdf_watermark_settings_collection.update_one(
+        {"isDefault": True},
+        {"$set": update_data},
+        upsert=True
+    )
+    saved = await pdf_watermark_settings_collection.find_one({"isDefault": True})
+    return serialize_doc(saved)
 
 # ==========================================
 # 3. ADMIN ACCOUNTS MANAGEMENT
@@ -2967,43 +3032,140 @@ async def generate_ai_study_notes(
     level = payload.level or "Intermediate"
     source = (payload.sourceText or "").strip()
 
-    summary_text = f"An authoritative executive synthesis of {topic} for {level} practitioners in {domain}. This note encapsulates fundamental tenets, practical frameworks, and high-frequency evaluation criteria."
+    # Match domain key for case studies
+    domain_case_studies = {
+        "medical": (
+            "Clinical Presentation: A 54-year-old patient presents with acute episodic dyspnea and tachycardia. "
+            "Differential analysis requires immediate arterial blood gas evaluation and ECG tracking to distinguish "
+            "between acute coronary syndrome and pulmonary embolism before initiating anticoagulant therapy."
+        ),
+        "hr": (
+            "Organizational Scenario: A high-performing engineering division experiences a 25% attrition spike following "
+            "a restructuring. The HRBP conducts blind 360-degree exit interviews, benchmarks compensation bands against "
+            "the 75th percentile of the regional market, and introduces structured career pathways to arrest turnover."
+        ),
+        "marketing": (
+            "Growth Audit: Customer acquisition cost (CAC) on Meta Ads increased by 42% over Q3. The growth team executes "
+            "creative fatigue audits, implements server-side Conversions API tracking, and optimizes mid-funnel email "
+            "nurturing workflows, recovering blended ROAS from 1.8x to 3.4x."
+        ),
+        "finance": (
+            "Valuation Case: Evaluating a prospective acquisition of a B2B SaaS company generating $15M ARR. "
+            "The analyst builds a 5-year discounted cash flow (DCF) model factoring in a 9.2% WACC, 3% terminal growth rate, "
+            "and calculates net working capital adjustments to determine fair enterprise value."
+        ),
+        "law": (
+            "Commercial Dispute: Drafting a master services agreement with strict cross-border data transfer covenants. "
+            "Counsel incorporates mutual indemnity caps, specifies London Court of International Arbitration (LCIA) "
+            "jurisdiction, and ensures adherence to GDPR Chapter V standard contractual clauses."
+        ),
+        "design": (
+            "Usability Overhaul: An enterprise health portal fails WCAG 2.1 AA audits due to low-contrast color palettes "
+            "and inaccessible modal dialogues. The product designer establishes design tokens with 4.5:1 text contrast ratios "
+            "and implements visible keyboard focus rings, improving completion rates among elderly users by 38%."
+        ),
+        "engineering": (
+            "Mechanical Simulation: A high-pressure hydraulic valve experiences cyclic fatigue at 12,000 cycles. "
+            "Finite element analysis (FEA) reveals a stress concentration factor of 2.8 at the fillet radius. "
+            "Redesigning the transition geometry reduces peak von Mises stress by 32%, ensuring safety factor compliance."
+        ),
+        "management": (
+            "Strategic Alignment: Expanding enterprise logistics operations across 3 regional hubs. "
+            "The operations director establishes bi-weekly OKR cadence, aligns warehouse throughput KPIs with delivery "
+            "SLAs, and deploys cross-docking logistics to reduce order fulfillment turnaround from 48h to 18h."
+        ),
+        "tech": (
+            "System Architecture: An e-commerce flash-sale API experiences catastrophic 504 gateway timeouts at 40,000 RPS. "
+            "The engineering team implements Redis cluster caching with cache-aside patterns, introduces token-bucket rate "
+            "limiting, and migrates write traffic to asynchronous Kafka message queues, dropping p99 latency to 18ms."
+        )
+    }
 
-    detailed_text = f"""# Comprehensive Study Notes: {topic}
-**Discipline:** {domain} | **Level:** {level}
+    domain_key = "tech"
+    for k in domain_case_studies:
+        if k in domain.lower() or k in disc.get("defaultCareer", "").lower():
+            domain_key = k
+            break
+    real_world_case = domain_case_studies.get(domain_key, domain_case_studies["tech"])
 
-## 1. Overview & Core Motivation
-In modern {domain}, **{topic}** provides the essential framework for rigorous decision-making, systematic execution, and quality assurance. Without a clear command of this concept, practitioners risk costly misdiagnoses, suboptimal architectures, and compliance failures.
+    summary_text = (
+        f"An authoritative executive synthesis of {topic} for {level} practitioners in {domain}. "
+        f"This study guide deconstructs core axioms, procedural mechanics, real-world case applications, "
+        "and high-frequency evaluation criteria for professional assessments."
+    )
 
-## 2. Fundamental Principles & Mechanics
-- **First Principles Analysis:** Deconstruct the problem into non-negotiable axioms before proposing interventions.
-- **Process Standardization:** Maintain deterministic workflows so outcomes are reproducible and verifiable.
-- **Trade-off Evaluation:** Balance latency, safety, cost, and technical debt across every design choice.
+    objectives = [
+        f"Master the core operational vocabulary, foundational models, and statutory standards of {topic}.",
+        f"Evaluate risk, latency, cost, and safety trade-offs in {domain} applications.",
+        "Formulate testable diagnostic hypotheses and execute systematic root-cause remediations.",
+        f"Excel in {level}-level competency evaluations and panel interview technical cross-examinations."
+    ]
 
-## 3. Practical Industry Case Study
-When confronting ambiguous challenges in {domain}, top performers employ structured frameworks:
-1. Conduct initial exploratory diagnostics.
-2. Formulate testable hypotheses.
-3. Validate through controlled testing.
-4. Document findings and institutionalize learnings.
+    prerequisites = [
+        f"Foundational understanding of core {domain} nomenclature and procedural workflows.",
+        "Competency in structured problem deconstruction and first-principles reasoning."
+    ]
 
-## 4. Key Takeaways & Exam Strategy
-Focus revision on understanding *why* certain trade-offs are favored under specific constraints rather than rote memorization.
+    detailed_text = f"""# Master Study Guide: {topic}
+**Discipline:** {domain} | **Level:** {level} | **SkillDNA AI Academic Framework**
+
+## 1. Executive Summary & Learning Objectives
+{summary_text}
+
+### Key Learning Objectives:
+- {objectives[0]}
+- {objectives[1]}
+- {objectives[2]}
+- {objectives[3]}
+
+### Prerequisites:
+- {prerequisites[0]}
+- {prerequisites[1]}
+
+## 2. Foundational & Basic Concepts
+In modern {domain}, **{topic}** provides the essential baseline for rigorous decision-making, systematic execution, and quality assurance. Without a clear command of this concept, practitioners risk costly errors, suboptimal outcomes, and regulatory compliance failures.
+
+## 3. Core Mechanics & Architecture
+- **First-Principles Analysis:** Deconstruct complex scenarios into verified axioms before proposing interventions.
+- **Process Standardization:** Maintain deterministic workflows so outcomes are reproducible, auditable, and verifiable.
+- **Trade-off Modeling:** Systematically balance speed, precision, cost, and safety across all decision points.
+
+## 4. Advanced Concepts & Optimization
+- Implement defensive fallback safeguards for unexpected anomalies and high-consequence failure modes.
+- Apply continuous telemetry, error budget tracking, and statistical process controls to maintain repeatability.
+- Ensure all conclusions are backed by verifiable evidence, peer reviews, and audit documentation.
+
+## 5. Real-World Case Study
+{real_world_case}
+
+## 6. Practical Hands-On Activity
+Apply this concept immediately: Conduct a structured audit of a simulated scenario in {topic}:
+1. Identify baseline operational parameters and isolate anomalous triggers.
+2. Formulate 2 testable hypotheses and evaluate with controlled validation.
+3. Produce a structured remediation brief with measurable acceptance criteria.
+
+## 7. Common Pitfalls & Mistakes to Avoid
+- **Premature Optimization:** Bypassing statutory compliance or verification in pursuit of speed.
+- **Inadequate Telemetry:** Modifying operational parameters without recording baseline state data.
+- **Subjective Assumptions:** Relying on intuition rather than empirical metrics and standardized protocols.
+
+## 8. Next Step in Learning Progression
+Following mastery of this concept, advance to the subsequent module in your curriculum to integrate composite practical projects.
 """
 
     key_points = [
-        f"Master the core operational vocabulary and foundational models of {topic}.",
-        f"Understand the primary trade-offs between speed, cost, and safety in {domain}.",
-        "Apply structured STAR and first-principles reasoning to all diagnostic tasks.",
-        "Recognize common edge-case vulnerabilities and implement defensive safeguards.",
+        f"Master the foundational axioms, operational vocabulary, and standards of {topic}.",
+        f"Understand the primary trade-offs between speed, cost, precision, and compliance in {domain}.",
+        "Apply structured STAR and first-principles diagnostic reasoning to all evaluations.",
+        "Implement defensive safeguards, error budgets, and fallback protocols for edge cases.",
         "Ensure all conclusions are backed by verifiable evidence and audit documentation."
     ]
 
     quick_revision = [
-        f"Defintion: {topic} is the systematic application of disciplined standards in {domain}.",
+        f"Core Axiom: {topic} is the systematic application of disciplined standards in {domain}.",
         "Golden Rule: Never sacrifice safety, compliance, or integrity for premature optimization.",
-        "Diagnostics: Isolate variables one at a time to establish direct causality.",
-        "Key Metric: Repeatability, error tolerance, and verifiable peer compliance."
+        "Diagnostic Rule: Isolate variables sequentially to establish direct causality.",
+        "Key Benchmark: Repeatability, error tolerance, and verifiable peer compliance."
     ]
 
     questions = [
@@ -3018,6 +3180,10 @@ Focus revision on understanding *why* certain trade-offs are favored under speci
         {
             "question": f"What are the most frequent failure modes encountered in {topic}?",
             "answer": "Inadequate preliminary validation, failure to account for edge cases, and lack of systematic error logging."
+        },
+        {
+            "question": f"How do you demonstrate mastery of {topic} during a senior technical interview?",
+            "answer": "Walk through a real-world scenario end-to-end using structured STAR methodology, quantifying trade-offs, edge-case mitigation, and post-implementation telemetry."
         }
     ]
 
@@ -3076,6 +3242,30 @@ Focus revision on understanding *why* certain trade-offs are favored under speci
             ],
             "correctAnswer": 0,
             "explanation": "Defensive fallback safeguards, audit documentation, and peer review protect operational integrity."
+        },
+        {
+            "id": "Q4",
+            "question": f"Which metric provides the highest fidelity verification of mastery in {topic}?",
+            "options": [
+                "Repeatable performance on standardized assessments and verified peer evaluations",
+                "Subjective self-reported confidence without quantitative proof",
+                "Speed of task completion irrespective of error rate",
+                "The number of textbooks read on the topic"
+            ],
+            "correctAnswer": 0,
+            "explanation": "Objective assessment scores and peer review validate true technical competency."
+        },
+        {
+            "id": "Q5",
+            "question": f"What is the golden rule of trade-off evaluation in {domain}?",
+            "options": [
+                "Never sacrifice statutory safety, ethics, or compliance for premature optimization",
+                "Always choose the lowest upfront financial cost",
+                "Optimize for speed above all other operational considerations",
+                "Avoid using metrics to evaluate performance"
+            ],
+            "correctAnswer": 0,
+            "explanation": "Safety, compliance, and procedural integrity form the foundational bedrock of all disciplines."
         }
     ]
 
@@ -3090,7 +3280,10 @@ Focus revision on understanding *why* certain trade-offs are favored under speci
         "qna": questions,
         "questions": questions,
         "flashcards": flashcards,
-        "quiz": quiz
+        "quiz": quiz,
+        "objectives": objectives,
+        "prerequisites": prerequisites,
+        "realWorldCase": real_world_case
     }
 
     return {
@@ -3106,6 +3299,9 @@ Focus revision on understanding *why* certain trade-offs are favored under speci
         "questions": questions,
         "flashcards": flashcards,
         "quiz": quiz,
+        "objectives": objectives,
+        "prerequisites": prerequisites,
+        "realWorldCase": real_world_case,
         "artifacts": artifacts_payload,
         "generatedAt": datetime.utcnow().isoformat()
     }
@@ -3259,8 +3455,138 @@ async def submit_note_quiz(
     }
 
 # ==========================================
+# 18B. AI STUDY NOTES PDF EXPORT & DOWNLOAD
+# ==========================================
+
+@router.get("/learning/notes/{id}/pdf")
+async def download_student_note_pdf(
+    id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Generate and stream a professional ReportLab PDF study guide for a saved note.
+    Includes running headers, footers with dynamic page count, and admin-configured watermark.
+    """
+    user = await get_authenticated_user_doc(current_user)
+    u_id = user.get("_id")
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        obj_id = id
+
+    note = await student_notes_collection.find_one({"_id": obj_id})
+    if not note:
+        raise HTTPException(status_code=404, detail="Study note not found")
+
+    is_owner = str(note.get("userId")) == str(u_id)
+    is_admin = bool(user.get("role") in ["ADMIN", "MAIN_ADMIN"] or user.get("isAdmin"))
+    if not is_owner and not is_admin:
+        raise HTTPException(status_code=403, detail="Not authorized to access this study guide")
+
+    wm_settings = await get_active_watermark_dict()
+    student_name = user.get("name") or "SkillDNA Candidate"
+
+    try:
+        pdf_bytes = build_notes_pdf(note, watermark_settings=wm_settings, student_name=student_name)
+    except Exception as e:
+        logger.error(f"Error compiling study note PDF: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate study guide PDF: {str(e)}")
+
+    safe_topic = re.sub(r"[^a-zA-Z0-9_-]", "_", note.get("topic", "Study_Notes"))
+    filename = f"SkillDNA_{safe_topic}_StudyGuide.pdf"
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "application/pdf"
+        }
+    )
+
+@router.post("/learning/notes/pdf-export")
+async def export_draft_note_pdf(
+    payload: NotePdfExportRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Generate and stream a ReportLab PDF study guide directly from draft content.
+    Allows immediate download of generated study material before or without saving.
+    """
+    user = await get_authenticated_user_doc(current_user)
+    wm_settings = await get_active_watermark_dict()
+    student_name = user.get("name") or "SkillDNA Candidate"
+
+    note_dict = payload.model_dump()
+    try:
+        pdf_bytes = build_notes_pdf(note_dict, watermark_settings=wm_settings, student_name=student_name)
+    except Exception as e:
+        logger.error(f"Error compiling draft PDF: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate study guide PDF: {str(e)}")
+
+    safe_topic = re.sub(r"[^a-zA-Z0-9_-]", "_", payload.topic or "Study_Notes")
+    filename = f"SkillDNA_{safe_topic}_StudyGuide.pdf"
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "application/pdf"
+        }
+    )
+
+# ==========================================
 # 19. CAREER TWIN INTELLIGENCE & REASSESSMENT
 # ==========================================
+
+DOMAIN_PRACTICAL_PROJECTS = {
+    "medical": {
+        "title": "Clinical Differential & Management Protocol",
+        "description": "Formulate a differential diagnosis, emergency medication dosage protocol, and follow-up clinical management plan for an acute patient presentation.",
+        "deliverable": "Structured Clinical SOAP Note & Evidence Synthesis"
+    },
+    "hr": {
+        "title": "Competency Architecture & Compensation Rubric",
+        "description": "Design an objective STAR behavioral interview framework and salary band benchmarking model for core roles.",
+        "deliverable": "Rubric Guide & Statutory Compliance Checksheet"
+    },
+    "marketing": {
+        "title": "Full-Funnel CAC/LTV & Attribution Matrix",
+        "description": "Audit performance marketing channels, model blended CAC against 12-month cohort retention, and outline conversion rate optimizations.",
+        "deliverable": "Cohort Attribution Model & Executive Strategy Brief"
+    },
+    "finance": {
+        "title": "Three-Statement DCF Corporate Valuation",
+        "description": "Construct an integrated dynamic 3-statement financial model, calculate WACC with debt tax shields, and execute sensitivity scenario analysis.",
+        "deliverable": "Valuation Spreadsheet & Investment Thesis Memo"
+    },
+    "law": {
+        "title": "Cross-Border Commercial Contract Audit",
+        "description": "Review and draft indemnification clauses, limitation of liability, governing law, and dispute arbitration agreements.",
+        "deliverable": "Annotated Redline Contract & Risk Summary"
+    },
+    "design": {
+        "title": "Design System Token & Accessibility Spec",
+        "description": "Develop a WCAG 2.1 AA compliant design system component library in Figma with defined state variants and token specifications.",
+        "deliverable": "Interactive Prototype & Component Documentation"
+    },
+    "engineering": {
+        "title": "First-Principles Structural Load & FEA Simulation",
+        "description": "Perform static stress and vibrational fatigue analysis on a structural joint, verifying against safety factor codes.",
+        "deliverable": "Simulation Report & FMEA Failure Mode Sheet"
+    },
+    "management": {
+        "title": "Strategic OKR Cascade & Capacity Model",
+        "description": "Establish quarterly corporate objectives, track lead indicators, and build a resource allocation matrix for a scaling business unit.",
+        "deliverable": "Executive OKR Dashboard & Resource Plan"
+    },
+    "tech": {
+        "title": "Resilient Microservices & Cache Architecture",
+        "description": "Design an event-driven system using Redis cache-aside, Kafka event streams, and idempotent RESTful API endpoints.",
+        "deliverable": "System Architecture Blueprint & OpenAPI Specification"
+    }
+}
 
 @router.get("/career-twin/me")
 async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
@@ -3278,6 +3604,7 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
     sessions = await question_sessions_collection.find({"studentId": u_id, "status": "Completed"}).sort("createdAt", -1).to_list(10)
     student_answers = await student_answers_collection.find({"studentId": u_id}).sort("submittedAt", -1).to_list(20)
     certificates = await certificates_collection.find({"studentId": u_id, "status": "APPROVED"}).to_list(10)
+    completed_assessments = await assessments_collection.find({"userId": u_id, "passed": True}).to_list(50)
 
     # Calculate real scores
     if sessions:
@@ -3301,6 +3628,8 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
     profile_skills = profile.get("skills") or []
     strengths = list(dict.fromkeys(profile_skills[:4] + disc["defaultStrengths"]))[:6]
     weaknesses = list(dict.fromkeys(disc["defaultWeaknesses"]))[:4]
+
+    target_role = profile.get("targetRole") or disc["roles"][0]
 
     # Weakness Remediations
     remediations = []
@@ -3333,11 +3662,18 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
             "matchedStrengths": strengths[:3]
         })
 
+    # Priority skill and rationale
+    priority_skill = weaknesses[0] if weaknesses else (disc["curriculumTopics"][0][0] if disc["curriculumTopics"] else "Core Principles")
+    why_recommended = (
+        f"Critical prerequisite for target role '{target_role}'. Required by 85% of {disc['domainName']} "
+        "employers. Mastering this competency bridges your primary evaluated skill gap and unlocks advanced milestones."
+    )
+
     # Daily actionable tasks
     daily_tasks = [
-        {"type": "Revision", "title": f"Review core principles of {weaknesses[0]}", "minutes": 25},
-        {"type": "Practice", "title": f"Complete practice quiz in {disc['curriculumTopics'][0][0]}", "minutes": 15},
-        {"type": "Interview", "title": f"Take 1 dynamic AI Interview session for {disc['roles'][0]}", "minutes": 20},
+        {"type": "Revision", "title": f"Study notes for {priority_skill}", "minutes": 20},
+        {"type": "Practice", "title": f"Complete practice quiz in {priority_skill}", "minutes": 15},
+        {"type": "Interview", "title": f"Take 1 dynamic AI Interview session for {target_role}", "minutes": 20},
     ]
 
     # Interview history
@@ -3364,7 +3700,7 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
             {"label": "Baseline Assessment", "score": avg_tech, "averageResponseTime": avg_response_time, "completedAt": "Recent"}
         ]
 
-    # Extract competencies from skillDNA or strengths
+    # Competencies
     profile_dna = profile.get("skillDNA") if isinstance(profile.get("skillDNA"), dict) else {}
     competencies_list = []
     if profile_dna:
@@ -3375,11 +3711,130 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
         for s in strengths[:4]:
             competencies_list.append({"name": s, "score": 82})
 
+    # Practical Domain Project
+    domain_key = "tech"
+    for k in DOMAIN_PRACTICAL_PROJECTS:
+        if k in disc["domainName"].lower() or k in disc.get("defaultCareer", "").lower():
+            domain_key = k
+            break
+    domain_project = DOMAIN_PRACTICAL_PROJECTS.get(domain_key, DOMAIN_PRACTICAL_PROJECTS["tech"])
+
+    # Structured 12-Step Progression Pipeline
+    structured_pipeline = [
+        {
+            "step": 1,
+            "key": "current_position",
+            "label": "1. Current Position Verified",
+            "status": "COMPLETED",
+            "detail": f"{overall_score}% composite readiness across {disc['domainName']}."
+        },
+        {
+            "step": 2,
+            "key": "target_career",
+            "label": "2. Target Career Identified",
+            "status": "COMPLETED",
+            "detail": f"Target Role: {target_role}."
+        },
+        {
+            "step": 3,
+            "key": "required_skills",
+            "label": "3. Required Skills Cataloged",
+            "status": "COMPLETED",
+            "detail": f"{len(disc['curriculumTopics'])} core syllabus modules mapped."
+        },
+        {
+            "step": 4,
+            "key": "current_skills",
+            "label": "4. Current Verified Skills",
+            "status": "COMPLETED",
+            "detail": f"{len(strengths)} competencies demonstrated."
+        },
+        {
+            "step": 5,
+            "key": "skill_gaps",
+            "label": "5. Real Skill Gaps Calculated",
+            "status": "IN_PROGRESS",
+            "detail": f"{len(weaknesses)} high-impact gaps identified."
+        },
+        {
+            "step": 6,
+            "key": "priority_skill",
+            "label": f"6. Priority Skill: {priority_skill}",
+            "status": "IN_PROGRESS",
+            "detail": "Recommended to learn first."
+        },
+        {
+            "step": 7,
+            "key": "learning_path",
+            "label": "7. Structured Learning Path",
+            "status": "ACTIVE",
+            "detail": f"Deep study on {priority_skill}.",
+            "actionUrl": "/learning"
+        },
+        {
+            "step": 8,
+            "key": "practice",
+            "label": "8. Concept Practice & MCQ",
+            "status": "PENDING",
+            "detail": "Validate conceptual retention with interactive quiz.",
+            "actionUrl": "/learning"
+        },
+        {
+            "step": 9,
+            "key": "assessment",
+            "label": "9. Skill Assessment",
+            "status": "PENDING",
+            "detail": "Achieve >= 70% to update official Skill DNA.",
+            "actionUrl": "/learning"
+        },
+        {
+            "step": 10,
+            "key": "project",
+            "label": "10. Practical Project Work",
+            "status": "PENDING",
+            "detail": domain_project.get("title"),
+        },
+        {
+            "step": 11,
+            "key": "interview",
+            "label": "11. AI Interview Simulation",
+            "status": "PENDING",
+            "detail": f"Targeted interview for {target_role}.",
+            "actionUrl": "/interview"
+        },
+        {
+            "step": 12,
+            "key": "skill_dna_sync",
+            "label": "12. Skill DNA Update & Next Milestone",
+            "status": "PENDING",
+            "detail": "Continuous progression loop."
+        }
+    ]
+
+    # Skill Engine Tiers (Beginner, Intermediate, Advanced)
+    skill_engine_tiers = {
+        "beginner": {
+            "title": "Foundational Tier",
+            "skills": [t[0] for t in disc["curriculumTopics"][:2]],
+            "status": "MASTERED" if overall_score >= 70 else "IN_PROGRESS"
+        },
+        "intermediate": {
+            "title": "Core Practitioner Tier",
+            "skills": [t[0] for t in disc["curriculumTopics"][2:4]],
+            "status": "IN_PROGRESS" if overall_score >= 70 else "LOCKED"
+        },
+        "advanced": {
+            "title": "Advanced Mastery & Architecture Tier",
+            "skills": [t[0] for t in disc["curriculumTopics"][4:]],
+            "status": "LOCKED" if overall_score < 85 else "IN_PROGRESS"
+        }
+    }
+
     twin_memory = {
         "userId": u_id,
         "discipline": disc["domainName"],
-        "targetRole": profile.get("targetRole") or disc["roles"][0],
-        "target_role": profile.get("targetRole") or disc["roles"][0],
+        "targetRole": target_role,
+        "target_role": target_role,
         "careerDomain": disc["domainName"],
         "overallScore": overall_score,
         "technicalScore": avg_tech,
@@ -3399,10 +3854,31 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
             "items": history,
             "improvement": max(4, round(overall_score - 72))
         },
+        "nextRecommendedSkill": {
+            "skill": priority_skill,
+            "priority": "HIGH",
+            "whyRecommended": why_recommended,
+            "prerequisites": [f"Foundational {disc['domainName']} Principles", f"Introductory {priority_skill} Concepts"],
+            "currentLevel": "Intermediate" if overall_score >= 70 else "Beginner",
+            "targetLevel": "Advanced",
+            "actionUrl": "/learning"
+        },
+        "nextBestAction": {
+            "title": f"Master {priority_skill}",
+            "reason": why_recommended,
+            "actionType": "LEARN",
+            "actionLabel": "Study Topic Notes",
+            "actionUrl": "/learning",
+            "estimatedMinutes": 20,
+            "topic": priority_skill
+        },
+        "structuredPipeline": structured_pipeline,
+        "practicalProject": domain_project,
+        "skillEngineTiers": skill_engine_tiers,
         "mentorSuggestions": [
-            f"Prioritize targeted remediation on {weaknesses[0]} using recommended professional literature.",
+            f"Prioritize targeted study on {priority_skill} using the recommended curriculum notes.",
             f"Your communication score of {avg_comm}% is a significant asset in {disc['domainName']} interviews.",
-            f"Target role '{disc['roles'][0]}' readiness is currently {job_readiness[0]['readiness']}%. Completing the practice quiz will push you past the 85% verified benchmark."
+            f"Target role '{target_role}' readiness is currently {job_readiness[0]['readiness']}%. Completing the practice quiz will push you past the 85% verified benchmark."
         ],
         "generatedAt": datetime.utcnow().isoformat()
     }

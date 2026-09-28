@@ -525,3 +525,41 @@ class ContentRequestFulfillRequest(BaseModel):
     noteId: Optional[str] = None
     adminRemarks: Optional[str] = None
 
+# ==========================================
+# 15. PDF WATERMARK & EXPORT SCHEMAS
+# ==========================================
+
+class PdfWatermarkSettingsRequest(BaseModel):
+    enabled: bool = True
+    text: str = "SkillDNA AI"
+    opacity: float = 0.08
+    fontSize: int = 52
+    rotation: int = 45
+    position: str = "center"  # center, diagonal, top, bottom
+    colorHex: Optional[str] = "#0f172a"
+    customLogoUrl: Optional[str] = None
+
+class PdfWatermarkSettingsResponse(BaseModel):
+    enabled: bool = True
+    text: str = "SkillDNA AI"
+    opacity: float = 0.08
+    fontSize: int = 52
+    rotation: int = 45
+    position: str = "center"
+    colorHex: Optional[str] = "#0f172a"
+    customLogoUrl: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+class NotePdfExportRequest(BaseModel):
+    topic: str
+    domain: Optional[str] = "General"
+    level: Optional[str] = "Intermediate"
+    summary: Optional[str] = None
+    detailedNotes: Optional[str] = None
+    keyPoints: Optional[List[str]] = []
+    quickRevision: Optional[List[Union[str, Dict[str, Any]]]] = []
+    questions: Optional[List[Dict[str, Any]]] = []
+    flashcards: Optional[List[Dict[str, str]]] = []
+    quiz: Optional[List[Dict[str, Any]]] = []
+    artifacts: Optional[Dict[str, Any]] = None
+
