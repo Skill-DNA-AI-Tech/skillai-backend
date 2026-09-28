@@ -66,6 +66,8 @@ assessments_collection = db["assessments"]
 helpdesk_tickets_collection = db["helpdesk_tickets"]
 student_notes_collection = db["student_notes"]
 career_change_requests_collection = db["career_change_requests"]
+topic_notes_collection = db["topic_notes"]
+content_requests_collection = db["contentrequests"]
 
 async def init_db():
     """
@@ -87,6 +89,8 @@ async def init_db():
         await helpdesk_tickets_collection.create_index("ticketId", unique=True)
         # Certificates lookup and versioning index
         await certificates_collection.create_index([("certificateId", 1), ("isCurrentVersion", -1)])
+        # Topic notes lookup index
+        await topic_notes_collection.create_index([("domain", 1), ("topic", 1), ("subtopic", 1)])
         logger.info("MongoDB indexes created successfully on unified database: %s", db_name)
 
         from auth_handler import get_password_hash

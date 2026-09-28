@@ -6,7 +6,7 @@ import random
 import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Any, Dict
-from fastapi import APIRouter, HTTPException, status, Depends, Request, Query, Response
+from fastapi import APIRouter, HTTPException, status, Depends, Request, Query, Response, UploadFile, File
 from bson import ObjectId
 
 from database import (
@@ -32,6 +32,8 @@ from database import (
     helpdesk_tickets_collection,
     student_notes_collection,
     career_change_requests_collection,
+    topic_notes_collection,
+    content_requests_collection,
 )
 from auth_handler import (
     get_current_admin,
@@ -87,6 +89,10 @@ from schemas import (
     StudentNoteSaveRequest,
     StudentNoteUpdateRequest,
     NoteQuizSubmitRequest,
+    TopicNoteCreateRequest,
+    TopicNoteUpdateRequest,
+    TopicNoteAiGenerateRequest,
+    ContentRequestFulfillRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -3787,3 +3793,601 @@ async def update_admin_helpdesk_ticket(
         "message": "Ticket status updated successfully",
         "ticket": serialize_doc(res)
     }
+
+# ==========================================
+# 15. TOPIC NOTES & CURRICULUM GOVERNANCE (ADMIN)
+# ==========================================
+
+def _escape_csv(val: Any) -> str:
+    if val is None:
+        return '""'
+    return f'"{str(val).replace(chr(34), chr(34) + chr(34))}"'
+
+def _extract_val(row: Dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        if k in row and row[k] is not None and str(row[k]).strip():
+            return str(row[k]).strip()
+        k_clean = re.sub(r'[\s_-]', '', k.lower())
+        for rk, rv in row.items():
+            if re.sub(r'[\s_-]', '', str(rk).lower()) == k_clean and rv is not None and str(rv).strip():
+                return str(rv).strip()
+    return ""
+
+def _parse_uploaded_file(file_bytes: bytes, filename: str) -> List[Dict[str, Any]]:
+    fn = filename.lower()
+    rows: List[Dict[str, Any]] = []
+    if fn.endswith(".csv"):
+        text = file_bytes.decode("utf-8-sig", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        for r in reader:
+            rows.append({k.strip() if k else "": v.strip() if isinstance(v, str) else v for k, v in r.items()})
+    else:
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+            sheet = wb.active
+            iter_rows = sheet.iter_rows(values_only=True)
+            header_row = next(iter_rows, None)
+            if header_row:
+                headers = [str(h).strip() if h is not None else f"col_{i}" for i, h in enumerate(header_row)]
+                for r in iter_rows:
+                    if not any(r):
+                        continue
+                    row_dict = {}
+                    for i, val in enumerate(r):
+                        if i < len(headers):
+                            row_dict[headers[i]] = str(val).strip() if val is not None else ""
+                    rows.append(row_dict)
+        except Exception as e:
+            logger.warning(f"Excel parsing fallback to CSV: {e}")
+            text = file_bytes.decode("utf-8-sig", errors="replace")
+            reader = csv.DictReader(io.StringIO(text))
+            for r in reader:
+                rows.append({k.strip() if k else "": v.strip() if isinstance(v, str) else v for k, v in r.items()})
+    return rows
+
+@router.get("/admin/notes")
+async def list_admin_topic_notes(
+    career: Optional[str] = Query(None),
+    domain: Optional[str] = Query(None),
+    topic: Optional[str] = Query(None),
+    subtopic: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=100),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Retrieve filtered topic notes catalog for governance (Admin only)."""
+    query: Dict[str, Any] = {}
+    if career and career != "ALL":
+        query["career"] = {"$regex": f"^{re.escape(career.strip())}$", "$options": "i"}
+    if domain and domain != "ALL":
+        query["domain"] = {"$regex": f"^{re.escape(domain.strip())}$", "$options": "i"}
+    if topic and topic != "ALL":
+        query["topic"] = {"$regex": re.escape(topic.strip()), "$options": "i"}
+    if subtopic and subtopic != "ALL":
+        query["subtopic"] = {"$regex": re.escape(subtopic.strip()), "$options": "i"}
+    if status and status != "ALL":
+        query["status"] = {"$regex": f"^{re.escape(status.strip())}$", "$options": "i"}
+
+    if search and search.strip():
+        s = search.strip()
+        query["$or"] = [
+            {"title": {"$regex": s, "$options": "i"}},
+            {"topic": {"$regex": s, "$options": "i"}},
+            {"subtopic": {"$regex": s, "$options": "i"}},
+            {"domain": {"$regex": s, "$options": "i"}},
+            {"career": {"$regex": s, "$options": "i"}},
+            {"overview": {"$regex": s, "$options": "i"}},
+        ]
+
+    skip = (page - 1) * limit
+    total = await topic_notes_collection.count_documents(query)
+    notes_cursor = topic_notes_collection.find(query).sort("updatedAt", -1).skip(skip).limit(limit)
+    notes_list = await notes_cursor.to_list(length=limit)
+
+    return {
+        "notes": [serialize_doc(n) for n in notes_list],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "totalPages": max(1, (total + limit - 1) // limit)
+    }
+
+@router.post("/admin/notes")
+async def create_admin_topic_note(
+    payload: TopicNoteCreateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Manually create and publish a topic note (Admin only)."""
+    if not payload.topic or not payload.topic.strip():
+        raise HTTPException(status_code=400, detail="Topic is a required field.")
+
+    trimmed_topic = payload.topic.strip()
+    trimmed_subtopic = (payload.subtopic or "General").strip()
+    effective_title = (payload.title or f"{trimmed_topic} - {trimmed_subtopic}").strip()
+    effective_text = (payload.richText or payload.content or payload.overview or "").strip()
+
+    status_val = "Published"
+    if payload.status:
+        s = payload.status.strip().upper()
+        if s == "DRAFT":
+            status_val = "Draft"
+        elif s == "ARCHIVED":
+            status_val = "Archived"
+        else:
+            status_val = "Published"
+
+    key_takeaways = []
+    if isinstance(payload.keyTakeaways, list):
+        key_takeaways = [str(k).strip() for k in payload.keyTakeaways if str(k).strip()]
+    elif isinstance(payload.keyTakeaways, str):
+        key_takeaways = [k.strip() for k in payload.keyTakeaways.split("\n") if k.strip()]
+
+    now = datetime.utcnow()
+    note_doc = {
+        "career": (payload.career or "").strip(),
+        "domain": (payload.domain or "Computer Science").strip(),
+        "topic": trimmed_topic,
+        "subtopic": trimmed_subtopic,
+        "title": effective_title,
+        "overview": payload.overview or effective_text[:300],
+        "richText": effective_text,
+        "content": effective_text,
+        "keyTakeaways": key_takeaways,
+        "examples": payload.examples or "",
+        "codeExamples": payload.codeExamples or [],
+        "resources": payload.resources or [],
+        "status": status_val,
+        "isAiGenerated": False,
+        "createdBy": current_admin.get("email") or current_admin.get("sub"),
+        "createdAt": now,
+        "updatedAt": now,
+        "publishedAt": now if status_val == "Published" else None,
+    }
+
+    res = await topic_notes_collection.insert_one(note_doc)
+    note_doc["_id"] = str(res.inserted_id)
+
+    # Log action in audit logs
+    await audit_logs_collection.insert_one({
+        "action": "TOPIC_NOTE_CREATED",
+        "performedBy": current_admin.get("email") or current_admin.get("sub"),
+        "entityType": "TopicNote",
+        "entityId": note_doc["_id"],
+        "details": {"topic": trimmed_topic, "subtopic": trimmed_subtopic, "title": effective_title},
+        "timestamp": now,
+    })
+
+    return {
+        "message": "Topic note created successfully.",
+        "note": serialize_doc(note_doc)
+    }
+
+@router.post("/admin/notes/ai-generate")
+@router.post("/admin/notes/generate-ai")
+async def generate_ai_topic_note(
+    payload: TopicNoteAiGenerateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Generate high-yield pedagogical notes draft using AI (Admin only)."""
+    if not payload.topic or not payload.topic.strip():
+        raise HTTPException(status_code=400, detail="Topic is required for AI generation.")
+
+    trimmed_topic = payload.topic.strip()
+    trimmed_subtopic = (payload.subtopic or "General").strip()
+    target_level = payload.studentLevel or payload.level or "Intermediate"
+    domain_val = payload.domain or payload.careerDomain or "Computer Science"
+
+    # Fallback structured draft
+    draft_title = f"Mastery Guide: {trimmed_subtopic} in {trimmed_topic}"
+    draft_overview = f"{trimmed_subtopic} is an indispensable core concept within {trimmed_topic}. Understanding its foundational mechanisms, performance characteristics, and industry patterns enables resilient system implementation."
+    draft_rich_text = f"### 1. Conceptual Foundation\n{trimmed_subtopic} establishes the core structural rules governing this module.\n\n### 2. Architectural Mechanisms\nWhen executed in production environments, {trimmed_subtopic} ensures predictable resource utilization and prevents runtime anti-patterns.\n\n### 3. Industry Best Practices\n- Verify boundary cases and null safety.\n- Profile memory and CPU allocations under simulated peak loads.\n- Follow clean design principles to maintain modularity."
+    draft_takeaways = [
+        "Master fundamental principles before applying optimizations.",
+        "Recognize common edge cases and implement graceful fallbacks.",
+        "Maintain modular separation of concerns.",
+        "Write automated unit tests verifying contract invariants."
+    ]
+    safe_identifier = re.sub(r'[^a-zA-Z]', '', trimmed_subtopic) or "Concept"
+    draft_example = f"// Practical demonstration for {trimmed_subtopic}\npublic class {safe_identifier}Example {{\n    public static void main(String[] args) {{\n        System.out.println(\"Executing verified pattern for: {trimmed_subtopic}\");\n    }}\n}}"
+    draft_resources = [
+        {
+            "title": f"{trimmed_subtopic} Complete Video Walkthrough",
+            "type": "youtube",
+            "url": f"https://www.youtube.com/results?search_query={trimmed_topic.replace(' ', '+')}+{trimmed_subtopic.replace(' ', '+')}+tutorial",
+            "description": f"Detailed video guide explaining {trimmed_subtopic} step-by-step."
+        }
+    ]
+
+    # Attempt LLM call if Groq API key is present
+    from config import settings
+    import os
+    groq_key = getattr(settings, "groq_api_key", None) or os.getenv("GROQ_API_KEY")
+    if groq_key:
+        try:
+            import requests
+            headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+            prompt = (
+                f"You are a world-class technical instructional designer writing official curriculum notes for SkillDNA AI.\n"
+                f"Generate comprehensive, pedagogical, and industry-grade notes for:\n"
+                f"- Domain: {domain_val}\n"
+                f"- Topic: {trimmed_topic}\n"
+                f"- Subtopic: {trimmed_subtopic}\n"
+                f"- Target Level: {target_level}\n\n"
+                f"Return ONLY valid JSON matching:\n"
+                f'{{"title": "...", "overview": "...", "richText": "...", "keyTakeaways": ["..."], "examples": "...", "resources": [{{"title": "...", "type": "youtube", "url": "...", "description": "..."}}]}}'
+            )
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.4,
+                    "response_format": {"type": "json_object"}
+                },
+                timeout=12
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                content_str = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                import json
+                parsed = json.loads(content_str)
+                if parsed.get("title"):
+                    draft_title = parsed.get("title", draft_title)
+                    draft_overview = parsed.get("overview", draft_overview)
+                    draft_rich_text = parsed.get("richText", draft_rich_text)
+                    if parsed.get("keyTakeaways"):
+                        draft_takeaways = parsed["keyTakeaways"]
+                    if parsed.get("examples"):
+                        draft_example = parsed["examples"]
+                    if parsed.get("resources"):
+                        draft_resources = parsed["resources"]
+        except Exception as e:
+            logger.warning(f"Groq generation fallback: {e}")
+
+    return {
+        "domain": domain_val,
+        "topic": trimmed_topic,
+        "subtopic": trimmed_subtopic,
+        "title": draft_title,
+        "overview": draft_overview,
+        "richText": draft_rich_text,
+        "content": draft_rich_text,
+        "keyTakeaways": draft_takeaways,
+        "examples": draft_example,
+        "resources": draft_resources,
+        "notes": {
+            "title": draft_title,
+            "content": draft_rich_text or draft_overview,
+            "keyTakeaways": draft_takeaways,
+            "codeExamples": [{"language": "java", "code": draft_example, "title": f"{trimmed_topic} Example"}] if draft_example else [],
+            "resources": draft_resources
+        }
+    }
+
+@router.post("/admin/notes/bulk-upload")
+@router.post("/admin/notes/upload")
+async def bulk_upload_topic_notes(
+    file: UploadFile = File(...),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Bulk upload and publish topic notes via Excel or CSV (Admin only)."""
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        raw_rows = _parse_uploaded_file(file_bytes, file.filename or "notes.xlsx")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
+
+    if not raw_rows:
+        raise HTTPException(status_code=400, detail="No data rows found in the uploaded file.")
+
+    now = datetime.utcnow()
+    created_count = 0
+
+    for row in raw_rows:
+        domain = _extract_val(row, "domain", "field", "careerDomain") or "Computer Science"
+        topic = _extract_val(row, "topic", "subject", "module") or "Core"
+        subtopic = _extract_val(row, "subtopic", "sub_topic", "concept") or "General"
+        title = _extract_val(row, "title", "note_title") or f"{subtopic} Overview"
+        overview = _extract_val(row, "overview", "summary", "description")
+        rich_text = _extract_val(row, "content", "notes", "richText", "body")
+        takeaways_raw = _extract_val(row, "keyTakeaways", "takeaways", "points")
+        examples = _extract_val(row, "examples", "code", "sample")
+        resources_raw = _extract_val(row, "resources", "links", "urls")
+        career = _extract_val(row, "career", "targetRole", "role") or ""
+
+        key_takeaways = [t.strip() for t in re.split(r'[,;\n]', takeaways_raw) if t.strip()] if takeaways_raw else []
+
+        resources: List[Dict[str, Any]] = []
+        if resources_raw:
+            links = [l.strip() for l in re.split(r'[,;\n]', resources_raw) if l.strip()]
+            for link in links:
+                is_yt = "youtube.com" in link or "youtu.be" in link
+                is_udemy = "udemy.com" in link
+                resources.append({
+                    "title": "Video Tutorial" if is_yt else "Online Course" if is_udemy else "Reference Document",
+                    "type": "youtube" if is_yt else "udemy" if is_udemy else "doc",
+                    "url": link
+                })
+
+        doc = {
+            "career": career,
+            "domain": domain,
+            "topic": topic,
+            "subtopic": subtopic,
+            "title": title,
+            "overview": overview or f"{title} covering key mechanisms and patterns.",
+            "richText": rich_text or overview or "",
+            "content": rich_text or overview or "",
+            "keyTakeaways": key_takeaways,
+            "examples": examples or "",
+            "codeExamples": [{"language": "java", "code": examples, "title": f"{topic} Example"}] if examples else [],
+            "resources": resources,
+            "status": "Published",
+            "isAiGenerated": False,
+            "createdBy": current_admin.get("email") or current_admin.get("sub"),
+            "updatedAt": now,
+            "publishedAt": now,
+        }
+
+        await topic_notes_collection.update_one(
+            {"domain": domain, "topic": topic, "subtopic": subtopic},
+            {"$set": doc, "$setOnInsert": {"createdAt": now}},
+            upsert=True
+        )
+        created_count += 1
+
+    await audit_logs_collection.insert_one({
+        "action": "TOPIC_NOTES_BULK_UPLOAD",
+        "performedBy": current_admin.get("email") or current_admin.get("sub"),
+        "entityType": "TopicNote",
+        "entityId": "bulk",
+        "details": {"count": created_count, "filename": file.filename},
+        "timestamp": now,
+    })
+
+    return {
+        "message": f"Successfully processed and published {created_count} topic notes into dataset!",
+        "count": created_count
+    }
+
+@router.get("/admin/notes/template")
+async def download_topic_notes_template(
+    format: str = Query("xlsx"),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Download starter spreadsheet template for Topic Notes (Admin only)."""
+    headers = ["Domain", "Topic", "Subtopic", "Title", "Overview", "Content", "KeyTakeaways", "Examples", "Resources"]
+    sample_rows = [
+        [
+            "Computer Science",
+            "Java",
+            "OOP",
+            "Object-Oriented Programming in Java",
+            "OOP models real-world entities through Encapsulation, Inheritance, Polymorphism, and Abstraction.",
+            "Encapsulation bundles data and methods while restricting direct access. Inheritance enables code reuse via extends. Polymorphism allows methods to take multiple forms through overloading and overriding. Abstraction hides implementation details using interfaces and abstract classes.",
+            "Encapsulation uses private fields with getters/setters; Polymorphism enables dynamic method dispatch; Prefer composition over inheritance.",
+            "public class Animal {\n    public void speak() {\n        System.out.println(\"Animal sound\");\n    }\n}\npublic class Dog extends Animal {\n    @Override\n    public void speak() {\n        System.out.println(\"Bark\");\n    }\n}",
+            "https://www.youtube.com/watch?v=sample_oop; https://docs.oracle.com/en/java/"
+        ],
+        [
+            "Computer Science",
+            "Java",
+            "Collections Framework",
+            "Java Collections Framework Deep Dive",
+            "The collections framework provides high-performance data structures including List, Set, Map, and Queue.",
+            "ArrayList provides O(1) indexed access but O(n) worst-case insertions. HashMap uses array buckets with LinkedLists and Treeify threshold of 8 using red-black trees.",
+            "HashMap is not thread-safe; use ConcurrentHashMap in multi-threaded code; Override equals and hashCode together.",
+            "Map<String, Integer> map = new HashMap<>();\nmap.put(\"Key\", 100);",
+            "https://www.youtube.com/watch?v=sample_collections"
+        ],
+        [
+            "Mechanical Engineering",
+            "CAD & GD&T",
+            "GD&T Feature Control Frames",
+            "Geometric Dimensioning and Tolerancing Standards",
+            "GD&T communicates design intent using feature control frames according to ASME Y14.5.",
+            "Datums serve as reference geometry. Position tolerance establishes cylindrical tolerance zones for holes and pins.",
+            "Datums must follow order of precedence; MMC allows bonus tolerance.",
+            "Feature control frame: [Pos | ⌀0.25 (M) | A | B | C]",
+            "https://www.youtube.com/watch?v=sample_gdt"
+        ]
+    ]
+
+    if format.lower() == "csv":
+        out = io.StringIO()
+        out.write("\ufeff")  # UTF-8 BOM for Excel compatibility
+        writer = csv.writer(out)
+        writer.writerow(headers)
+        writer.writerows(sample_rows)
+        csv_bytes = out.getvalue().encode("utf-8")
+        return Response(
+            content=csv_bytes,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="skilldna_topic_notes_template.csv"'}
+        )
+
+    # XLSX format
+    try:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "TopicNotesTemplate"
+        ws.append(headers)
+        for r in sample_rows:
+            ws.append(r)
+        col_widths = [22, 20, 20, 35, 45, 60, 40, 40, 35]
+        for col_idx, width in enumerate(col_widths, start=1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return Response(
+            content=buf.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": 'attachment; filename="skilldna_topic_notes_template.xlsx"'}
+        )
+    except Exception as e:
+        logger.warning(f"openpyxl failed, fallback to CSV: {e}")
+        out = io.StringIO()
+        out.write("\ufeff")
+        writer = csv.writer(out)
+        writer.writerow(headers)
+        writer.writerows(sample_rows)
+        csv_bytes = out.getvalue().encode("utf-8")
+        return Response(
+            content=csv_bytes,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="skilldna_topic_notes_template.csv"'}
+        )
+
+@router.put("/admin/notes/{note_id}")
+async def update_admin_topic_note(
+    note_id: str,
+    payload: TopicNoteUpdateRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Edit and update an existing topic note (Admin only)."""
+    try:
+        obj_id = ObjectId(note_id)
+    except Exception:
+        obj_id = note_id
+
+    update_fields: Dict[str, Any] = {"updatedAt": datetime.utcnow()}
+    if payload.career is not None:
+        update_fields["career"] = payload.career.strip()
+    if payload.domain is not None:
+        update_fields["domain"] = payload.domain.strip()
+    if payload.topic is not None:
+        update_fields["topic"] = payload.topic.strip()
+    if payload.subtopic is not None:
+        update_fields["subtopic"] = payload.subtopic.strip()
+    if payload.title is not None:
+        update_fields["title"] = payload.title.strip()
+    if payload.overview is not None:
+        update_fields["overview"] = payload.overview.strip()
+    if payload.richText is not None:
+        update_fields["richText"] = payload.richText.strip()
+        update_fields["content"] = payload.richText.strip()
+    elif payload.content is not None:
+        update_fields["richText"] = payload.content.strip()
+        update_fields["content"] = payload.content.strip()
+
+    if payload.keyTakeaways is not None:
+        if isinstance(payload.keyTakeaways, list):
+            update_fields["keyTakeaways"] = [str(k).strip() for k in payload.keyTakeaways if str(k).strip()]
+        elif isinstance(payload.keyTakeaways, str):
+            update_fields["keyTakeaways"] = [k.strip() for k in payload.keyTakeaways.split("\n") if k.strip()]
+
+    if payload.examples is not None:
+        update_fields["examples"] = payload.examples
+    if payload.codeExamples is not None:
+        update_fields["codeExamples"] = payload.codeExamples
+    if payload.resources is not None:
+        update_fields["resources"] = payload.resources
+
+    if payload.status is not None:
+        s = payload.status.strip().upper()
+        norm_status = "Draft" if s == "DRAFT" else "Archived" if s == "ARCHIVED" else "Published"
+        update_fields["status"] = norm_status
+        if norm_status == "Published":
+            update_fields["publishedAt"] = datetime.utcnow()
+
+    res = await topic_notes_collection.find_one_and_update(
+        {"_id": obj_id},
+        {"$set": update_fields},
+        return_document=True
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Topic note not found")
+
+    return {
+        "message": "Topic note updated successfully.",
+        "note": serialize_doc(res)
+    }
+
+@router.delete("/admin/notes/{note_id}")
+async def delete_admin_topic_note(
+    note_id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Delete a topic note permanently (Admin only)."""
+    try:
+        obj_id = ObjectId(note_id)
+    except Exception:
+        obj_id = note_id
+
+    res = await topic_notes_collection.delete_one({"_id": obj_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Topic note not found")
+
+    await audit_logs_collection.insert_one({
+        "action": "TOPIC_NOTE_DELETED",
+        "performedBy": current_admin.get("email") or current_admin.get("sub"),
+        "entityType": "TopicNote",
+        "entityId": str(note_id),
+        "timestamp": datetime.utcnow(),
+    })
+
+    return {"message": "Topic note deleted successfully."}
+
+@router.get("/admin/notes/requests")
+async def list_content_requests(
+    status: Optional[str] = Query(None),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Retrieve student curriculum and notes requests (Admin only)."""
+    filter_q: Dict[str, Any] = {}
+    if status and status != "ALL":
+        filter_q["status"] = {"$regex": f"^{re.escape(status.strip())}$", "$options": "i"}
+
+    requests_cursor = content_requests_collection.find(filter_q).sort("createdAt", -1).limit(100)
+    requests_list = await requests_cursor.to_list(length=100)
+    pending_count = await content_requests_collection.count_documents({"status": "PENDING"})
+
+    return {
+        "requests": [serialize_doc(r) for r in requests_list],
+        "pendingCount": pending_count
+    }
+
+@router.post("/admin/notes/requests/{request_id}/fulfill")
+async def fulfill_content_request(
+    request_id: str,
+    payload: ContentRequestFulfillRequest,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Fulfill student content request (Admin only)."""
+    try:
+        obj_id = ObjectId(request_id)
+    except Exception:
+        obj_id = request_id
+
+    update_fields: Dict[str, Any] = {
+        "status": "FULFILLED",
+        "fulfilledAt": datetime.utcnow(),
+        "fulfilledBy": current_admin.get("email") or current_admin.get("sub")
+    }
+    if payload.noteId:
+        update_fields["fulfilledByNoteId"] = payload.noteId
+    if payload.adminRemarks:
+        update_fields["adminRemarks"] = payload.adminRemarks.strip()
+
+    res = await content_requests_collection.find_one_and_update(
+        {"_id": obj_id},
+        {"$set": update_fields},
+        return_document=True
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Content request not found")
+
+    return {
+        "message": "Content request marked as fulfilled.",
+        "request": serialize_doc(res)
+    }
+

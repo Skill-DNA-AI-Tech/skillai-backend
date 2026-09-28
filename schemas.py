@@ -478,3 +478,50 @@ class StudentNoteUpdateRequest(BaseModel):
 class NoteQuizSubmitRequest(BaseModel):
     answers: Dict[str, Any]
 
+# ==========================================
+# 14. ADMIN TOPIC NOTES & CURRICULUM SCHEMAS
+# ==========================================
+
+class TopicNoteCreateRequest(BaseModel):
+    career: Optional[str] = ""
+    domain: Optional[str] = "Computer Science"
+    topic: str
+    subtopic: Optional[str] = "General"
+    title: Optional[str] = None
+    overview: Optional[str] = None
+    richText: Optional[str] = None
+    content: Optional[str] = None
+    keyTakeaways: Optional[Union[List[str], str]] = None
+    examples: Optional[Any] = None
+    codeExamples: Optional[List[Dict[str, Any]]] = None
+    resources: Optional[List[Dict[str, Any]]] = None
+    status: Optional[str] = "Published"
+
+class TopicNoteUpdateRequest(BaseModel):
+    career: Optional[str] = None
+    domain: Optional[str] = None
+    topic: Optional[str] = None
+    subtopic: Optional[str] = None
+    title: Optional[str] = None
+    overview: Optional[str] = None
+    richText: Optional[str] = None
+    content: Optional[str] = None
+    keyTakeaways: Optional[Union[List[str], str]] = None
+    examples: Optional[Any] = None
+    codeExamples: Optional[List[Dict[str, Any]]] = None
+    resources: Optional[List[Dict[str, Any]]] = None
+    status: Optional[str] = None
+
+class TopicNoteAiGenerateRequest(BaseModel):
+    career: Optional[str] = None
+    careerDomain: Optional[str] = None
+    domain: Optional[str] = "Computer Science"
+    topic: str
+    subtopic: Optional[str] = "General"
+    studentLevel: Optional[str] = "Intermediate"
+    level: Optional[str] = "Intermediate"
+
+class ContentRequestFulfillRequest(BaseModel):
+    noteId: Optional[str] = None
+    adminRemarks: Optional[str] = None
+
