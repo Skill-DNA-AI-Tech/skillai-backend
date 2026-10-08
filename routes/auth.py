@@ -174,6 +174,7 @@ async def login(payload: StudentLogin, request: Request):
         "name": user.get("name", "User")
     }
     access_token = create_access_token(data=token_data)
+    refresh_token = create_access_token(data={**token_data, "token_type": "refresh"}, expires_delta=timedelta(days=30))
 
     # Log success
     await login_logs_collection.insert_one({
@@ -194,7 +195,7 @@ async def login(payload: StudentLogin, request: Request):
         isPreProductionUser=bool(user.get("isPreProductionUser", False)),
         created_at=user.get("created_at")
     )
-    return TokenResponse(access_token=access_token, role=user_role, user=user_response)
+    return TokenResponse(access_token=access_token, refreshToken=refresh_token, role=user_role, user=user_response)
 
 @router.post("/verify-email", response_model=TokenResponse)
 async def verify_email(payload: VerifyEmailRequest, request: Request):
@@ -253,6 +254,7 @@ async def verify_email(payload: VerifyEmailRequest, request: Request):
         "name": user.get("name", "Student")
     }
     access_token = create_access_token(data=token_data)
+    refresh_token = create_access_token(data={**token_data, "token_type": "refresh"}, expires_delta=timedelta(days=30))
 
     # Log successful verification login
     await login_logs_collection.insert_one({
@@ -273,7 +275,7 @@ async def verify_email(payload: VerifyEmailRequest, request: Request):
         isPreProductionUser=bool(user.get("isPreProductionUser", False)),
         created_at=user.get("created_at")
     )
-    return TokenResponse(access_token=access_token, role=user.get("role", "student"), user=user_response)
+    return TokenResponse(access_token=access_token, refreshToken=refresh_token, role=user.get("role", "student"), user=user_response)
 
 @router.post("/google", response_model=TokenResponse)
 async def google_login(payload: GoogleLoginRequest, request: Request):
@@ -377,6 +379,7 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
         "name": user.get("name", name)
     }
     access_token = create_access_token(data=token_data)
+    refresh_token = create_access_token(data={**token_data, "token_type": "refresh"}, expires_delta=timedelta(days=30))
 
     # Log success
     await login_logs_collection.insert_one({
@@ -397,7 +400,7 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
         isPreProductionUser=bool(user.get("isPreProductionUser", False)),
         created_at=user.get("created_at")
     )
-    return TokenResponse(access_token=access_token, role=user_role, user=user_response)
+    return TokenResponse(access_token=access_token, refreshToken=refresh_token, role=user_role, user=user_response)
 
 @router.post("/forgot-password", response_model=MessageResponse)
 async def forgot_password(payload: ForgotPasswordRequest):
@@ -590,6 +593,7 @@ async def refresh_session_token(request: Request):
         "name": user.get("name", "User")
     }
     new_access_token = create_access_token(data=token_data)
+    new_refresh_token = create_access_token(data={**token_data, "token_type": "refresh"}, expires_delta=timedelta(days=30))
 
     user_response = UserResponse(
         id=str(user["_id"]),
@@ -600,5 +604,5 @@ async def refresh_session_token(request: Request):
         isPreProductionUser=bool(user.get("isPreProductionUser", False)),
         created_at=user.get("created_at")
     )
-    return TokenResponse(access_token=new_access_token, role=user_role, user=user_response)
+    return TokenResponse(access_token=new_access_token, refreshToken=new_refresh_token, role=user_role, user=user_response)
 

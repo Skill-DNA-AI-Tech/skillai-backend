@@ -52,6 +52,7 @@ class UserResponse(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
+    refreshToken: Optional[str] = None
     token_type: str = "bearer"
     role: str = "student"
     user: UserResponse
