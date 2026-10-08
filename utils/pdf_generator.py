@@ -60,9 +60,9 @@ class NumberedCanvasWithWatermark(canvas.Canvas):
         wm_enabled = wm.get("enabled", True)
         if wm_enabled:
             wm_text = wm.get("text", "SkillDNA AI") or "SkillDNA AI"
-            wm_opacity = float(wm.get("opacity", 0.07))
+            wm_opacity = float(wm.get("opacity", 0.035))
             wm_opacity = max(0.01, min(0.35, wm_opacity))
-            wm_size = int(wm.get("fontSize", 52))
+            wm_size = int(wm.get("fontSize", 48))
             wm_rotation = int(wm.get("rotation", 45))
             wm_position = wm.get("position", "center").lower()
 
@@ -71,7 +71,7 @@ class NumberedCanvasWithWatermark(canvas.Canvas):
                 self.setFillAlpha(wm_opacity)
             except Exception:
                 pass  # Fallback if setFillAlpha not supported by canvas
-            self.setFillColor(colors.HexColor("#0f172a"))
+            self.setFillColor(colors.HexColor("#94a3b8"))
             self.setFont("Helvetica-Bold", wm_size)
 
             if wm_position == "top":

@@ -24,6 +24,8 @@ from auth_handler import (
     get_password_hash,
     verify_password,
     create_access_token,
+    decode_access_token,
+    extract_token_from_request,
     get_current_user
 )
 from email_handler import send_otp_email
@@ -523,3 +525,80 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         isPreProductionUser=bool(user.get("isPreProductionUser", False)),
         created_at=user.get("created_at")
     )
+
+@router.get("/current-user", response_model=UserResponse)
+async def get_current_user_profile(current_user: dict = Depends(get_current_user)):
+    """
+    Session restoration endpoint: returns currently authenticated user profile.
+    Guarantees reliable page refreshes without race conditions or premature redirect.
+    """
+    return await get_me(current_user=current_user)
+
+@router.post("/refresh", response_model=TokenResponse)
+async def refresh_session_token(request: Request):
+    """
+    Refreshes the access token for an active user session.
+    Accepts Bearer token in Authorization header or refreshToken in JSON body.
+    """
+    token = extract_token_from_request(request)
+    if not token:
+        try:
+            body = await request.json()
+            token = body.get("refreshToken") or body.get("token")
+        except Exception:
+            token = None
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session refresh token required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    payload = decode_access_token(token)
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired or invalid refresh token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    email = (payload.get("sub") or payload.get("email") or "").lower()
+    user = await users_collection.find_one({"email": email})
+    if not user:
+        admin_doc = await admins_collection.find_one({"email": email})
+        if admin_doc:
+            user = {
+                "_id": admin_doc["_id"],
+                "name": admin_doc.get("name") or admin_doc.get("full_name") or "Administrator",
+                "email": admin_doc["email"],
+                "role": admin_doc.get("role", "MAIN_ADMIN"),
+                "isTestUser": False,
+                "isPreProductionUser": False,
+                "created_at": admin_doc.get("created_at")
+            }
+
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User account not found.")
+
+    user_role = user.get("role", "student")
+    token_data = {
+        "sub": email,
+        "id": str(user["_id"]),
+        "email": email,
+        "role": user_role,
+        "name": user.get("name", "User")
+    }
+    new_access_token = create_access_token(data=token_data)
+
+    user_response = UserResponse(
+        id=str(user["_id"]),
+        name=user.get("name", "User"),
+        email=user["email"],
+        role=user_role,
+        isTestUser=bool(user.get("isTestUser", False)),
+        isPreProductionUser=bool(user.get("isPreProductionUser", False)),
+        created_at=user.get("created_at")
+    )
+    return TokenResponse(access_token=new_access_token, role=user_role, user=user_response)
+

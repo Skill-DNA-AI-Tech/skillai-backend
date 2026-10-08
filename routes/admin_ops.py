@@ -746,6 +746,85 @@ async def update_user_status(
 
     return {"message": "User status updated successfully", "status": "success"}
 
+@router.delete("/admin/users/{id}")
+async def delete_or_deactivate_user(
+    id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Safely deactivate/soft-delete a user or administrator account (Admin only).
+    - Prevents self-deletion (cannot delete the administrator making the request).
+    - Prevents deleting the master platform administrator (skilldnaai@ai.com).
+    - Safely marks account as DEACTIVATED with soft-delete timestamp preserving historical records.
+    - Full audit logging of the deactivation action.
+    """
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        obj_id = id
+
+    target_user = await users_collection.find_one({"$or": [{"_id": obj_id}, {"email": id.lower()}]})
+    is_in_admins = False
+    if not target_user:
+        target_user = await admins_collection.find_one({"$or": [{"_id": obj_id}, {"email": id.lower()}]})
+        if target_user:
+            is_in_admins = True
+
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User account not found")
+
+    target_id_str = str(target_user["_id"])
+    target_email = (target_user.get("email") or "").lower()
+    admin_email = (current_admin.get("email") or current_admin.get("sub") or "").lower()
+    admin_id_str = str(current_admin.get("id") or "")
+
+    # 1. Prevent self-deletion
+    if target_id_str == admin_id_str or (target_email and target_email == admin_email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Self-deletion is prohibited. You cannot deactivate or delete your own active administrator session."
+        )
+
+    # 2. Prevent deleting master admin accounts
+    if target_email in ["skilldnaai@ai.com", "admin@skilldna.ai"] or target_user.get("role") in ["MAIN_ADMIN", "SUPER_ADMIN"]:
+        if current_admin.get("role") != "MAIN_ADMIN" or target_email == "skilldnaai@ai.com":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="The master system administrator account is permanently protected and cannot be deleted."
+            )
+
+    # 3. Perform safe soft-deletion / deactivation
+    now = datetime.utcnow()
+    update_doc = {
+        "status": "DEACTIVATED",
+        "is_deleted": True,
+        "isDeleted": True,
+        "deactivated_at": now,
+        "updated_at": now
+    }
+
+    if is_in_admins:
+        await admins_collection.update_one({"_id": target_user["_id"]}, {"$set": update_doc})
+    else:
+        await users_collection.update_one({"_id": target_user["_id"]}, {"$set": update_doc})
+
+    # 4. Record security audit log
+    await audit_logs_collection.insert_one({
+        "action": "USER_DEACTIVATED",
+        "targetUserId": target_id_str,
+        "targetEmail": target_email,
+        "performedBy": admin_email,
+        "timestamp": now
+    })
+
+    return {
+        "status": "success",
+        "success": True,
+        "userId": target_id_str,
+        "email": target_email,
+        "message": f"Account for {target_user.get('name', 'User')} ({target_email}) has been safely deactivated."
+    }
+
 @router.put("/admin/users/{id}")
 async def update_user_details(
     id: str,
@@ -3452,6 +3531,52 @@ async def submit_note_quiz(
         "totalQuestions": total,
         "passed": passed,
         "message": f"Quiz evaluated: {score}%! Learning evidence synced with Skill DNA."
+    }
+
+@router.post("/learning/notes/quiz-evaluate")
+async def evaluate_draft_note_quiz(
+    payload: Dict[str, Any],
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Evaluates quiz answers on active study notes and updates Skill DNA evidence when score >= 70%.
+    Prevents false score inflation when score < 70%.
+    """
+    user = await get_authenticated_user_doc(current_user)
+    u_id = user.get("_id")
+    quiz_items = payload.get("quiz") or []
+    answers = payload.get("answers") or {}
+    total = len(quiz_items)
+    correct = 0
+
+    for idx, item in enumerate(quiz_items):
+        q_id = item.get("id") or f"Q{idx+1}"
+        correct_idx = item.get("correctAnswer", 0)
+        chosen = answers.get(q_id)
+        if chosen is None:
+            chosen = answers.get(str(idx))
+        if chosen is None:
+            chosen = answers.get(idx)
+        if chosen is not None and int(chosen) == int(correct_idx):
+            correct += 1
+
+    score = round((correct / total) * 100) if total > 0 else 0
+    passed = score >= 70
+
+    if passed and u_id:
+        await profiles_collection.update_one(
+            {"$or": [{"user": u_id}, {"userId": str(u_id)}]},
+            {"$inc": {"skillDNA.technicalScore": 2, "skillDNA.overallScore": 1}, "$set": {"updatedAt": datetime.utcnow()}},
+            upsert=True
+        )
+
+    return {
+        "success": True,
+        "score": score,
+        "correctCount": correct,
+        "totalQuestions": total,
+        "passed": passed,
+        "message": f"Quiz evaluated: {score}%. {'Verified competency added to Skill DNA!' if passed else 'Review high-yield keypoints before retaking.'}"
     }
 
 # ==========================================
