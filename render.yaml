@@ -24,23 +24,7 @@ services:
         sync: false
       - key: SUPER_ADMIN_PASSWORD
         sync: false
-
-  # Express Application Backend (https://skilldna-backend.onrender.com)
-  - type: web
-    name: skilldna-backend
-    runtime: node
-    buildCommand: npm install && npm run build
-    startCommand: npm start
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: MONGODB_URI
-        sync: false
-      - key: MONGO_URI
-        sync: false
-      - key: JWT_SECRET
-        sync: false
-      - key: AI_SERVICE_URL
-        sync: false
-      - key: APP_BASE_URL
+      - key: FRONTEND_BASE_URL
+        value: https://skillai-frontend.team-lcoding.workers.dev
+      - key: GROQ_API_KEY
         sync: false

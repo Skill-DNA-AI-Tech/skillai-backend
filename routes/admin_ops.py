@@ -4,6 +4,8 @@ import csv
 import uuid
 import random
 import re
+import json
+import os
 from datetime import datetime, timedelta
 from typing import Optional, List, Any, Dict
 from fastapi import APIRouter, HTTPException, status, Depends, Request, Query, Response, UploadFile, File
@@ -37,6 +39,12 @@ from database import (
     pdf_watermark_settings_collection,
 )
 from utils.pdf_generator import build_notes_pdf
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.graphics.barcode import qr as reportlab_qr
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics import renderPDF
 from auth_handler import (
     get_current_admin,
     get_current_user,
@@ -101,8 +109,16 @@ from schemas import (
 )
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(tags=["Admin & Business Operations"])
+CANONICAL_FRONTEND_URL = os.getenv(
+    "FRONTEND_BASE_URL",
+    "https://skillai-frontend.team-lcoding.workers.dev",
+).rstrip("/")
+
+
+def canonical_certificate_url(certificate_id: str) -> str:
+    return f"{CANONICAL_FRONTEND_URL}/verify/{certificate_id}"
+
 
 def serialize_doc(doc: Any) -> Any:
     """
@@ -1712,7 +1728,7 @@ async def create_student_report(
         },
         "interviewScore": payload.interviewScore or 80,
         "verificationId": verification_id,
-        "publicUrl": f"https://skillai-frontend.pages.dev/report/{verification_id}",
+        "publicUrl": f"{CANONICAL_FRONTEND_URL}/report/{verification_id}",
         "shareTokens": [],
         "createdAt": datetime.utcnow()
     }
@@ -1750,7 +1766,7 @@ async def share_student_report(
         "createdAt": datetime.utcnow()
     }
     await reports_collection.update_one({"_id": report["_id"]}, {"$push": {"shareTokens": share_record}})
-    link = f"https://skillai-frontend.pages.dev/recruiter/report/{share_token}"
+    link = f"{CANONICAL_FRONTEND_URL}/recruiter/report/{share_token}"
     return {
         "status": "success",
         "message": "Report shared successfully",
@@ -1797,7 +1813,13 @@ async def verify_certificate_public(certificate_id: str):
     achievement = cert.get("achievement") or f"Demonstrated technical and interview competency in {career_path}"
     issuer = cert.get("issuer") or "SkillDNA Tech AI Certification Authority"
     seal = "SKILLDNA AI • VERIFIED AUTHENTIC CERTIFICATE"
-    verify_url = f"https://skillai-frontend.pages.dev/verify/{certificate_id}"
+    verify_url = canonical_certificate_url(certificate_id)
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={verify_url}"
+    if cert.get("verificationUrl") != verify_url or cert.get("qrCode") != qr_url:
+        await certificates_collection.update_one(
+            {"_id": cert["_id"]},
+            {"$set": {"verificationUrl": verify_url, "qrCode": qr_url}},
+        )
 
     issue_date_val = cert.get("issueDate") or cert.get("createdAt")
     issue_date_str = issue_date_val.strftime("%B %d, %Y") if isinstance(issue_date_val, datetime) else str(issue_date_val or "")
@@ -1816,6 +1838,7 @@ async def verify_certificate_public(certificate_id: str):
             issuer=issuer,
             seal=seal,
             verificationUrl=verify_url,
+            qrCode=qr_url,
             message="This certificate was officially REVOKED by the issuing authority and is no longer valid."
         )
 
@@ -1834,6 +1857,7 @@ async def verify_certificate_public(certificate_id: str):
             issuer=issuer,
             seal=seal,
             verificationUrl=verify_url,
+            qrCode=qr_url,
             message="This certificate has EXPIRED."
         )
 
@@ -1858,6 +1882,7 @@ async def verify_certificate_public(certificate_id: str):
         issuer=issuer,
         seal=seal,
         verificationUrl=verify_url,
+        qrCode=qr_url,
         scores=scores,
         message="This certificate is verified authentic and active."
     )
@@ -1959,26 +1984,69 @@ async def share_student_certificate(
 
 @router.get("/certificates/{certificate_id}/pdf")
 async def download_certificate_pdf(certificate_id: str):
-    """Download certificate document representation (Public)."""
+    """Return the authoritative certificate record as a real PDF document."""
     cert = await certificates_collection.find_one({"certificateId": certificate_id})
     if not cert:
         raise HTTPException(status_code=404, detail="Certificate not found")
 
-    svg_content = f"""<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600">
-      <rect width="800" height="600" fill="#0f172a" />
-      <rect x="20" y="20" width="760" height="560" fill="none" stroke="#6366f1" stroke-width="4" rx="12" />
-      <text x="400" y="100" fill="#ffffff" font-size="28" font-family="Arial" font-weight="bold" text-anchor="middle">SkillDNA AI Certified Professional</text>
-      <text x="400" y="160" fill="#94a3b8" font-size="16" font-family="Arial" text-anchor="middle">This officially certifies that</text>
-      <text x="400" y="230" fill="#38bdf8" font-size="32" font-family="Arial" font-weight="bold" text-anchor="middle">{cert.get('studentName', 'Candidate')}</text>
-      <text x="400" y="290" fill="#cbd5e1" font-size="18" font-family="Arial" text-anchor="middle">has successfully completed technical evaluation in</text>
-      <text x="400" y="340" fill="#a855f7" font-size="24" font-family="Arial" font-weight="bold" text-anchor="middle">{cert.get('careerPath', 'Software Engineering')}</text>
-      <text x="400" y="420" fill="#94a3b8" font-size="14" font-family="Arial" text-anchor="middle">Certificate ID: {cert.get('certificateId')}</text>
-      <text x="400" y="460" fill="#94a3b8" font-size="14" font-family="Arial" text-anchor="middle">Verified on {datetime.utcnow().strftime('%B %d, %Y')}</text>
-    </svg>"""
+    verify_url = canonical_certificate_url(certificate_id)
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={verify_url}"
+    await certificates_collection.update_one(
+        {"_id": cert["_id"]},
+        {"$set": {"verificationUrl": verify_url, "qrCode": qr_url}},
+    )
 
-    return Response(content=svg_content, media_type="image/svg+xml", headers={
-        "Content-Disposition": f"attachment; filename=SkillDNA-Certificate-{certificate_id}.svg"
-    })
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    pdf.setTitle(f"SkillDNA Certificate {certificate_id}")
+    pdf.setFillColor(colors.HexColor("#0f172a"))
+    pdf.rect(0, 0, width, height, fill=1, stroke=0)
+    pdf.setStrokeColor(colors.HexColor("#38bdf8"))
+    pdf.setLineWidth(3)
+    pdf.roundRect(36, 36, width - 72, height - 72, 12, fill=0, stroke=1)
+    pdf.setFillColor(colors.HexColor("#38bdf8"))
+    pdf.setFont("Helvetica-Bold", 24)
+    pdf.drawCentredString(width / 2, height - 105, "SKILLDNA AI")
+    pdf.setFillColor(colors.white)
+    pdf.setFont("Helvetica-Bold", 20)
+    pdf.drawCentredString(width / 2, height - 155, "Certified Professional")
+    pdf.setFillColor(colors.HexColor("#94a3b8"))
+    pdf.setFont("Helvetica", 12)
+    pdf.drawCentredString(width / 2, height - 205, "This officially certifies that")
+    pdf.setFillColor(colors.HexColor("#38bdf8"))
+    pdf.setFont("Helvetica-Bold", 26)
+    pdf.drawCentredString(width / 2, height - 250, str(cert.get("studentName") or "SkillDNA Candidate"))
+    pdf.setFillColor(colors.HexColor("#cbd5e1"))
+    pdf.setFont("Helvetica", 13)
+    pdf.drawCentredString(width / 2, height - 295, "has demonstrated verified competency in")
+    pdf.setFillColor(colors.HexColor("#a855f7"))
+    pdf.setFont("Helvetica-Bold", 19)
+    pdf.drawCentredString(width / 2, height - 335, str(cert.get("careerPath") or "Software Engineering"))
+    pdf.setFillColor(colors.HexColor("#cbd5e1"))
+    pdf.setFont("Helvetica", 11)
+    pdf.drawCentredString(width / 2, height - 390, f"Certificate ID: {certificate_id}")
+    pdf.drawCentredString(width / 2, height - 410, f"Verification: {verify_url}")
+    pdf.setFont("Helvetica-Bold", 10)
+    pdf.setFillColor(colors.HexColor("#22c55e"))
+    pdf.drawCentredString(width / 2, 85, "VERIFIED AUTHENTIC CERTIFICATE")
+
+    qr_widget = reportlab_qr.QrCodeWidget(verify_url)
+    qr_widget.barWidth = 96
+    qr_widget.barHeight = 96
+    drawing = Drawing(96, 96)
+    drawing.add(qr_widget)
+    renderPDF.draw(drawing, pdf, width - 160, 82)
+    pdf.save()
+    content = buffer.getvalue()
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=500, detail="Certificate PDF generation failed")
+
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=SkillDNA-Certificate-{certificate_id}.pdf"},
+    )
 
 # ==========================================
 # 14. DYNAMIC INTERVIEW & QUESTION ENGINE
@@ -2815,53 +2883,70 @@ async def get_active_curriculum(current_user: dict = Depends(get_current_user)):
         "completionPercentage": completion_pct
     }
 
-@router.post("/learning/topic-content")
-async def get_topic_content(
-    payload: LearningTopicContentRequest,
-    current_user: dict = Depends(get_current_user)
-):
-    """Retrieve verified study notes and key takeaways for a specific learning topic (Authenticated user)."""
+async def _topic_content_response(topic: Optional[str], subtopic: Optional[str], domain: Optional[str], current_user: dict):
     user = await get_authenticated_user_doc(current_user)
     profile = await profiles_collection.find_one({"user": user.get("_id")}) or {}
     disc = resolve_student_discipline(user, profile)
-    topic = payload.topic or disc["curriculumTopics"][0][0]
+    topic_value = (topic or (disc["curriculumTopics"][0][0] if disc["curriculumTopics"] else "")).strip()
+    domain_value = (domain or disc["domainName"]).strip()
+    subtopic_value = (subtopic or "").strip()
+    if not topic_value:
+        raise HTTPException(status_code=400, detail="Topic is required")
 
-    # Generate structured notes content tailored to the topic and domain
-    content_text = f"""### {topic} — Core Professional Syllabus
-
-This master curriculum module establishes rigorous professional competency in **{topic}**, directly supporting the student's progression toward industry-grade mastery in {disc['domainName']}.
-
-#### 1. Theoretical Foundations & Fundamental Principles
-Understanding {topic} begins with first principles. Key operational standards mandate consistent terminology, disciplined execution, and strict adherence to established best practices.
-
-#### 2. Practical Application & Case Methodologies
-When confronting real-world scenarios in {disc['domainName']}, professionals must synthesize diagnostic evidence, evaluate multi-variable trade-offs, and implement durable, verified solutions.
-
-#### 3. Common Failure Modes & Risk Mitigation
-Pitfalls in {topic} typically arise from premature optimization, inadequate verification of edge cases, or communication breakdowns across cross-functional teams. Prioritize end-to-end testing and formal reviews."""
-
-    takeaways = [
-        f"Master the core operational terminology and foundational frameworks of {topic}.",
-        f"Apply disciplined methodology to solve ambiguous problems in {disc['domainName']}.",
-        "Conduct systematic failure mode analysis to prevent costly production errors.",
-        "Maintain thorough documentation and audit readiness across every stage."
-    ]
-
-    return {
-        "hasNotes": True,
-        "note": {
-            "topic": topic,
-            "subtopic": "Core Fundamentals & Advanced Application",
-            "content": content_text,
-            "keyTakeaways": takeaways,
-            "codeExamples": [
-                {
-                    "title": f"Standardized {disc['domainName']} Workflow Pattern",
-                    "code": f"// Professional Standard: {topic}\nStep 1: Input Validation & Problem Formulation\nStep 2: Analysis & Diagnostic Execution\nStep 3: Verification & Impact Assessment\nStatus: Verified Compliant"
-                }
-            ]
-        }
+    query = {
+        "topic": {"$regex": f"^{re.escape(topic_value)}$", "$options": "i"},
+        "status": {"$in": ["Published", "PUBLISHED"]},
     }
+    if domain_value:
+        query["domain"] = {"$regex": f"^{re.escape(domain_value)}$", "$options": "i"}
+    if subtopic_value and subtopic_value.lower() != "general":
+        query["subtopic"] = {"$regex": f"^{re.escape(subtopic_value)}$", "$options": "i"}
+
+    note = await topic_notes_collection.find_one(query, sort=[("updatedAt", -1), ("createdAt", -1)])
+    if not note and subtopic_value:
+        query.pop("subtopic", None)
+        note = await topic_notes_collection.find_one(query, sort=[("updatedAt", -1), ("createdAt", -1)])
+
+    if not note:
+        return {
+            "hasNotes": False,
+            "topic": topic_value,
+            "domain": domain_value,
+            "note": None,
+            "message": "No official published notes are available for this topic yet.",
+        }
+
+    note_data = serialize_doc(note)
+    content = note_data.get("richText") or note_data.get("content") or note_data.get("overview") or ""
+    return {
+        "hasNotes": bool(content),
+        "topic": topic_value,
+        "domain": domain_value,
+        "note": {
+            **note_data,
+            "content": content,
+            "keyTakeaways": note_data.get("keyTakeaways") or [],
+            "codeExamples": note_data.get("codeExamples") or note_data.get("examples") or [],
+        },
+    }
+
+
+@router.get("/learning/topic-content")
+async def get_topic_content_query(
+    domain: Optional[str] = Query(None),
+    topic: Optional[str] = Query(None),
+    subtopic: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user),
+):
+    return await _topic_content_response(topic, subtopic, domain, current_user)
+
+
+@router.post("/learning/topic-content")
+async def get_topic_content(
+    payload: LearningTopicContentRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    return await _topic_content_response(payload.topic, None, None, current_user)
 
 @router.post("/learning/request-content")
 async def request_learning_content(
@@ -3090,300 +3175,101 @@ async def get_mcq_assessment_history(current_user: dict = Depends(get_current_us
 @router.post("/learning/notes/generate")
 async def generate_ai_study_notes(
     payload: AINotesGenerateRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    """
-    Generate comprehensive AI Study Notes across 7 learning artifacts:
-    1. Executive Summary
-    2. Detailed Structured Notes
-    3. Key High-Yield Bullet Points
-    4. Quick Revision Sheet
-    5. Important Exam / Interview Questions
-    6. Interactive Flashcards (front/back)
-    7. Practice Quiz (with answer keys)
-    """
+    """Generate student-authorized, profile-aware notes using the configured LLM."""
     user = await get_authenticated_user_doc(current_user)
     profile = await profiles_collection.find_one({"user": user.get("_id")}) or {}
     disc = resolve_student_discipline(user, profile)
-
-    topic = payload.topic or (disc["curriculumTopics"][0][0] if disc["curriculumTopics"] else "Core Principles")
-    domain = payload.domain or disc["domainName"]
-    level = payload.level or "Intermediate"
+    memory = await career_twin_memories_collection.find_one({"userId": user.get("_id")}) or await career_twin_memories_collection.find_one({"user": user.get("_id")}) or {}
+    skill_dna = profile.get("skillDNA") or profile.get("skills") or {}
+    gaps = profile.get("skillGaps") or profile.get("weaknesses") or memory.get("weaknesses") or []
+    strengths = profile.get("strengths") or memory.get("strengths") or []
+    target_role = profile.get("targetRole") or profile.get("careerGoal") or disc.get("defaultCareer")
+    topic = (payload.topic or "").strip()
+    domain = (payload.domain or disc.get("domainName") or "").strip()
+    level = (payload.level or profile.get("skillLevel") or "Intermediate").strip()
+    if not topic:
+        topic = (disc.get("curriculumTopics") or [["Core competency"]])[0][0]
     source = (payload.sourceText or "").strip()
 
-    # Match domain key for case studies
-    domain_case_studies = {
-        "medical": (
-            "Clinical Presentation: A 54-year-old patient presents with acute episodic dyspnea and tachycardia. "
-            "Differential analysis requires immediate arterial blood gas evaluation and ECG tracking to distinguish "
-            "between acute coronary syndrome and pulmonary embolism before initiating anticoagulant therapy."
-        ),
-        "hr": (
-            "Organizational Scenario: A high-performing engineering division experiences a 25% attrition spike following "
-            "a restructuring. The HRBP conducts blind 360-degree exit interviews, benchmarks compensation bands against "
-            "the 75th percentile of the regional market, and introduces structured career pathways to arrest turnover."
-        ),
-        "marketing": (
-            "Growth Audit: Customer acquisition cost (CAC) on Meta Ads increased by 42% over Q3. The growth team executes "
-            "creative fatigue audits, implements server-side Conversions API tracking, and optimizes mid-funnel email "
-            "nurturing workflows, recovering blended ROAS from 1.8x to 3.4x."
-        ),
-        "finance": (
-            "Valuation Case: Evaluating a prospective acquisition of a B2B SaaS company generating $15M ARR. "
-            "The analyst builds a 5-year discounted cash flow (DCF) model factoring in a 9.2% WACC, 3% terminal growth rate, "
-            "and calculates net working capital adjustments to determine fair enterprise value."
-        ),
-        "law": (
-            "Commercial Dispute: Drafting a master services agreement with strict cross-border data transfer covenants. "
-            "Counsel incorporates mutual indemnity caps, specifies London Court of International Arbitration (LCIA) "
-            "jurisdiction, and ensures adherence to GDPR Chapter V standard contractual clauses."
-        ),
-        "design": (
-            "Usability Overhaul: An enterprise health portal fails WCAG 2.1 AA audits due to low-contrast color palettes "
-            "and inaccessible modal dialogues. The product designer establishes design tokens with 4.5:1 text contrast ratios "
-            "and implements visible keyboard focus rings, improving completion rates among elderly users by 38%."
-        ),
-        "engineering": (
-            "Mechanical Simulation: A high-pressure hydraulic valve experiences cyclic fatigue at 12,000 cycles. "
-            "Finite element analysis (FEA) reveals a stress concentration factor of 2.8 at the fillet radius. "
-            "Redesigning the transition geometry reduces peak von Mises stress by 32%, ensuring safety factor compliance."
-        ),
-        "management": (
-            "Strategic Alignment: Expanding enterprise logistics operations across 3 regional hubs. "
-            "The operations director establishes bi-weekly OKR cadence, aligns warehouse throughput KPIs with delivery "
-            "SLAs, and deploys cross-docking logistics to reduce order fulfillment turnaround from 48h to 18h."
-        ),
-        "tech": (
-            "System Architecture: An e-commerce flash-sale API experiences catastrophic 504 gateway timeouts at 40,000 RPS. "
-            "The engineering team implements Redis cluster caching with cache-aside patterns, introduces token-bucket rate "
-            "limiting, and migrates write traffic to asynchronous Kafka message queues, dropping p99 latency to 18ms."
-        )
-    }
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key:
+        raise HTTPException(status_code=503, detail="AI notes are temporarily unavailable: GROQ_API_KEY is not configured.")
 
-    domain_key = "tech"
-    for k in domain_case_studies:
-        if k in domain.lower() or k in disc.get("defaultCareer", "").lower():
-            domain_key = k
-            break
-    real_world_case = domain_case_studies.get(domain_key, domain_case_studies["tech"])
-
-    summary_text = (
-        f"An authoritative executive synthesis of {topic} for {level} practitioners in {domain}. "
-        f"This study guide deconstructs core axioms, procedural mechanics, real-world case applications, "
-        "and high-frequency evaluation criteria for professional assessments."
-    )
-
-    objectives = [
-        f"Master the core operational vocabulary, foundational models, and statutory standards of {topic}.",
-        f"Evaluate risk, latency, cost, and safety trade-offs in {domain} applications.",
-        "Formulate testable diagnostic hypotheses and execute systematic root-cause remediations.",
-        f"Excel in {level}-level competency evaluations and panel interview technical cross-examinations."
-    ]
-
-    prerequisites = [
-        f"Foundational understanding of core {domain} nomenclature and procedural workflows.",
-        "Competency in structured problem deconstruction and first-principles reasoning."
-    ]
-
-    detailed_text = f"""# Master Study Guide: {topic}
-**Discipline:** {domain} | **Level:** {level} | **SkillDNA AI Academic Framework**
-
-## 1. Executive Summary & Learning Objectives
-{summary_text}
-
-### Key Learning Objectives:
-- {objectives[0]}
-- {objectives[1]}
-- {objectives[2]}
-- {objectives[3]}
-
-### Prerequisites:
-- {prerequisites[0]}
-- {prerequisites[1]}
-
-## 2. Foundational & Basic Concepts
-In modern {domain}, **{topic}** provides the essential baseline for rigorous decision-making, systematic execution, and quality assurance. Without a clear command of this concept, practitioners risk costly errors, suboptimal outcomes, and regulatory compliance failures.
-
-## 3. Core Mechanics & Architecture
-- **First-Principles Analysis:** Deconstruct complex scenarios into verified axioms before proposing interventions.
-- **Process Standardization:** Maintain deterministic workflows so outcomes are reproducible, auditable, and verifiable.
-- **Trade-off Modeling:** Systematically balance speed, precision, cost, and safety across all decision points.
-
-## 4. Advanced Concepts & Optimization
-- Implement defensive fallback safeguards for unexpected anomalies and high-consequence failure modes.
-- Apply continuous telemetry, error budget tracking, and statistical process controls to maintain repeatability.
-- Ensure all conclusions are backed by verifiable evidence, peer reviews, and audit documentation.
-
-## 5. Real-World Case Study
-{real_world_case}
-
-## 6. Practical Hands-On Activity
-Apply this concept immediately: Conduct a structured audit of a simulated scenario in {topic}:
-1. Identify baseline operational parameters and isolate anomalous triggers.
-2. Formulate 2 testable hypotheses and evaluate with controlled validation.
-3. Produce a structured remediation brief with measurable acceptance criteria.
-
-## 7. Common Pitfalls & Mistakes to Avoid
-- **Premature Optimization:** Bypassing statutory compliance or verification in pursuit of speed.
-- **Inadequate Telemetry:** Modifying operational parameters without recording baseline state data.
-- **Subjective Assumptions:** Relying on intuition rather than empirical metrics and standardized protocols.
-
-## 8. Next Step in Learning Progression
-Following mastery of this concept, advance to the subsequent module in your curriculum to integrate composite practical projects.
-"""
-
-    key_points = [
-        f"Master the foundational axioms, operational vocabulary, and standards of {topic}.",
-        f"Understand the primary trade-offs between speed, cost, precision, and compliance in {domain}.",
-        "Apply structured STAR and first-principles diagnostic reasoning to all evaluations.",
-        "Implement defensive safeguards, error budgets, and fallback protocols for edge cases.",
-        "Ensure all conclusions are backed by verifiable evidence and audit documentation."
-    ]
-
-    quick_revision = [
-        f"Core Axiom: {topic} is the systematic application of disciplined standards in {domain}.",
-        "Golden Rule: Never sacrifice safety, compliance, or integrity for premature optimization.",
-        "Diagnostic Rule: Isolate variables sequentially to establish direct causality.",
-        "Key Benchmark: Repeatability, error tolerance, and verifiable peer compliance."
-    ]
-
-    questions = [
-        {
-            "question": f"What is the foundational objective of {topic} in modern {domain}?",
-            "answer": f"To establish a reliable, standardized methodology that minimizes error rates, ensures statutory and procedural compliance, and delivers repeatable excellence."
-        },
-        {
-            "question": f"How should a practitioner handle conflicting constraints when implementing {topic}?",
-            "answer": "Perform a risk-weighted trade-off analysis, align with core regulatory standards, and document the rationale for stakeholder sign-off."
-        },
-        {
-            "question": f"What are the most frequent failure modes encountered in {topic}?",
-            "answer": "Inadequate preliminary validation, failure to account for edge cases, and lack of systematic error logging."
-        },
-        {
-            "question": f"How do you demonstrate mastery of {topic} during a senior technical interview?",
-            "answer": "Walk through a real-world scenario end-to-end using structured STAR methodology, quantifying trade-offs, edge-case mitigation, and post-implementation telemetry."
-        }
-    ]
-
-    flashcards = [
-        {
-            "front": f"Core Definition: {topic}",
-            "back": f"The standardized, evidence-based methodology governing {domain} operations."
-        },
-        {
-            "front": "Primary Diagnostic Rule",
-            "back": "Isolate variables systematically and test hypotheses under controlled conditions."
-        },
-        {
-            "front": "Risk vs Performance Trade-off",
-            "back": "Prioritize regulatory compliance and safety before optimizing speed or cost."
-        },
-        {
-            "front": "Edge-Case Safeguard",
-            "back": "Implement graceful degradation and fallback procedures for unexpected anomalies."
-        }
-    ]
-
-    quiz = [
-        {
-            "id": "Q1",
-            "question": f"What is the primary benefit of standardizing {topic} across an organization?",
-            "options": [
-                "Minimizes variance and delivers repeatable quality",
-                "Eliminates the need for ongoing employee training",
-                "Removes all operational costs immediately",
-                "Prevents any future changes from being made"
-            ],
-            "correctAnswer": 0,
-            "explanation": "Standardization ensures predictable outcomes, reduces defect rates, and facilitates auditing."
-        },
-        {
-            "id": "Q2",
-            "question": f"When troubleshooting an anomaly in {topic}, what should be executed first?",
-            "options": [
-                "Log the state and isolate the immediate trigger before modifying parameters",
-                "Restart all systems immediately without recording error dumps",
-                "Double the workload to test maximum stress limits",
-                "Ignore the notification if standard traffic seems unaffected"
-            ],
-            "correctAnswer": 0,
-            "explanation": "State capture and isolation are essential prerequisites for root-cause analysis."
-        },
-        {
-            "id": "Q3",
-            "question": f"In {domain}, what is the recommended protocol when confronting ambiguous edge cases in {topic}?",
-            "options": [
-                "Apply defensive fallback procedures, document the scenario, and seek cross-functional review",
-                "Ignore the edge case unless it impacts more than 50% of the operation",
-                "Disable monitoring alarms until the ambiguity resolves spontaneously",
-                "Override established statutory safety protocols"
-            ],
-            "correctAnswer": 0,
-            "explanation": "Defensive fallback safeguards, audit documentation, and peer review protect operational integrity."
-        },
-        {
-            "id": "Q4",
-            "question": f"Which metric provides the highest fidelity verification of mastery in {topic}?",
-            "options": [
-                "Repeatable performance on standardized assessments and verified peer evaluations",
-                "Subjective self-reported confidence without quantitative proof",
-                "Speed of task completion irrespective of error rate",
-                "The number of textbooks read on the topic"
-            ],
-            "correctAnswer": 0,
-            "explanation": "Objective assessment scores and peer review validate true technical competency."
-        },
-        {
-            "id": "Q5",
-            "question": f"What is the golden rule of trade-off evaluation in {domain}?",
-            "options": [
-                "Never sacrifice statutory safety, ethics, or compliance for premature optimization",
-                "Always choose the lowest upfront financial cost",
-                "Optimize for speed above all other operational considerations",
-                "Avoid using metrics to evaluate performance"
-            ],
-            "correctAnswer": 0,
-            "explanation": "Safety, compliance, and procedural integrity form the foundational bedrock of all disciplines."
-        }
-    ]
-
-    artifacts_payload = {
-        "summary": summary_text,
-        "detailed_notes": detailed_text,
-        "detailedNotes": detailed_text,
-        "key_points": key_points,
-        "keyPoints": key_points,
-        "revision_sheet": quick_revision,
-        "quickRevision": quick_revision,
-        "qna": questions,
-        "questions": questions,
-        "flashcards": flashcards,
-        "quiz": quiz,
-        "objectives": objectives,
-        "prerequisites": prerequisites,
-        "realWorldCase": real_world_case
-    }
-
-    return {
-        "status": "success",
-        "success": True,
-        "topic": topic,
-        "domain": domain,
+    context = {
+        "field": profile.get("field") or domain,
+        "careerGoal": profile.get("careerGoal"),
+        "targetRole": target_role,
         "level": level,
-        "summary": summary_text,
-        "detailedNotes": detailed_text,
-        "keyPoints": key_points,
-        "quickRevision": quick_revision,
-        "questions": questions,
-        "flashcards": flashcards,
-        "quiz": quiz,
-        "objectives": objectives,
-        "prerequisites": prerequisites,
-        "realWorldCase": real_world_case,
-        "artifacts": artifacts_payload,
-        "generatedAt": datetime.utcnow().isoformat()
+        "skillGaps": gaps,
+        "strengths": strengths,
+        "skillDNA": skill_dna,
+        "careerTwin": {k: memory.get(k) for k in ("overallScore", "technicalScore", "communicationScore", "weaknesses", "strengths") if memory.get(k) is not None},
+        "curriculumTopics": disc.get("curriculumTopics", []),
     }
+    prompt = f"""You are SkillDNA AI's expert instructional designer. Create genuinely educational, domain-specific notes, not generic motivational text and not a template. Determine the most appropriate subtopics, prerequisites, sequence, and difficulty from the learner context.
+Learner context JSON: {json.dumps(context, default=str)}
+Requested topic: {topic}
+Domain: {domain}
+Requested level: {level}
+Optional learner source text: {source or '(none)'}
+
+Return ONLY valid JSON with exactly these keys:
+summary (string), detailedNotes (string with headings and explanations), keyPoints (array of strings), quickRevision (array of strings), questions (array of objects with question and answer), flashcards (array of objects with front and back), quiz (array of objects with id, question, options, correctAnswer integer, explanation), objectives (array), prerequisites (array), subtopics (array of strings), difficulty (string), sequenceRationale (string), examples (array of objects with title, context, explanation), realWorldCases (array of objects with case, decision, lesson), practicalApplications (array of strings), commonMistakes (array of objects with mistake and correction), assessmentRubric (array of strings).
+
+Requirements: explain why concepts work; use terminology and examples specific to the domain; include multiple contextual examples and real-world cases; compare alternatives and trade-offs; include practical applications, common mistakes, revision, practice and assessment; sequence from prerequisites to advanced material; do not invent citations, credentials, or facts presented as verified."""
+
+    try:
+        import requests
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.55,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=45,
+        )
+        if response.status_code != 200:
+            logger.error("Groq notes request failed: %s", response.text[:500])
+            raise HTTPException(status_code=502, detail="AI notes provider failed to generate notes.")
+        raw = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        generated = json.loads(raw)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("AI notes generation failed: %s", exc)
+        raise HTTPException(status_code=502, detail="AI notes provider returned invalid content.")
+
+    required = ["summary", "detailedNotes", "keyPoints", "quickRevision", "questions", "flashcards", "quiz", "objectives", "prerequisites"]
+    missing = [key for key in required if not generated.get(key)]
+    if missing:
+        raise HTTPException(status_code=502, detail=f"AI notes response is incomplete: {', '.join(missing)}")
+    generated["topic"] = topic
+    generated["domain"] = domain
+    generated["level"] = level
+    generated["status"] = "success"
+    generated["success"] = True
+    generated["generatedAt"] = datetime.utcnow().isoformat()
+    generated["artifacts"] = {
+        "summary": generated["summary"],
+        "detailedNotes": generated["detailedNotes"],
+        "keyPoints": generated["keyPoints"],
+        "quickRevision": generated["quickRevision"],
+        "questions": generated["questions"],
+        "flashcards": generated["flashcards"],
+        "quiz": generated["quiz"],
+        "subtopics": generated.get("subtopics", []),
+        "examples": generated.get("examples", []),
+        "realWorldCases": generated.get("realWorldCases", []),
+        "practicalApplications": generated.get("practicalApplications", []),
+        "commonMistakes": generated.get("commonMistakes", []),
+        "assessmentRubric": generated.get("assessmentRubric", []),
+    }
+    return generated
 
 @router.post("/learning/notes/save")
 async def save_student_study_note(
@@ -4991,4 +4877,3 @@ async def fulfill_content_request(
         "message": "Content request marked as fulfilled.",
         "request": serialize_doc(res)
     }
-

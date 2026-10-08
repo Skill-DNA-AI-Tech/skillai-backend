@@ -422,6 +422,7 @@ class PublicCertificateVerifyResponse(BaseModel):
     issuer: Optional[str] = None
     seal: Optional[str] = None
     verificationUrl: Optional[str] = None
+    qrCode: Optional[str] = None
     scores: Optional[Dict[str, Any]] = None
     message: Optional[str] = None
 
@@ -562,4 +563,3 @@ class NotePdfExportRequest(BaseModel):
     flashcards: Optional[List[Dict[str, str]]] = []
     quiz: Optional[List[Dict[str, Any]]] = []
     artifacts: Optional[Dict[str, Any]] = None
-
