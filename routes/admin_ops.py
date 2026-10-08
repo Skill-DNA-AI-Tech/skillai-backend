@@ -4467,7 +4467,7 @@ async def generate_ai_topic_note(
     target_level = payload.studentLevel or payload.level or "Intermediate"
     domain_val = payload.domain or payload.careerDomain or "Computer Science"
 
-    # Fallback structured draft
+    # These fields are populated only by a successful provider response.
     draft_title = f"Mastery Guide: {trimmed_subtopic} in {trimmed_topic}"
     draft_overview = f"{trimmed_subtopic} is an indispensable core concept within {trimmed_topic}. Understanding its foundational mechanisms, performance characteristics, and industry patterns enables resilient system implementation."
     draft_rich_text = f"### 1. Conceptual Foundation\n{trimmed_subtopic} establishes the core structural rules governing this module.\n\n### 2. Architectural Mechanisms\nWhen executed in production environments, {trimmed_subtopic} ensures predictable resource utilization and prevents runtime anti-patterns.\n\n### 3. Industry Best Practices\n- Verify boundary cases and null safety.\n- Profile memory and CPU allocations under simulated peak loads.\n- Follow clean design principles to maintain modularity."
@@ -4492,48 +4492,51 @@ async def generate_ai_topic_note(
     from config import settings
     import os
     groq_key = getattr(settings, "groq_api_key", None) or os.getenv("GROQ_API_KEY")
-    if groq_key:
-        try:
-            import requests
-            headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
-            prompt = (
-                f"You are a world-class technical instructional designer writing official curriculum notes for SkillDNA AI.\n"
-                f"Generate comprehensive, pedagogical, and industry-grade notes for:\n"
-                f"- Domain: {domain_val}\n"
-                f"- Topic: {trimmed_topic}\n"
-                f"- Subtopic: {trimmed_subtopic}\n"
-                f"- Target Level: {target_level}\n\n"
-                f"Return ONLY valid JSON matching:\n"
-                f'{{"title": "...", "overview": "...", "richText": "...", "keyTakeaways": ["..."], "examples": "...", "resources": [{{"title": "...", "type": "youtube", "url": "...", "description": "..."}}]}}'
-            )
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=headers,
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.4,
-                    "response_format": {"type": "json_object"}
-                },
-                timeout=12
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                content_str = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                import json
-                parsed = json.loads(content_str)
-                if parsed.get("title"):
-                    draft_title = parsed.get("title", draft_title)
-                    draft_overview = parsed.get("overview", draft_overview)
-                    draft_rich_text = parsed.get("richText", draft_rich_text)
-                    if parsed.get("keyTakeaways"):
-                        draft_takeaways = parsed["keyTakeaways"]
-                    if parsed.get("examples"):
-                        draft_example = parsed["examples"]
-                    if parsed.get("resources"):
-                        draft_resources = parsed["resources"]
-        except Exception as e:
-            logger.warning(f"Groq generation fallback: {e}")
+    if not groq_key:
+        raise HTTPException(status_code=503, detail="AI notes are temporarily unavailable: GROQ_API_KEY is not configured.")
+    try:
+        import requests
+        headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+        prompt = (
+            f"You are a world-class technical instructional designer writing official curriculum notes for SkillDNA AI.\n"
+            f"Generate comprehensive, pedagogical, and industry-grade notes for:\n"
+            f"- Domain: {domain_val}\n"
+            f"- Topic: {trimmed_topic}\n"
+            f"- Subtopic: {trimmed_subtopic}\n"
+            f"- Target Level: {target_level}\n\n"
+            f"Return ONLY valid JSON matching:\n"
+            f'{{"title": "...", "overview": "...", "richText": "...", "keyTakeaways": ["..."], "examples": "...", "resources": [{{"title": "...", "type": "youtube", "url": "...", "description": "..."}}]}}'
+        )
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.4,
+                "response_format": {"type": "json_object"}
+            },
+            timeout=12
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="AI notes provider returned an error.")
+        data = resp.json()
+        content_str = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        import json
+        parsed = json.loads(content_str)
+        if not parsed.get("title"):
+            raise HTTPException(status_code=502, detail="AI notes provider returned invalid content.")
+        draft_title = parsed["title"]
+        draft_overview = parsed.get("overview", "")
+        draft_rich_text = parsed.get("richText", "")
+        draft_takeaways = parsed.get("keyTakeaways", [])
+        draft_example = parsed.get("examples", "")
+        draft_resources = parsed.get("resources", [])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AI notes generation failed: {e}")
+        raise HTTPException(status_code=502, detail="AI notes generation failed.") from e
 
     return {
         "domain": domain_val,
