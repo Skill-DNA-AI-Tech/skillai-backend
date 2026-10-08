@@ -76,7 +76,7 @@ app.get('/api/verify/:certificateId', async (req, res) => {
     }
 
     if (certificate.status !== 'APPROVED') {
-      res.status(400).json({ error: 'This certificate is not officially approved yet.', valid: false, verified: false });
+      res.status(409).json({ error: 'This certificate is not officially approved yet.', valid: false, verified: false });
       return;
     }
 
@@ -89,6 +89,7 @@ app.get('/api/verify/:certificateId', async (req, res) => {
       message: 'Certificate is authentic and valid',
       valid: true,
       verified: true,
+      verificationUrl: certificate.verificationUrl,
       certificate,
     });
   } catch (error: any) {

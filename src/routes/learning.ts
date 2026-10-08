@@ -376,92 +376,69 @@ router.get('/analytics/overview', protect, authorize('admin', 'employee', 'staff
   });
 }));
 
-// POST /api/learning/notes/generate - Admin-only note generation endpoint (Students cannot freely generate customized notes themselves)
-router.post('/notes/generate', protect, authorize('admin', 'employee', 'staff'), asyncHandler(async (req: AuthRequest, res) => {
-  const { topic, subtopic, domain, careerDomain, level = 'Intermediate' } = req.body;
-  if (!topic) {
-    res.status(400).json({ message: 'Topic is required to generate notes.' });
+// POST /api/learning/notes/generate - Student-authorized, profile-aware AI learning notes.
+// The student grants permission by invoking this endpoint; the server derives the learning design context.
+router.post('/notes/generate', protect, asyncHandler(async (req: AuthRequest, res) => {
+  const role = normalizeRole(req.user?.role, req.user?.email);
+  if (!['STUDENT', 'MAIN_ADMIN', 'ADMIN', 'SUPPORT_TEAM'].includes(role)) {
+    res.status(403).json({ message: 'Only students and authorized administrators can generate learning notes.' });
     return;
   }
 
-  const prompt = `You are a world-class technical educator and instructional designer.
-Generate structured, pedagogical study notes for:
-Topic: ${topic}
-Subtopic: ${subtopic || 'General'}
-Domain: ${domain || careerDomain || 'Computer Science'}
-Target Knowledge Level: ${level}
+  const profile = await Profile.findOne({ user: req.user._id }).lean();
+  const careerTwin = await CareerTwinMemory.findOne({
+    $or: [{ userId: req.user._id }, { user: req.user._id }],
+  }).lean();
+  const career = String((profile as any)?.career || req.user.careerDomain || req.body.careerDomain || 'Career Development');
+  const domain = String((profile as any)?.domain || req.body.domain || 'Computer Science');
+  const targetRole = String((profile as any)?.preferredRoles?.[0] || req.user.targetRole || 'Specialist');
+  const weaknesses = ((careerTwin as any)?.weaknesses || (careerTwin as any)?.weakAreas || (profile as any)?.skillDNA?.weaknesses || []).slice(0, 8);
+  const strengths = ((careerTwin as any)?.strengths || (profile as any)?.skillDNA?.strengths || []).slice(0, 8);
+  const curriculum = resolveCurriculum(career);
+  const firstTopic = curriculum.topics?.[0];
+  const topic = String(req.body.topic || weaknesses[0] || firstTopic?.name || career).trim();
+  const subtopic = String(req.body.subtopic || firstTopic?.subtopics?.[0] || 'Core principles').trim();
+  const level = String(req.body.level || (profile as any)?.experienceLevel || 'Intermediate').trim();
 
-Return ONLY a valid JSON object strictly matching this schema:
+  const prompt = `You are SkillDNA AI's domain-specific instructional designer. Create one original, technically accurate learning module for a real student.
+Student context:
+- Career: ${career}
+- Target role: ${targetRole}
+- Domain: ${domain}
+- Level: ${level}
+- Diagnosed gaps: ${weaknesses.length ? weaknesses.join(', ') : 'No recorded gaps; diagnose likely prerequisites from the topic'}
+- Strengths: ${strengths.length ? strengths.join(', ') : 'Not yet established'}
+Requested focus: ${topic} / ${subtopic}
+
+Do not produce generic motivational prose, placeholders, repeated wording, or content that could apply unchanged to another domain. Use the actual domain vocabulary, realistic tools/workflows, trade-offs, and a case study relevant to ${targetRole}. Explain why each idea works and explicitly bridge prerequisites to the next concept.
+Return ONLY valid JSON with this exact shape:
 {
-  "topic": "${topic}",
-  "subtopic": "${subtopic || 'General'}",
-  "level": "${level}",
-  "commonMistakes": ["Common mistake 1 and why it happens", "Common mistake 2 and how to avoid it"],
-  "keyTakeaways": ["Key point 1", "Key point 2", "Key point 3"],
-  "miniAssessment": [
-    {
-      "question": "Question 1 testing core intuition",
-      "options": ["Option A", "Option B", "Option C", "Option D"],
-      "answer": "Option A",
-      "explanation": "Why Option A is correct"
-    },
-    {
-      "question": "Question 2 testing practical application",
-      "options": ["Option A", "Option B", "Option C", "Option D"],
-      "answer": "Option B",
-      "explanation": "Why Option B is correct"
-    }
-  ]
-}`;
+  "topic": "...", "subtopic": "...", "domain": "...", "career": "...", "level": "...",
+  "prerequisites": [{"topic":"...","why":"...","readinessCheck":"..."}],
+  "learningSequence": [{"order":1,"title":"...","difficulty":"FOUNDATION|WORKING|ADVANCED","whyNow":"..."}],
+  "overview": "...", "explanation": "...",
+  "examples": [{"title":"...","context":"...","walkthrough":"...","expectedOutcome":"..."}],
+  "realWorldCase": {"scenario":"...","decision":"...","tradeoffs":"...","lesson":"..."},
+  "comparison": [{"optionA":"...","optionB":"...","whenToUse":"...","costOrRisk":"..."}],
+  "practicalApplications": ["..."],
+  "commonMistakes": [{"mistake":"...","whyItHappens":"...","correction":"..."}],
+  "quickRevision": ["..."],
+  "practice": [{"prompt":"...","hint":"...","successCriteria":"..."}],
+  "assessment": [{"question":"...","options":["...","...","...","..."],"answer":"...","explanation":"..."}],
+  "nextStep": "..."
+}
+Use at least 3 contextual examples, 2 comparisons, 4 mistakes, 5 revision points, 3 practice tasks, and 5 assessment questions. Keep every item specific to ${domain} and ${career}.`;
 
   try {
     const aiResponse = await groqRequest({ prompt });
-    const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
-      res.json(parsed);
-      return;
-    }
-  } catch (err) {
-    console.warn('AI notes generation failed, using structured template fallback:', err);
+    const jsonMatch = String(aiResponse).match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('AI returned no structured learning module');
+    const parsed = JSON.parse(jsonMatch[0]);
+    res.json({ ...parsed, generatedFor: { career, targetRole, domain, level, weaknesses } });
+  } catch (error: any) {
+    console.error('AI notes generation failed:', error);
+    res.status(502).json({ message: 'AI notes could not be generated. No placeholder content was returned.', code: 'AI_NOTES_UNAVAILABLE' });
   }
-
-  // Structured fallback
-  res.json({
-    topic,
-    level,
-    overview: `${topic} is a critical core concept in ${careerDomain || 'the field'}. Mastery of this topic requires understanding foundational principles, execution mechanisms, and common operational edge cases.`,
-    importantConcepts: [
-      `Foundational Theory: Core mathematical and conceptual definition of ${topic}.`,
-      `Implementation Architecture: How ${topic} is integrated into real-world pipelines.`,
-      `Performance & Trade-offs: Resource efficiency, latency, and boundary limits.`,
-    ],
-    simpleExplanation: `Think of ${topic} like a well-organized workflow coordinator that ensures resources are routed efficiently without collisions or bottlenecks.`,
-    concreteExamples: `// Practical Example for ${topic}\nfunction demonstrate${topic.replace(/[^a-zA-Z]/g, '')}() {\n  // 1. Initialize configuration\n  const context = { ready: true, domain: "${careerDomain || 'Engineering'}" };\n  // 2. Execute process\n  return context;\n}`,
-    practicalApplication: `In real-world engineering teams, ${topic} is used to optimize reliability and prevent regressions in production deployments.`,
-    commonMistakes: [
-      `Neglecting edge cases and boundary validation before executing core logic.`,
-      `Assuming uniform performance across varying load conditions without benchmarking.`,
-    ],
-    keyTakeaways: [
-      `Always understand the fundamental first principles before optimizing.`,
-      `Test edge cases and validate state transitions under stress.`,
-      `Document assumptions clearly for cross-functional collaborators.`,
-    ],
-    miniAssessment: [
-      {
-        question: `What is the primary objective of studying ${topic}?`,
-        options: [
-          `To build scalable and resilient domain solutions`,
-          `To bypass architectural requirements`,
-          `To eliminate the need for testing`,
-          `To increase system latency`,
-        ],
-        answer: `To build scalable and resilient domain solutions`,
-        explanation: `Understanding ${topic} ensures high-standard implementation and robust system design.`,
-      },
-    ],
-  });
 }));
 
 // CONTROLLED APPLICATION NAVIGATION MAP

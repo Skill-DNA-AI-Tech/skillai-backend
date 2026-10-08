@@ -200,61 +200,37 @@ Return ONLY a valid JSON object matching this schema:
   ]
 }`;
 
-  let parsed: any = null;
   try {
     const aiResponse = await groqRequest({ prompt });
-    const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      parsed = JSON.parse(jsonMatch[0]);
-    }
-  } catch (err) {
-    console.warn('AI note generation failed, using structured template fallback:', err);
-  }
-
-  if (!parsed) {
-    parsed = {
-      title: `Mastery Guide: ${trimmedSubtopic} in ${trimmedTopic}`,
-      overview: `${trimmedSubtopic} is an indispensable core concept within ${trimmedTopic}. Understanding its foundational mechanisms, performance characteristics, and industry patterns enables resilient system implementation.`,
-      richText: `### 1. Conceptual Foundation\n${trimmedSubtopic} establishes the core structural rules governing this module.\n\n### 2. Architectural Mechanisms\nWhen executed in production environments, ${trimmedSubtopic} ensures predictable resource utilization and prevents runtime anti-patterns.\n\n### 3. Industry Best Practices\n- Verify boundary cases and null safety.\n- Profile memory and CPU allocations under simulated peak loads.\n- Follow clean design principles to maintain modularity.`,
-      keyTakeaways: [
-        `Master fundamental principles before applying optimizations.`,
-        `Recognize common edge cases and implement graceful fallbacks.`,
-        `Maintain modular separation of concerns.`,
-        `Write automated unit tests verifying contract invariants.`,
-      ],
-      examples: `// Practical demonstration for ${trimmedSubtopic}\npublic class ${trimmedSubtopic.replace(/[^a-zA-Z]/g, '')}Example {\n    public static void main(String[] args) {\n        System.out.println("Executing verified pattern for: ${trimmedSubtopic}");\n    }\n}`,
-      resources: [
-        {
-          title: `${trimmedSubtopic} Complete Video Walkthrough`,
-          type: 'youtube',
-          url: `https://www.youtube.com/results?search_query=${encodeURIComponent(trimmedTopic + ' ' + trimmedSubtopic + ' tutorial')}`,
-          description: `Detailed video guide explaining ${trimmedSubtopic} step-by-step.`,
-        },
-      ],
-    };
-  }
-
-  const responsePayload = {
-    domain: domain || 'Computer Science',
-    topic: trimmedTopic,
-    subtopic: trimmedSubtopic,
-    title: parsed.title || `Mastery Guide: ${trimmedSubtopic} in ${trimmedTopic}`,
-    overview: parsed.overview || '',
-    richText: parsed.richText || '',
-    keyTakeaways: parsed.keyTakeaways || [],
-    examples: parsed.examples || '',
-    resources: parsed.resources || [],
-    notes: {
-      title: parsed.title || `Mastery Guide: ${trimmedSubtopic} in ${trimmedTopic}`,
-      content: parsed.richText || parsed.overview || '',
+    const jsonMatch = String(aiResponse).match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('AI returned no structured note');
+    const parsed = JSON.parse(jsonMatch[0]);
+    const responsePayload = {
+      domain: domain || 'Computer Science',
+      topic: trimmedTopic,
+      subtopic: trimmedSubtopic,
+      title: parsed.title || `${trimmedSubtopic} in ${trimmedTopic}`,
+      overview: parsed.overview || '',
+      richText: parsed.richText || '',
       keyTakeaways: parsed.keyTakeaways || [],
-      codeExamples: parsed.examples ? [parsed.examples] : [],
+      examples: parsed.examples || '',
       resources: parsed.resources || [],
-    },
-  };
-
-  res.json(responsePayload);
+      notes: {
+        title: parsed.title || `${trimmedSubtopic} in ${trimmedTopic}`,
+        content: parsed.richText || parsed.overview || '',
+        keyTakeaways: parsed.keyTakeaways || [],
+        codeExamples: parsed.examples ? [parsed.examples] : [],
+        resources: parsed.resources || [],
+      },
+    };
+    res.json(responsePayload);
+  } catch (err) {
+    console.error('AI note generation failed:', err);
+    res.status(502).json({ message: 'AI note generation is unavailable. No placeholder content was returned.', code: 'AI_NOTES_UNAVAILABLE' });
+  }
 });
+
+
 
 router.post('/ai-generate', protect, handleAiGenerate);
 router.post('/generate-ai', protect, handleAiGenerate);

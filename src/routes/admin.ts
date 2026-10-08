@@ -508,6 +508,21 @@ router.patch('/students/:id/status', asyncHandler(async (req: AuthRequest, res) 
   });
 }));
 
+// DELETE is intentionally non-destructive: student removal deactivates the account and preserves audit/history.
+router.delete('/students/:id', asyncHandler(async (req: AuthRequest, res) => {
+  const student = await User.findOneAndUpdate(
+    { _id: req.params.id, role: { $in: studentRoles } },
+    { status: 'DISABLED', disabled_at: new Date() },
+    { new: true }
+  );
+  if (!student) {
+    res.status(404).json({ message: 'Student account not found or cannot modify non-student accounts.' });
+    return;
+  }
+  await writeAuditLog(req, 'ADMIN_STUDENT_DEACTIVATED', 'User', student._id.toString(), { email: student.email });
+  res.json({ message: `Student account ${student.name} has been deactivated.`, student: serializeUserAccount(student) });
+}));
+
 // POST /api/admin/certificates/issue - Admin creates and issues verified certificate to student
 router.post('/certificates/issue', asyncHandler(async (req: AuthRequest, res) => {
   const {
@@ -533,7 +548,7 @@ router.post('/certificates/issue', asyncHandler(async (req: AuthRequest, res) =>
   }
 
   const student = await User.findById(studentId);
-  if (!student) {
+  if (!student || normalizeRole(student.role, student.email) !== 'STUDENT') {
     res.status(404).json({ message: 'Selected student not found.' });
     return;
   }

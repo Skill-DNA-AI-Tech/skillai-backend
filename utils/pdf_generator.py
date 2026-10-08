@@ -55,6 +55,21 @@ class NumberedCanvasWithWatermark(canvas.Canvas):
     def draw_decorations(self, page_count: int):
         page_w, page_h = letter
 
+        # Official SkillDNA AI Learning mark: vector-built so PDFs do not depend on a missing web asset.
+        self.saveState()
+        self.setFillColor(colors.HexColor("#0284c7"))
+        self.circle(63, page_h - 32, 9, stroke=0, fill=1)
+        self.setStrokeColor(colors.white)
+        self.setLineWidth(1.2)
+        self.line(59, page_h - 32, 63, page_h - 27)
+        self.line(63, page_h - 27, 67, page_h - 32)
+        self.line(59, page_h - 32, 63, page_h - 37)
+        self.line(63, page_h - 37, 67, page_h - 32)
+        self.setFillColor(colors.HexColor("#0f172a"))
+        self.setFont("Helvetica-Bold", 8)
+        self.drawString(77, page_h - 35, "SKILLDNA AI LEARNING")
+        self.restoreState()
+
         # 1. Background Watermark (Rendered below text)
         wm = self.watermark_settings or {}
         wm_enabled = wm.get("enabled", True)
@@ -91,7 +106,7 @@ class NumberedCanvasWithWatermark(canvas.Canvas):
             self.saveState()
             self.setFont("Helvetica-Bold", 8)
             self.setFillColor(colors.HexColor("#0284c7"))
-            self.drawString(54, page_h - 36, "SKILLDNA AI")
+            self.drawString(77, page_h - 48, "SKILLDNA AI")
 
             self.setFont("Helvetica", 8)
             self.setFillColor(colors.HexColor("#64748b"))

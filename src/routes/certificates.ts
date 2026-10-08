@@ -122,10 +122,11 @@ router.post(
     });
 
     if (existingActiveCert) {
-      res.status(400).json({
-        error: `An active certificate (${existingActiveCert.certificateId}) has already been issued to you for '${careerPath}'. Duplicate certificates are not permitted.`,
+      res.status(200).json({
+        message: 'The existing authoritative certificate was returned.',
         certificate: existingActiveCert,
         certificateId: existingActiveCert.certificateId,
+        certificateNumber: existingActiveCert.certificateId,
       });
       return;
     }
@@ -238,12 +239,38 @@ router.get(
       return;
     }
 
+    if (!isAdminRole(req.user.role, req.user.email) && req.params.studentId !== req.user._id.toString()) {
+      res.status(403).json({ error: 'You do not have access to this student certificate list' });
+      return;
+    }
+
     const certificates = await Certificate.find({
       studentId: req.params.studentId,
       isActive: true,
     }).sort({ issueDate: -1 });
 
     res.status(200).json(certificates);
+  })
+);
+
+// Get one certificate from the authoritative MongoDB record. This never creates or regenerates a certificate.
+router.get(
+  '/:certificateId',
+  protect,
+  asyncHandler(async (req: AuthRequest, res: Response) => {
+    const certificate = await Certificate.findOne({ certificateId: req.params.certificateId, isActive: true });
+    if (!certificate) {
+      res.status(404).json({ error: 'Certificate not found' });
+      return;
+    }
+
+    const isAdmin = isAdminRole(req.user?.role, req.user?.email);
+    if (!isAdmin && certificate.studentId.toString() !== req.user?._id.toString()) {
+      res.status(403).json({ error: 'You do not have access to this certificate' });
+      return;
+    }
+
+    res.json(certificate);
   })
 );
 
@@ -260,6 +287,11 @@ router.get(
 
     if (!certificate) {
       res.status(404).json({ error: 'Certificate not found or has been revoked.', valid: false, verified: false });
+      return;
+    }
+
+    if (certificate.status !== 'APPROVED') {
+      res.status(409).json({ error: 'This certificate is not approved.', valid: false, verified: false });
       return;
     }
 
@@ -294,6 +326,7 @@ router.get(
         improvements: certificate.improvements,
         status: certificate.status,
         qrCode: certificate.qrCode,
+        verificationUrl: certificate.verificationUrl,
         issuedByName: certificate.issuedByName || 'SkillDNA AI Certification Authority',
         adminSignatureBase64: certificate.adminSignatureBase64,
         adminRemark: certificate.adminRemark || certificate.officialRemark || '',
@@ -461,7 +494,7 @@ router.get(
         },
         body: JSON.stringify({
           certificate: certificate.toObject(),
-          verifyUrl: `${env.appBaseUrl}/certificate`,
+          verifyUrl: certificate.verificationUrl,
         }),
       });
 
@@ -1006,4 +1039,3 @@ router.get(
 );
 
 export default router;
-
