@@ -349,6 +349,20 @@ def build_notes_pdf(
     story.append(meta_table)
     story.append(Spacer(1, 12))
 
+    # Long study guides get a readable contents overview before the detailed sections.
+    if len(detailed_notes) > 1200 or len(questions) >= 3 or len(quiz) >= 3:
+        contents = [
+            "1. Executive Summary & Learning Objectives",
+            "2. Core Concepts & Theoretical Mechanics",
+            "3. High-Yield Key Points",
+            "4. Quick Revision Sheet",
+            "5. Practice Questions & Worked Examples",
+            "6. Assessment and Mastery Check",
+        ]
+        story.append(Paragraph("Contents", section_heading))
+        story.append(Paragraph("<br/>".join(f"{idx + 1}. {sanitize_pdf_text(item.split('. ', 1)[1])}" for idx, item in enumerate(contents)), body_style))
+        story.append(Spacer(1, 6))
+
     # Divider
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#0284c7"), spaceAfter=10))
 

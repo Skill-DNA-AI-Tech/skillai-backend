@@ -450,6 +450,8 @@ class AINotesGenerateRequest(BaseModel):
     detail_level: Optional[str] = "comprehensive"
     sourceText: Optional[str] = None
     level: Optional[str] = "Intermediate"
+    language: Optional[str] = "en"
+    curriculumVersion: Optional[str] = "v1"
 
 class StudentNoteSaveRequest(BaseModel):
     topic: str
@@ -463,6 +465,10 @@ class StudentNoteSaveRequest(BaseModel):
     questions: Optional[List[Dict[str, Any]]] = []
     flashcards: Optional[List[Dict[str, str]]] = []
     quiz: Optional[List[Dict[str, Any]]] = []
+    noteId: Optional[str] = None
+    sharedNoteId: Optional[str] = None
+    language: Optional[str] = "en"
+    curriculumVersion: Optional[str] = "v1"
 
 class StudentNoteUpdateRequest(BaseModel):
     topic: Optional[str] = None

@@ -65,6 +65,7 @@ reports_collection = db["reports"]
 assessments_collection = db["assessments"]
 helpdesk_tickets_collection = db["helpdesk_tickets"]
 student_notes_collection = db["student_notes"]
+student_note_progress_collection = db["student_note_progress"]
 career_change_requests_collection = db["career_change_requests"]
 topic_notes_collection = db["topic_notes"]
 content_requests_collection = db["contentrequests"]
@@ -93,6 +94,11 @@ async def init_db():
         await certificates_collection.create_index([("certificateId", 1), ("isCurrentVersion", -1)])
         # Topic notes lookup index
         await topic_notes_collection.create_index([("domain", 1), ("topic", 1), ("subtopic", 1)])
+        # One canonical shared AI note per curriculum identity; sparse preserves existing admin notes.
+        await topic_notes_collection.create_index("canonicalKey", unique=True, sparse=True)
+        # A student may save/bookmark a canonical note once; progress is always separate from content.
+        await student_notes_collection.create_index([("userId", 1), ("sharedNoteId", 1)], unique=True, partialFilterExpression={"sharedNoteId": {"$exists": True}})
+        await student_note_progress_collection.create_index([("userId", 1), ("noteId", 1)], unique=True)
         logger.info("MongoDB indexes created successfully on unified database: %s", db_name)
 
         from auth_handler import get_password_hash

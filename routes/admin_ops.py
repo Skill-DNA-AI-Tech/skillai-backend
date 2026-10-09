@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import io
 import csv
 import uuid
@@ -33,6 +34,7 @@ from database import (
     audit_logs_collection,
     helpdesk_tickets_collection,
     student_notes_collection,
+    student_note_progress_collection,
     career_change_requests_collection,
     topic_notes_collection,
     content_requests_collection,
@@ -118,6 +120,21 @@ CANONICAL_FRONTEND_URL = os.getenv(
 
 def canonical_certificate_url(certificate_id: str) -> str:
     return f"{CANONICAL_FRONTEND_URL}/verify/{certificate_id}"
+
+
+def canonical_note_key(domain: str, topic: str, subtopic: str = "General", language: str = "en", curriculum_version: str = "v1") -> str:
+    def clean(value: str) -> str:
+        return re.sub(r"\s+", " ", (value or "").strip().lower())
+    return "|".join([clean(domain), clean(topic), clean(subtopic), clean(language), clean(curriculum_version)])
+
+
+def shared_note_response(note: dict) -> dict:
+    response = serialize_doc({k: v for k, v in note.items() if k not in {"pdfCache", "pdfCacheUpdatedAt"}})
+    response["noteId"] = response.get("_id")
+    response["sharedNoteId"] = response.get("_id")
+    response["success"] = True
+    response["status"] = "success"
+    return response
 
 
 def serialize_doc(doc: Any) -> Any:
@@ -3192,10 +3209,43 @@ async def generate_ai_study_notes(
     if not topic:
         topic = (disc.get("curriculumTopics") or [["Core competency"]])[0][0]
     source = (payload.sourceText or "").strip()
+    language = (payload.language or "en").strip().lower()
+    curriculum_version = (payload.curriculumVersion or "v1").strip()
+    canonical_key = canonical_note_key(domain, topic, "General", language, curriculum_version)
+
+    existing_shared = await topic_notes_collection.find_one({"canonicalKey": canonical_key, "status": "Published"})
+    if existing_shared:
+        return shared_note_response(existing_shared)
 
     groq_key = os.getenv("GROQ_API_KEY")
     if not groq_key:
         raise HTTPException(status_code=503, detail="AI notes are temporarily unavailable: GROQ_API_KEY is not configured.")
+
+    now = datetime.utcnow()
+    generation_lock = {
+        "canonicalKey": canonical_key,
+        "noteKind": "shared_ai",
+        "status": "Generating",
+        "domain": domain,
+        "topic": topic,
+        "subtopic": "General",
+        "language": language,
+        "curriculumVersion": curriculum_version,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    try:
+        lock_result = await topic_notes_collection.insert_one(generation_lock)
+        generation_lock["_id"] = lock_result.inserted_id
+    except Exception as exc:
+        if "duplicate key" not in str(exc).lower() and "e11000" not in str(exc).lower():
+            raise
+        for _ in range(40):
+            await asyncio.sleep(0.5)
+            existing_shared = await topic_notes_collection.find_one({"canonicalKey": canonical_key, "status": "Published"})
+            if existing_shared:
+                return shared_note_response(existing_shared)
+        raise HTTPException(status_code=409, detail="A shared note is already being generated. Please retry shortly.")
 
     context = {
         "field": profile.get("field") or domain,
@@ -3239,14 +3289,17 @@ Requirements: explain why concepts work; use terminology and examples specific t
         raw = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
         generated = json.loads(raw)
     except HTTPException:
+        await topic_notes_collection.delete_one({"canonicalKey": canonical_key, "status": "Generating"})
         raise
     except Exception as exc:
         logger.exception("AI notes generation failed: %s", exc)
+        await topic_notes_collection.delete_one({"canonicalKey": canonical_key, "status": "Generating"})
         raise HTTPException(status_code=502, detail="AI notes provider returned invalid content.")
 
     required = ["summary", "detailedNotes", "keyPoints", "quickRevision", "questions", "flashcards", "quiz", "objectives", "prerequisites"]
     missing = [key for key in required if not generated.get(key)]
     if missing:
+        await topic_notes_collection.delete_one({"canonicalKey": canonical_key, "status": "Generating"})
         raise HTTPException(status_code=502, detail=f"AI notes response is incomplete: {', '.join(missing)}")
     generated["topic"] = topic
     generated["domain"] = domain
@@ -3269,7 +3322,32 @@ Requirements: explain why concepts work; use terminology and examples specific t
         "commonMistakes": generated.get("commonMistakes", []),
         "assessmentRubric": generated.get("assessmentRubric", []),
     }
-    return generated
+    shared_note = {
+        **generated["artifacts"],
+        "canonicalKey": canonical_key,
+        "noteKind": "shared_ai",
+        "domain": domain,
+        "topic": topic,
+        "subtopic": "General",
+        "level": level,
+        "language": language,
+        "curriculumVersion": curriculum_version,
+        "summary": generated["summary"],
+        "detailedNotes": generated["detailedNotes"],
+        "keyPoints": generated["keyPoints"],
+        "quickRevision": generated["quickRevision"],
+        "questions": generated["questions"],
+        "flashcards": generated["flashcards"],
+        "quiz": generated["quiz"],
+        "status": "Published",
+        "isAiGenerated": True,
+        "createdAt": now,
+        "updatedAt": datetime.utcnow(),
+        "publishedAt": datetime.utcnow(),
+    }
+    await topic_notes_collection.update_one({"_id": generation_lock["_id"], "status": "Generating"}, {"$set": shared_note})
+    shared_note["_id"] = generation_lock["_id"]
+    return shared_note_response(shared_note)
 
 @router.post("/learning/notes/save")
 async def save_student_study_note(
@@ -3280,19 +3358,36 @@ async def save_student_study_note(
     user = await get_authenticated_user_doc(current_user)
     u_id = user.get("_id")
 
-    summary_val = payload.summary or (payload.artifacts.get("summary") if payload.artifacts else "") or ""
-    detailed_val = payload.detailedNotes or (payload.artifacts.get("detailed_notes") or payload.artifacts.get("detailedNotes") if payload.artifacts else "") or ""
-    key_points_val = payload.keyPoints or (payload.artifacts.get("key_points") or payload.artifacts.get("keyPoints") if payload.artifacts else []) or []
-    quick_rev_val = payload.quickRevision or (payload.artifacts.get("revision_sheet") or payload.artifacts.get("quickRevision") if payload.artifacts else []) or []
-    questions_val = payload.questions or (payload.artifacts.get("qna") or payload.artifacts.get("questions") if payload.artifacts else []) or []
-    flashcards_val = payload.flashcards or (payload.artifacts.get("flashcards") if payload.artifacts else []) or []
-    quiz_val = payload.quiz or (payload.artifacts.get("quiz") if payload.artifacts else []) or []
+    shared_id = payload.sharedNoteId or payload.noteId
+    shared_note = None
+    if shared_id:
+        try:
+            shared_obj_id = ObjectId(shared_id)
+        except Exception:
+            shared_obj_id = shared_id
+        shared_note = await topic_notes_collection.find_one({"_id": shared_obj_id, "status": "Published"})
+    if not shared_note:
+        key = canonical_note_key(payload.domain or payload.discipline or "General", payload.topic, "General", payload.language or "en", payload.curriculumVersion or "v1")
+        shared_note = await topic_notes_collection.find_one({"canonicalKey": key, "status": "Published"})
+    if not shared_note:
+        raise HTTPException(status_code=409, detail="Generate or select a published shared note before saving it.")
+
+    shared_id = str(shared_note["_id"])
+    summary_val = shared_note.get("summary") or payload.summary or (payload.artifacts.get("summary") if payload.artifacts else "") or ""
+    detailed_val = shared_note.get("detailedNotes") or ""
+    key_points_val = shared_note.get("keyPoints") or []
+    quick_rev_val = shared_note.get("quickRevision") or []
+    questions_val = shared_note.get("questions") or []
+    flashcards_val = shared_note.get("flashcards") or []
+    quiz_val = shared_note.get("quiz") or []
 
     doc = {
         "userId": u_id,
-        "topic": payload.topic.strip(),
-        "domain": payload.domain or payload.discipline or "General",
-        "artifacts": payload.artifacts,
+        "sharedNoteId": shared_id,
+        "canonicalKey": shared_note.get("canonicalKey"),
+        "topic": shared_note.get("topic") or payload.topic.strip(),
+        "domain": shared_note.get("domain") or payload.domain or payload.discipline or "General",
+        "contentVersion": shared_note.get("curriculumVersion", payload.curriculumVersion or "v1"),
         "summary": summary_val,
         "detailedNotes": detailed_val,
         "keyPoints": key_points_val,
@@ -3304,11 +3399,23 @@ async def save_student_study_note(
         "updatedAt": datetime.utcnow()
     }
 
-    res = await student_notes_collection.insert_one(doc)
-    doc["_id"] = res.inserted_id
+    res = await student_notes_collection.update_one(
+        {"userId": u_id, "sharedNoteId": shared_id},
+        {"$set": {**doc, "updatedAt": datetime.utcnow()}, "$setOnInsert": {"createdAt": datetime.utcnow()}},
+        upsert=True,
+    )
+    saved = await student_notes_collection.find_one({"userId": u_id, "sharedNoteId": shared_id})
+    doc = saved or doc
+    await student_note_progress_collection.update_one(
+        {"userId": u_id, "noteId": shared_id},
+        {"$setOnInsert": {"userId": u_id, "noteId": shared_id, "createdAt": datetime.utcnow()}, "$set": {"updatedAt": datetime.utcnow()}},
+        upsert=True,
+    )
     serialized = serialize_doc(doc)
     serialized["success"] = True
-    serialized["note_id"] = str(res.inserted_id)
+    serialized["note_id"] = str(doc.get("_id"))
+    serialized["sharedNoteId"] = shared_id
+    serialized["sharedContent"] = shared_note_response(shared_note)
     return serialized
 
 @router.get("/learning/notes/my")
@@ -3316,7 +3423,17 @@ async def get_my_study_notes(current_user: dict = Depends(get_current_user)):
     """Retrieve all study notes saved by the logged-in student (Authenticated user)."""
     user = await get_authenticated_user_doc(current_user)
     notes = await student_notes_collection.find({"userId": user.get("_id")}).sort("updatedAt", -1).to_list(100)
-    return [serialize_doc(n) for n in notes]
+    result = []
+    for note in notes:
+        if note.get("sharedNoteId"):
+            shared = await topic_notes_collection.find_one({"_id": ObjectId(note["sharedNoteId"]) if ObjectId.is_valid(str(note["sharedNoteId"])) else note["sharedNoteId"]})
+            if shared:
+                merged = shared_note_response(shared)
+                merged.update({"_id": str(note.get("_id")), "id": str(note.get("_id")), "sharedNoteId": note.get("sharedNoteId"), "savedAt": note.get("updatedAt")})
+                result.append(merged)
+                continue
+        result.append(serialize_doc(note))
+    return result
 
 @router.put("/learning/notes/{id}")
 async def update_my_study_note(
@@ -3379,10 +3496,16 @@ async def submit_note_quiz(
     note = await student_notes_collection.find_one({"_id": obj_id, "userId": u_id})
     if not note:
         raise HTTPException(status_code=404, detail="Study note not found")
+    if note.get("sharedNoteId"):
+        shared = await topic_notes_collection.find_one({"_id": ObjectId(note["sharedNoteId"]) if ObjectId.is_valid(str(note["sharedNoteId"])) else note["sharedNoteId"]})
+        if shared:
+            note = {**shared, "_id": note.get("_id"), "sharedNoteId": note.get("sharedNoteId")}
 
     quiz_items = note.get("quiz") or (note.get("artifacts", {}).get("quiz") if isinstance(note.get("artifacts"), dict) else []) or []
     answers = payload.answers or {}
-    total = len(quiz_items) or len(answers) or 2
+    if not quiz_items:
+        raise HTTPException(status_code=422, detail="This shared note has no assessment questions.")
+    total = len(quiz_items)
     correct = 0
 
     for idx, item in enumerate(quiz_items):
@@ -3396,10 +3519,7 @@ async def submit_note_quiz(
         if chosen is not None and int(chosen) == int(correct_idx):
             correct += 1
 
-    if not quiz_items and answers:
-        correct = max(1, total - 1)
-
-    score = round((correct / total) * 100) if total > 0 else 85
+    score = round((correct / total) * 100)
     passed = score >= 70
 
     if passed:
@@ -3493,12 +3613,25 @@ async def download_student_note_pdf(
     is_admin = bool(user.get("role") in ["ADMIN", "MAIN_ADMIN"] or user.get("isAdmin"))
     if not is_owner and not is_admin:
         raise HTTPException(status_code=403, detail="Not authorized to access this study guide")
+    shared_note_doc = None
+    if note.get("sharedNoteId"):
+        shared = await topic_notes_collection.find_one({"_id": ObjectId(note["sharedNoteId"]) if ObjectId.is_valid(str(note["sharedNoteId"])) else note["sharedNoteId"]})
+        if shared:
+            shared_note_doc = shared
+            note = {**shared, "_id": note.get("_id"), "sharedNoteId": note.get("sharedNoteId")}
 
     wm_settings = await get_active_watermark_dict()
     student_name = user.get("name") or "SkillDNA Candidate"
 
     try:
-        pdf_bytes = build_notes_pdf(note, watermark_settings=wm_settings, student_name=student_name)
+        pdf_bytes = shared_note_doc.get("pdfCache") if shared_note_doc else None
+        if not pdf_bytes:
+            pdf_bytes = build_notes_pdf(note, watermark_settings=wm_settings, student_name=student_name)
+            if shared_note_doc:
+                await topic_notes_collection.update_one(
+                    {"_id": shared_note_doc["_id"], "updatedAt": shared_note_doc.get("updatedAt")},
+                    {"$set": {"pdfCache": pdf_bytes, "pdfCacheUpdatedAt": datetime.utcnow()}},
+                )
     except Exception as e:
         logger.error(f"Error compiling study note PDF: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to generate study guide PDF: {str(e)}")
@@ -4467,26 +4600,10 @@ async def generate_ai_topic_note(
     target_level = payload.studentLevel or payload.level or "Intermediate"
     domain_val = payload.domain or payload.careerDomain or "Computer Science"
 
-    # These fields are populated only by a successful provider response.
-    draft_title = f"Mastery Guide: {trimmed_subtopic} in {trimmed_topic}"
-    draft_overview = f"{trimmed_subtopic} is an indispensable core concept within {trimmed_topic}. Understanding its foundational mechanisms, performance characteristics, and industry patterns enables resilient system implementation."
-    draft_rich_text = f"### 1. Conceptual Foundation\n{trimmed_subtopic} establishes the core structural rules governing this module.\n\n### 2. Architectural Mechanisms\nWhen executed in production environments, {trimmed_subtopic} ensures predictable resource utilization and prevents runtime anti-patterns.\n\n### 3. Industry Best Practices\n- Verify boundary cases and null safety.\n- Profile memory and CPU allocations under simulated peak loads.\n- Follow clean design principles to maintain modularity."
-    draft_takeaways = [
-        "Master fundamental principles before applying optimizations.",
-        "Recognize common edge cases and implement graceful fallbacks.",
-        "Maintain modular separation of concerns.",
-        "Write automated unit tests verifying contract invariants."
-    ]
-    safe_identifier = re.sub(r'[^a-zA-Z]', '', trimmed_subtopic) or "Concept"
-    draft_example = f"// Practical demonstration for {trimmed_subtopic}\npublic class {safe_identifier}Example {{\n    public static void main(String[] args) {{\n        System.out.println(\"Executing verified pattern for: {trimmed_subtopic}\");\n    }}\n}}"
-    draft_resources = [
-        {
-            "title": f"{trimmed_subtopic} Complete Video Walkthrough",
-            "type": "youtube",
-            "url": f"https://www.youtube.com/results?search_query={trimmed_topic.replace(' ', '+')}+{trimmed_subtopic.replace(' ', '+')}+tutorial",
-            "description": f"Detailed video guide explaining {trimmed_subtopic} step-by-step."
-        }
-    ]
+    draft_title = draft_overview = draft_rich_text = None
+    draft_takeaways = []
+    draft_example = ""
+    draft_resources = []
 
     # Attempt LLM call if Groq API key is present
     from config import settings
@@ -4524,7 +4641,7 @@ async def generate_ai_topic_note(
         content_str = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         import json
         parsed = json.loads(content_str)
-        if not parsed.get("title"):
+        if not parsed.get("title") or not parsed.get("overview") or not parsed.get("richText"):
             raise HTTPException(status_code=502, detail="AI notes provider returned invalid content.")
         draft_title = parsed["title"]
         draft_overview = parsed.get("overview", "")
