@@ -2953,7 +2953,7 @@ async def get_active_curriculum(current_user: dict = Depends(get_current_user)):
     modules = [
         {
             "moduleNumber": (idx // 2) + 1,
-            "title": f"Module {(idx // 2) + 1}: {topics_progress[idx]["name"]}",
+            "title": f"Module {(idx // 2) + 1}: {topics_progress[idx]['name']}",
             "topics": topics_progress[idx:idx + 2],
         }
         for idx in range(0, total_topics, 2)
