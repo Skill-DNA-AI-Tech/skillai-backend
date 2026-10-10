@@ -42,9 +42,14 @@ import Profile from '../models/profile';
 
 router.post('/reassess/:concept', protect, asyncHandler(async (req: AuthRequest, res) => {
   const { concept } = req.params;
-  const { score = 85, answers } = req.body;
+  const { score, answers } = req.body;
+  const numericScore = Number(score);
+  if (!Number.isFinite(numericScore)) {
+    res.status(422).json({ message: 'A verified reassessment score is required.' });
+    return;
+  }
 
-  const targetScore = Math.max(0, Math.min(100, Number(score) || 85));
+  const targetScore = Math.max(0, Math.min(100, numericScore));
   const isPassed = targetScore >= 75;
 
   const twinDoc = await CareerTwinMemory.findOne({

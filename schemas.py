@@ -201,6 +201,8 @@ class AIResumeRequest(BaseModel):
 
 class LearningTopicContentRequest(BaseModel):
     topic: str = Field(..., description="Topic name to retrieve structured learning guide")
+    subtopic: Optional[str] = Field(None, description="Optional subtopic within the topic")
+    domain: Optional[str] = Field(None, description="Optional learner domain")
 
 class LearningContentRequest(BaseModel):
     topic: str = Field(..., description="Topic name to generate AI learning module")
@@ -301,7 +303,7 @@ class CertificateCreateRequest(BaseModel):
     problemSolvingScore: Optional[int] = None
     confidenceScore: Optional[int] = None
     overallScore: Optional[int] = None
-    sessionsCompleted: Optional[int] = 1
+    sessionsCompleted: Optional[int] = None
     strengths: Optional[List[str]] = None
     improvements: Optional[List[str]] = None
     adminRemark: Optional[str] = None
@@ -318,7 +320,7 @@ class CertificateShareRequest(BaseModel):
 class ReportCreateRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     profileId: Optional[str] = None
-    interviewScore: Optional[int] = 0
+    interviewScore: Optional[int] = None
 
 class ReportShareRequest(BaseModel):
     model_config = ConfigDict(extra="allow")

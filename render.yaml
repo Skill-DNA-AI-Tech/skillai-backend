@@ -28,3 +28,5 @@ services:
         value: https://skillai-frontend.team-lcoding.workers.dev
       - key: GROQ_API_KEY
         sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b

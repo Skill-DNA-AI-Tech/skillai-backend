@@ -99,6 +99,12 @@ class Settings(BaseSettings):
     resend_api_key: str = Field(
         default_factory=lambda: os.getenv("RESEND_API_KEY", "")
     )
+    groq_api_key: str = Field(
+        default_factory=lambda: os.getenv("GROQ_API_KEY", "")
+    )
+    groq_model: str = Field(
+        default_factory=lambda: os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    )
     supabase_client_id: str = Field(
         default_factory=lambda: os.getenv("SUPABASE_CLIENT_ID", "")
     )

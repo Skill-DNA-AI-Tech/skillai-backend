@@ -12,6 +12,8 @@ from typing import Optional, List, Any, Dict
 from fastapi import APIRouter, HTTPException, status, Depends, Request, Query, Response, UploadFile, File
 from bson import ObjectId
 
+from config import settings
+
 from database import (
     db,
     users_collection,
@@ -2921,8 +2923,7 @@ async def get_active_curriculum(current_user: dict = Depends(get_current_user)):
                             dna_score = v
                             break
 
-        # Baseline progression logic:
-        # If student has passed an assessment with >= 70 or interview score >= 75 or skillDNA >= 70
+        # Progress is derived only from persisted assessment/interview/Skill DNA evidence.
         if (mcq_score is not None and mcq_score >= 70) or (interview_score is not None and interview_score >= 75) or (dna_score is not None and dna_score >= 70):
             status_str = "PASSED"
             is_mastered = True
@@ -2941,14 +2942,22 @@ async def get_active_curriculum(current_user: dict = Depends(get_current_user)):
             "name": t_name,
             "subtopics": subtopics,
             "status": status_str,
-            "mcqScore": mcq_score or dna_score or (82 if is_mastered else None),
-            "interviewScore": interview_score or (80 if is_mastered else None),
+            "mcqScore": mcq_score if mcq_score is not None else dna_score,
+            "interviewScore": interview_score,
             "isMastered": is_mastered,
-            "attempts": max(attempts, 1 if (is_mastered or dna_score) else 0)
+            "attempts": attempts
         })
 
     total_topics = len(topics_progress)
     completion_pct = round((mastered_count / total_topics) * 100) if total_topics > 0 else 0
+    modules = [
+        {
+            "moduleNumber": (idx // 2) + 1,
+            "title": f"Module {(idx // 2) + 1}: {topics_progress[idx]["name"]}",
+            "topics": topics_progress[idx:idx + 2],
+        }
+        for idx in range(0, total_topics, 2)
+    ]
 
     return {
         "success": True,
@@ -2957,6 +2966,7 @@ async def get_active_curriculum(current_user: dict = Depends(get_current_user)):
         "discipline": disc["domainName"],
         "description": disc["description"],
         "topics": topics_progress,
+        "modules": modules,
         "totalTopics": total_topics,
         "masteredTopics": mastered_count,
         "completionPercentage": completion_pct
@@ -3025,7 +3035,7 @@ async def get_topic_content(
     payload: LearningTopicContentRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    return await _topic_content_response(payload.topic, None, None, current_user)
+    return await _topic_content_response(payload.topic, getattr(payload, "subtopic", None), getattr(payload, "domain", None), current_user)
 
 @router.post("/learning/request-content")
 async def request_learning_content(
@@ -3182,14 +3192,16 @@ async def submit_mcq_assessment(
     if passed:
         profile = await profiles_collection.find_one({"user": u_id}) or {}
         skill_dna = profile.get("skillDNA") or {}
-        current_tech = skill_dna.get("technicalScore", 75)
-        new_tech = min(98, max(current_tech, round(current_tech * 0.7 + score * 0.3)))
-        
+        current_tech = skill_dna.get("technicalScore")
+        new_tech = score if current_tech is None else min(98, max(float(current_tech), round(float(current_tech) * 0.7 + score * 0.3)))
+        current_overall = skill_dna.get("overallScore")
+        new_overall = new_tech if current_overall is None else round(float(current_overall) * 0.5 + new_tech * 0.5)
+
         await profiles_collection.update_one(
             {"user": u_id},
             {"$set": {
                 "skillDNA.technicalScore": new_tech,
-                "skillDNA.overallScore": min(96, round(new_tech * 0.5 + 85 * 0.5)),
+                "skillDNA.overallScore": new_overall,
                 "updatedAt": datetime.utcnow()
             }},
             upsert=True
@@ -3262,7 +3274,7 @@ async def generate_ai_study_notes(
     if existing_shared:
         return shared_note_response(existing_shared)
 
-    groq_key = os.getenv("GROQ_API_KEY")
+    groq_key = getattr(settings, "groq_api_key", None) or os.getenv("GROQ_API_KEY")
     if not groq_key:
         raise HTTPException(status_code=503, detail="AI notes are temporarily unavailable: GROQ_API_KEY is not configured.")
 
@@ -3321,8 +3333,8 @@ Requirements: explain why concepts work; use terminology and examples specific t
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
             json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{"role": "user", "content": prompt}],
+                "model": settings.groq_model,
+                "messages": [{"role": "system", "content": "Return only valid JSON. Do not include markdown fences."}, {"role": "user", "content": prompt}],
                 "temperature": 0.55,
                 "response_format": {"type": "json_object"},
             },
@@ -4292,7 +4304,7 @@ async def create_student_certificate(
         "confidenceScore": conf_score,
         "overallScore": overall_score,
         "passStatus": "PASS",
-        "sessionsCompleted": payload.sessionsCompleted or 1,
+        "sessionsCompleted": payload.sessionsCompleted if payload.sessionsCompleted is not None else 0,
         "assessmentScore": assessment_score,
         "interviewScore": overall_score,
         "completion": completion,
@@ -4659,8 +4671,6 @@ async def generate_ai_topic_note(
     draft_resources = []
 
     # Attempt LLM call if Groq API key is present
-    from config import settings
-    import os
     groq_key = getattr(settings, "groq_api_key", None) or os.getenv("GROQ_API_KEY")
     if not groq_key:
         raise HTTPException(status_code=503, detail="AI notes are temporarily unavailable: GROQ_API_KEY is not configured.")
@@ -4681,7 +4691,7 @@ async def generate_ai_topic_note(
             "https://api.groq.com/openai/v1/chat/completions",
             headers=headers,
             json={
-                "model": "llama-3.3-70b-versatile",
+                "model": settings.groq_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.4,
                 "response_format": {"type": "json_object"}
