@@ -216,6 +216,7 @@ class MCQStartRequest(BaseModel):
     topic: Optional[str] = Field("Data Structures", description="Assessment topic")
 
 class MCQSubmitRequest(BaseModel):
+    assessmentId: str
     answers: Dict[str, Any] = Field(..., description="Mapping of question IDs to selected option indices")
 
 # ==========================================
@@ -295,16 +296,19 @@ class CertificateCreateRequest(BaseModel):
     assessmentId: Optional[str] = None
     sessionId: Optional[str] = None
     careerPath: Optional[str] = "Software Engineering"
-    technicalScore: Optional[int] = 80
-    communicationScore: Optional[int] = 80
-    problemSolvingScore: Optional[int] = 80
-    confidenceScore: Optional[int] = 80
+    technicalScore: Optional[int] = None
+    communicationScore: Optional[int] = None
+    problemSolvingScore: Optional[int] = None
+    confidenceScore: Optional[int] = None
     overallScore: Optional[int] = None
     sessionsCompleted: Optional[int] = 1
     strengths: Optional[List[str]] = None
     improvements: Optional[List[str]] = None
     adminRemark: Optional[str] = None
     officialRemark: Optional[str] = None
+
+class AdminCertificateIssueRequest(CertificateCreateRequest):
+    studentId: str
 
 class CertificateShareRequest(BaseModel):
     model_config = ConfigDict(extra="allow")

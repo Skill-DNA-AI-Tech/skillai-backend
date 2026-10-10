@@ -81,6 +81,7 @@ from schemas import (
     CareerChangeRequestCreate,
     CareerChangeReviewRequest,
     CertificateCreateRequest,
+    AdminCertificateIssueRequest,
     CertificateShareRequest,
     ReportCreateRequest,
     ReportShareRequest,
@@ -116,6 +117,29 @@ CANONICAL_FRONTEND_URL = os.getenv(
     "FRONTEND_BASE_URL",
     "https://skillai-frontend.team-lcoding.workers.dev",
 ).rstrip("/")
+COMPONENT_MIN_SCORE = 50
+COMBINED_COMPLETION_SCORE = 70
+
+
+def evaluate_completion_eligibility(assessment_score: Optional[float], interview_score: Optional[float]) -> dict:
+    assessment = round(float(assessment_score), 2) if assessment_score is not None else None
+    interview = round(float(interview_score), 2) if interview_score is not None else None
+    combined = round((assessment + interview) / 2, 2) if assessment is not None and interview is not None else None
+    assessment_minimum_met = assessment is not None and assessment >= COMPONENT_MIN_SCORE
+    interview_minimum_met = interview is not None and interview >= COMPONENT_MIN_SCORE
+    combined_threshold_met = combined is not None and combined >= COMBINED_COMPLETION_SCORE
+    return {
+        "assessmentScore": assessment,
+        "interviewScore": interview,
+        "combinedScore": combined,
+        "assessmentMinimum": COMPONENT_MIN_SCORE,
+        "interviewMinimum": COMPONENT_MIN_SCORE,
+        "combinedMinimum": COMBINED_COMPLETION_SCORE,
+        "assessmentMinimumMet": assessment_minimum_met,
+        "interviewMinimumMet": interview_minimum_met,
+        "combinedThresholdMet": combined_threshold_met,
+        "eligible": bool(assessment_minimum_met and interview_minimum_met and combined_threshold_met),
+    }
 
 
 def canonical_certificate_url(certificate_id: str) -> str:
@@ -1164,6 +1188,56 @@ async def get_pending_certificates(current_admin: dict = Depends(get_current_adm
     pending = await certificates_collection.find({"status": "PENDING"}).to_list(50)
     return [serialize_doc(p) for p in pending]
 
+@router.post("/admin/certificates/issue")
+async def issue_admin_certificate(
+    payload: AdminCertificateIssueRequest,
+    current_admin: dict = Depends(get_current_admin),
+):
+    """Issue one canonical certificate for a student after checking persisted evidence."""
+    target_query: Dict[str, Any] = {"$or": [{"_id": payload.studentId}, {"email": payload.studentId}]}
+    if ObjectId.is_valid(payload.studentId):
+        target_query["$or"].append({"_id": ObjectId(payload.studentId)})
+    student = await users_collection.find_one(target_query)
+    if not student or str(student.get("role", "")).upper() != "STUDENT":
+        raise HTTPException(status_code=403, detail="Admin certificate issuance is restricted to student accounts")
+    student_id = student["_id"]
+    identity = [{"studentId": student_id}, {"studentId": str(student_id)}, {"userId": student_id}, {"userId": str(student_id)}]
+    session = await question_sessions_collection.find_one({"$or": identity, "status": "Completed"}, sort=[("endTime", -1)])
+    assessment = await assessments_collection.find_one({"$or": identity, "assessmentType": "MCQ", "status": {"$ne": "IN_PROGRESS"}}, sort=[("submittedAt", -1)])
+    if not session or not assessment:
+        raise HTTPException(status_code=409, detail="Student must have a completed interview and a verified domain assessment")
+    interview_score = session.get("overallScore") or session.get("finalReport", {}).get("overallScore")
+    assessment_score = assessment.get("overallScore") or assessment.get("score")
+    completion = evaluate_completion_eligibility(assessment_score, interview_score)
+    if not completion["eligible"]:
+        raise HTTPException(status_code=400, detail={"message": "Certificate requires 50% minimum in both components and a 70% combined average", "completion": completion})
+    career_path = session.get("careerDomain") or assessment.get("domain") or payload.careerPath or "Career Development"
+    existing = await certificates_collection.find_one({"studentId": {"$in": [student_id, str(student_id)]}, "careerPath": career_path, "isActive": True, "status": "APPROVED"})
+    if existing:
+        cert_id = existing.get("certificateId")
+        verify_url = existing.get("verificationUrl") or canonical_certificate_url(cert_id)
+        qr_url = existing.get("qrCode") or f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={verify_url}"
+        return {"message": "Existing canonical certificate returned", "certificate": serialize_doc(existing), "verificationUrl": verify_url, "qrCode": qr_url}
+    competencies = session.get("competencies") or session.get("finalReport", {}).get("competencies") or {}
+    cert_id = f"SDNA-CERT-{datetime.utcnow().year}-{uuid.uuid4().hex[:6].upper()}"
+    verify_url = canonical_certificate_url(cert_id)
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={verify_url}"
+    cert_doc = {
+        "certificateId": cert_id, "studentId": student_id, "studentName": student.get("name", "Student"),
+        "studentEmail": student.get("email"), "email": student.get("email"), "careerPath": career_path,
+        "courseName": career_path, "technicalScore": competencies.get("technical"),
+        "communicationScore": competencies.get("communication"), "problemSolvingScore": competencies.get("problemSolving"),
+        "confidenceScore": competencies.get("confidence"), "overallScore": interview_score,
+        "assessmentScore": assessment_score, "interviewScore": interview_score, "completion": completion,
+        "passStatus": "PASS", "status": "APPROVED", "isActive": True, "sharedWith": [],
+        "verificationUrl": verify_url, "qrCode": qr_url, "issuer": current_admin.get("email") or "SkillDNA Admin",
+        "adminRemark": payload.officialRemark or payload.adminRemark, "issueDate": datetime.utcnow(),
+        "createdAt": datetime.utcnow(), "updatedAt": datetime.utcnow(),
+    }
+    result = await certificates_collection.insert_one(cert_doc)
+    cert_doc["_id"] = result.inserted_id
+    return {"message": "Certificate issued successfully", "certificate": serialize_doc(cert_doc), "verificationUrl": verify_url, "qrCode": qr_url}
+
 @router.get("/certificates/admin/signature")
 async def get_admin_signature(current_admin: dict = Depends(get_current_admin)):
     """Get active digital signature (Admin only)."""
@@ -1560,11 +1634,11 @@ async def get_my_profile(current_user: dict = Depends(get_current_user)):
             "career": user.get("careerDomain", "Full Stack Developer"),
             "domain": user.get("careerDomain", "Information Technology"),
             "skillDNA": {
-                "score": 75,
-                "technicalScore": 78,
-                "communicationScore": 72,
-                "confidenceScore": 80,
-                "placementReadinessScore": 75,
+                "score": 0,
+                "technicalScore": 0,
+                "communicationScore": 0,
+                "confidenceScore": 0,
+                "placementReadinessScore": 0,
             },
             "createdAt": datetime.utcnow(),
             "updatedAt": datetime.utcnow()
@@ -1661,11 +1735,11 @@ async def create_or_setup_profile(
         update_data["createdAt"] = datetime.utcnow()
         if "skillDNA" not in update_data or not update_data["skillDNA"]:
             update_data["skillDNA"] = {
-                "score": 75,
-                "technicalScore": 78,
-                "communicationScore": 72,
-                "confidenceScore": 80,
-                "placementReadinessScore": 75,
+                "score": 0,
+                "technicalScore": 0,
+                "communicationScore": 0,
+                "confidenceScore": 0,
+                "placementReadinessScore": 0,
             }
         res = await profiles_collection.insert_one(update_data)
         update_data["_id"] = res.inserted_id
@@ -1743,7 +1817,7 @@ async def create_student_report(
             "college": user.get("college") or (profile.get("college") if profile else None),
             "field": profile.get("branch") if profile else "Software Engineering",
         },
-        "interviewScore": payload.interviewScore or 80,
+        "interviewScore": payload.interviewScore,
         "verificationId": verification_id,
         "publicUrl": f"{CANONICAL_FRONTEND_URL}/report/{verification_id}",
         "shareTokens": [],
@@ -2095,20 +2169,7 @@ async def start_interview_session(
     
     questions = await question_bank_collection.find(query).limit(question_count * 2).to_list(question_count * 2)
     if len(questions) < question_count:
-        fallback_questions = await question_bank_collection.find({}).limit(question_count).to_list(question_count)
-        for fq in fallback_questions:
-            if fq not in questions:
-                questions.append(fq)
-
-    if len(questions) < question_count:
-        fallback_bank = [
-            {"question": f"Explain the core architectural principles of modern {field} applications.", "topic": topic, "field": field, "difficulty": "Medium"},
-            {"question": "How do you handle asynchronous operations, latency, and race conditions in production?", "topic": topic, "field": field, "difficulty": "Hard"},
-            {"question": "Walk me through how you optimize database query performance and manage indexing strategies.", "topic": topic, "field": field, "difficulty": "Medium"},
-            {"question": "Describe an end-to-end authentication and token refresh lifecycle with security best practices.", "topic": topic, "field": field, "difficulty": "Medium"},
-            {"question": "How do you debug an intermittent memory leak or high CPU spike in a deployed container service?", "topic": topic, "field": field, "difficulty": "Hard"},
-        ]
-        questions.extend(fallback_bank)
+        raise HTTPException(status_code=409, detail="Not enough approved domain-specific interview questions are available for this session")
 
     random.shuffle(questions)
     selected_questions = questions[:question_count]
@@ -2205,6 +2266,12 @@ async def submit_interview_answer(
     session = await question_sessions_collection.find_one({"sessionId": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
+    if str(session.get("studentId")) != str(user.get("_id")):
+        raise HTTPException(status_code=403, detail="You are not authorized to answer this interview session")
+    if not any(str(item.get("questionId")) == str(question_id) for item in session.get("questionSet", [])):
+        raise HTTPException(status_code=400, detail="Question does not belong to this interview session")
+    if await student_answers_collection.find_one({"sessionId": session_id, "questionId": question_id}):
+        raise HTTPException(status_code=409, detail="This interview question has already been answered")
 
     word_count = len(answer.split())
     has_substance = word_count >= 10
@@ -2292,17 +2359,28 @@ async def complete_interview_session(
     session = await question_sessions_collection.find_one({"sessionId": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
+    if str(session.get("studentId")) != str(user.get("_id")):
+        raise HTTPException(status_code=403, detail="You are not authorized to complete this interview session")
 
     answers = await student_answers_collection.find({"sessionId": session_id}).to_list(100)
 
-    if answers:
-        tech_avg = round(sum(a.get("scores", {}).get("technical", 75) for a in answers) / len(answers))
-        comm_avg = round(sum(a.get("scores", {}).get("communication", 75) for a in answers) / len(answers))
-        ps_avg = round(sum(a.get("scores", {}).get("problemSolving", 75) for a in answers) / len(answers))
-        conf_avg = round(sum(a.get("scores", {}).get("confidence", 75) for a in answers) / len(answers))
-        overall_avg = round((tech_avg * 0.4) + (comm_avg * 0.25) + (ps_avg * 0.2) + (conf_avg * 0.15))
-    else:
-        tech_avg, comm_avg, ps_avg, conf_avg, overall_avg = 78, 80, 76, 82, 79
+    if not answers:
+        raise HTTPException(status_code=422, detail="Complete at least one evaluated interview answer before finalizing the session")
+    score_sets = [a.get("scores") or {} for a in answers]
+    required_scores = ("technical", "communication", "problemSolving", "confidence")
+    if any(any(score.get(key) is None for key in required_scores) for score in score_sets):
+        raise HTTPException(status_code=422, detail="Interview answers are missing transparent component scores")
+    tech_avg = round(sum(float(a["technical"]) for a in score_sets) / len(score_sets))
+    comm_avg = round(sum(float(a["communication"]) for a in score_sets) / len(score_sets))
+    ps_avg = round(sum(float(a["problemSolving"]) for a in score_sets) / len(score_sets))
+    conf_avg = round(sum(float(a["confidence"]) for a in score_sets) / len(score_sets))
+    overall_avg = round((tech_avg * 0.4) + (comm_avg * 0.25) + (ps_avg * 0.2) + (conf_avg * 0.15))
+    latest_assessment = await assessments_collection.find_one(
+        {"$or": [{"userId": user.get("_id")}, {"userId": str(user.get("_id"))}, {"studentId": user.get("_id")}, {"studentId": str(user.get("_id"))}], "assessmentType": "MCQ", "status": {"$ne": "IN_PROGRESS"}},
+        sort=[("submittedAt", -1)],
+    )
+    assessment_score = (latest_assessment or {}).get("overallScore") or (latest_assessment or {}).get("score")
+    completion = evaluate_completion_eligibility(assessment_score, overall_avg)
 
     competencies = {
         "technical": tech_avg,
@@ -2318,22 +2396,18 @@ async def complete_interview_session(
         "overallScore": overall_avg
     }
 
-    strengths = [
-        "Strong structural clarity in technical explanations",
-        "Clear articulation of domain architecture and workflows",
-        "Effective composure and pacing under timed conditions"
-    ]
-    weaknesses = [
-        "Include more concrete production metrics (latency, QPS, memory benchmarks)",
-        "Deepen discussion on distributed edge cases and failure modes"
-    ]
-    remediations = [
-        {"topic": "System Resilience", "recommendation": "Review circuit breaker patterns and exponential backoff retry policies.", "status": "Pending"},
-        {"topic": "Performance Benchmarking", "recommendation": "Practice quantifying optimization gains in percentage latency reductions.", "status": "Pending"}
-    ]
+    strengths = []
+    weaknesses = []
+    for label, score in (("Technical reasoning", tech_avg), ("Communication", comm_avg), ("Problem solving", ps_avg), ("Interview confidence", conf_avg)):
+        (strengths if score >= 70 else weaknesses).append(label)
+    remediations = [{"topic": weakness, "recommendation": f"Review evaluated {weakness.lower()} evidence and complete a targeted reassessment.", "status": "Pending"} for weakness in weaknesses]
 
     final_report = {
         "overallScore": overall_avg,
+        "assessmentId": (latest_assessment or {}).get("assessmentId"),
+        "assessmentScore": assessment_score,
+        "componentMinimums": completion,
+        "completionEligible": completion["eligible"],
         "competencies": competencies,
         "strengths": strengths,
         "weaknesses": weaknesses,
@@ -2351,6 +2425,7 @@ async def complete_interview_session(
                 "strengths": strengths,
                 "weaknesses": weaknesses,
                 "finalReport": final_report,
+                "completion": completion,
                 "endTime": datetime.utcnow(),
                 "updatedAt": datetime.utcnow()
             }
@@ -2382,6 +2457,10 @@ async def complete_interview_session(
         "status": "Completed",
         "sessionId": session_id,
         "overallScore": overall_avg,
+        "assessmentId": (latest_assessment or {}).get("assessmentId"),
+        "assessmentScore": assessment_score,
+        "completion": completion,
+        "completionEligible": completion["eligible"],
         "competencies": competencies,
         "finalReport": final_report
     }
@@ -2392,47 +2471,30 @@ async def get_interview_report(
     current_user: dict = Depends(get_current_user)
 ):
     """Retrieve full interview report card with answers, scores, and remediations (Authenticated user)."""
+    user = await get_authenticated_user_doc(current_user)
     session = await question_sessions_collection.find_one({"sessionId": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
+    if str(session.get("studentId")) != str(user.get("_id")):
+        raise HTTPException(status_code=403, detail="You are not authorized to view this interview report")
 
     answers = await student_answers_collection.find({"sessionId": session_id}).to_list(100)
     final_report = session.get("finalReport") or {}
-    competencies = session.get("competencies") or final_report.get("competencies") or {
-        "technical": 80,
-        "communication": 78,
-        "problemSolving": 82,
-        "confidence": 85,
-        "overall": 81,
-        "averageTechnical": 80,
-        "averageCommunication": 78,
-        "averageCorrectness": 82,
-        "averageConfidence": 85,
-        "overallScore": 81
-    }
+    competencies = session.get("competencies") or final_report.get("competencies") or {}
 
-    remediations = final_report.get("weaknessRemediations") or [
-        {"topic": "System Resilience", "recommendation": "Review circuit breaker patterns and exponential backoff retry policies.", "status": "Pending"},
-        {"topic": "Performance Benchmarking", "recommendation": "Practice quantifying optimization gains in percentage latency reductions.", "status": "Pending"}
-    ]
+    remediations = final_report.get("weaknessRemediations") or []
 
     return {
         "session": serialize_doc(session),
         "finalReport": serialize_doc(final_report),
-        "overallScore": competencies.get("overall", 80),
+        "overallScore": competencies.get("overall", 0),
         "competencies": competencies,
         "averageScores": competencies,
         "answers": [serialize_doc(a) for a in answers],
         "questionsAsked": len(answers),
         "stuckTopics": session.get("stuckTopics", []),
-        "strengthAreas": session.get("strengths") or final_report.get("strengths") or [
-            "Strong structural clarity in technical explanations",
-            "Clear articulation of domain architecture and workflows"
-        ],
-        "weakAreas": session.get("weaknesses") or final_report.get("weaknesses") or [
-            "Include more concrete production metrics",
-            "Deepen discussion on edge cases"
-        ],
+        "strengthAreas": session.get("strengths") or final_report.get("strengths") or [],
+        "weakAreas": session.get("weaknesses") or final_report.get("weaknesses") or [],
         "weaknessRemediations": remediations,
         "myImprovementPlan": remediations
     }
@@ -3011,64 +3073,36 @@ async def start_mcq_assessment(
     disc = resolve_student_discipline(user, profile)
     topic = payload.topic or disc["curriculumTopics"][0][0]
 
-    # Dynamic question generator tailored to topic
-    questions = [
-        {
-            "id": "Q1",
-            "question": f"In the context of {topic}, what constitutes the most critical foundational principle?",
-            "options": [
-                f"Adhering to structured, standardized industry protocols in {disc['domainName']}",
-                "Bypassing preliminary validation steps to accelerate completion",
-                "Relying solely on subjective intuition without empirical verification",
-                "Disregarding cross-functional stakeholder inputs"
-            ],
-            "correctAnswer": 0
-        },
-        {
-            "id": "Q2",
-            "question": f"Which diagnostic approach is most effective when isolating root causes in {topic}?",
-            "options": [
-                "Random trial-and-error without logging",
-                "Systematic differential analysis testing single variables sequentially",
-                "Assuming the earliest observed symptom is the definitive cause",
-                "Delegating root-cause investigation without documentation"
-            ],
-            "correctAnswer": 1
-        },
-        {
-            "id": "Q3",
-            "question": f"When evaluating trade-offs in {topic}, how should risk versus performance be balanced?",
-            "options": [
-                "Prioritize speed over safety and regulatory compliance",
-                "Eliminate all innovation to avoid any minor risk",
-                "Quantify expected impact, establish fallback safeguards, and maintain compliance",
-                "Ignore edge cases if typical cases demonstrate acceptable performance"
-            ],
-            "correctAnswer": 2
-        },
-        {
-            "id": "Q4",
-            "question": f"What metric provides the highest fidelity verification of mastery in {topic}?",
-            "options": [
-                "Subjective self-assessment scores",
-                "Number of unverified study hours logged",
-                "Repeatable performance on standardized assessments and structured peer review",
-                "Speed of answering questions regardless of precision"
-            ],
-            "correctAnswer": 2
-        },
-        {
-            "id": "Q5",
-            "question": f"What is the recommended protocol when an anomaly or unhandled condition occurs during {topic} execution?",
-            "options": [
-                "Halt gracefully, log the context, notify stakeholders, and trigger remediation procedures",
-                "Suppress the warning and proceed without intervention",
-                "Hard restart the entire environment without recording error state",
-                "Retry the failing operation indefinitely in a tight loop"
-            ],
-            "correctAnswer": 0
-        }
-    ]
+    bank_questions = await question_bank_collection.find({
+        "status": "Active",
+        "field": {"$regex": re.escape(disc["domainName"].split()[0]), "$options": "i"},
+        "topic": {"$regex": re.escape(topic.split()[0]), "$options": "i"},
+        "options.0": {"$exists": True},
+    }).limit(10).to_list(10)
+    if not bank_questions:
+        shared_note = await topic_notes_collection.find_one({
+            "status": {"$in": ["Published", "PUBLISHED"]},
+            "domain": {"$regex": re.escape(disc["domainName"].split()[0]), "$options": "i"},
+            "topic": {"$regex": re.escape(topic.split()[0]), "$options": "i"},
+            "quiz.0": {"$exists": True},
+        })
+        bank_questions = (shared_note or {}).get("quiz", []) if shared_note else []
+    if not bank_questions:
+        raise HTTPException(status_code=409, detail="No approved domain-specific assessment is available for this topic yet.")
+    questions = []
+    for idx, item in enumerate(bank_questions[:10]):
+        options = item.get("options") or []
+        if len(options) < 2 or item.get("correctAnswer") is None:
+            continue
+        questions.append({
+            "id": str(item.get("id") or item.get("questionId") or f"Q{idx + 1}"),
+            "question": item.get("question", ""),
+            "options": options,
+            "correctAnswer": int(item.get("correctAnswer")),
+            "explanation": item.get("explanation", ""),
+        })
+    if not questions:
+        raise HTTPException(status_code=409, detail="Approved assessment questions are incomplete for this topic.")
 
     session_id = f"MCQ-{uuid.uuid4().hex[:8].upper()}"
     await assessments_collection.insert_one({
@@ -3101,41 +3135,50 @@ async def submit_mcq_assessment(
     user = await get_authenticated_user_doc(current_user)
     u_id = user.get("_id")
     
-    # Retrieve active assessment or evaluate answers directly
     answers = payload.answers or {}
-    total = len(answers) or 5
+    if not answers:
+        raise HTTPException(status_code=422, detail="Submit at least one answer before grading the assessment")
+    assessment = await assessments_collection.find_one({
+        "assessmentId": payload.assessmentId,
+        "$or": [{"userId": u_id}, {"userId": str(u_id)}],
+        "status": "IN_PROGRESS",
+    })
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment session not found or not owned by the current student")
+    question_set = assessment.get("questions") or []
+    key_map = {str(q.get("id")): int(q.get("correctAnswer")) for q in question_set if q.get("correctAnswer") is not None}
+    if not key_map:
+        raise HTTPException(status_code=422, detail="Assessment has no authoritative answer key")
+    total = len(key_map)
     correct_count = 0
-
-    # Answer key matches our question generator (0, 1, 2, 2, 0)
-    key_map = {"Q1": 0, "Q2": 1, "Q3": 2, "Q4": 2, "Q5": 0}
     for q_id, chosen_idx in answers.items():
         try:
-            if int(chosen_idx) == key_map.get(str(q_id), 0):
+            if str(q_id) in key_map and int(chosen_idx) == key_map[str(q_id)]:
                 correct_count += 1
         except Exception:
             pass
 
-    if not answers:
-        correct_count = 4
-        total = 5
-
-    score = round((correct_count / total) * 100) if total > 0 else 80
-    passed = score >= 70
+    score = round((correct_count / total) * 100)
+    passed = score >= COMPONENT_MIN_SCORE
 
     # Save to assessments collection
     await assessments_collection.insert_one({
         "userId": u_id,
         "studentId": u_id,
         "assessmentType": "MCQ",
+        "assessmentId": payload.assessmentId,
+        "domain": assessment.get("domain"),
+        "topic": assessment.get("topic"),
         "score": score,
         "overallScore": score,
         "correctCount": correct_count,
         "totalQuestions": total,
         "passed": passed,
+        "componentMinimumMet": passed,
+        "submittedAnswers": len(answers),
         "submittedAt": datetime.utcnow()
     })
 
-    # If passed, update Skill DNA in student Profile
     if passed:
         profile = await profiles_collection.find_one({"user": u_id}) or {}
         skill_dna = profile.get("skillDNA") or {}
@@ -3157,7 +3200,9 @@ async def submit_mcq_assessment(
         "correctCount": correct_count,
         "totalQuestions": total,
         "passed": passed,
-        "feedback": f"You scored {score}% ({correct_count}/{total} correct). {'Skill DNA competency updated successfully!' if passed else 'Review the topic notes and re-attempt to earn mastery badge.'}"
+        "componentMinimumMet": passed,
+        "completionEligible": False,
+        "feedback": f"You scored {score}% ({correct_count}/{total} correct). {'Verified assessment evidence added to Skill DNA.' if passed else 'The assessment component is below the 50% minimum; review the approved notes and retake it.'}"
     }
 
 @router.get("/mcq/history")
@@ -3748,30 +3793,38 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
     sessions = await question_sessions_collection.find({"studentId": u_id, "status": "Completed"}).sort("createdAt", -1).to_list(10)
     student_answers = await student_answers_collection.find({"studentId": u_id}).sort("submittedAt", -1).to_list(20)
     certificates = await certificates_collection.find({"studentId": u_id, "status": "APPROVED"}).to_list(10)
-    completed_assessments = await assessments_collection.find({"userId": u_id, "passed": True}).to_list(50)
+    completed_assessments = await assessments_collection.find({"$or": [{"userId": u_id}, {"userId": str(u_id)}, {"studentId": u_id}, {"studentId": str(u_id)}], "assessmentType": "MCQ", "status": {"$ne": "IN_PROGRESS"}}).to_list(50)
 
     # Calculate real scores
     if sessions:
-        technical_scores = [s.get("overallScore") or s.get("technicalScore") or 75 for s in sessions]
+        technical_scores = [s.get("overallScore") or s.get("technicalScore") for s in sessions if s.get("overallScore") is not None or s.get("technicalScore") is not None]
+        technical_scores.extend([a.get("overallScore") or a.get("score") for a in completed_assessments if a.get("overallScore") is not None or a.get("score") is not None])
+        if not technical_scores:
+            technical_scores = [0]
         avg_tech = round(sum(technical_scores) / len(technical_scores))
-        avg_response_time = round(sum(s.get("averageResponseTime", 65) for s in sessions) / len(sessions))
+        response_times = [s.get("averageResponseTime") for s in sessions if s.get("averageResponseTime") is not None]
+        avg_response_time = round(sum(response_times) / len(response_times)) if response_times else 0
     else:
-        avg_tech = profile.get("skillDNA", {}).get("technicalScore") or 82
-        avg_response_time = 68
+        avg_tech = profile.get("skillDNA", {}).get("technicalScore") or 0
+        avg_response_time = 0
 
-    communication_scores = [a.get("communicationScore") or 82 for a in student_answers] or [82]
-    avg_comm = round(sum(communication_scores) / len(communication_scores))
+    communication_scores = [a.get("scores", {}).get("communication") or a.get("communicationScore") for a in student_answers if a.get("scores", {}).get("communication") is not None or a.get("communicationScore") is not None]
+    avg_comm = round(sum(communication_scores) / len(communication_scores)) if communication_scores else 0
 
-    confidence_scores = [a.get("confidenceScore") or 80 for a in student_answers] or [80]
-    avg_conf = round(sum(confidence_scores) / len(confidence_scores))
+    confidence_scores = [a.get("scores", {}).get("confidence") or a.get("confidenceScore") for a in student_answers if a.get("scores", {}).get("confidence") is not None or a.get("confidenceScore") is not None]
+    avg_conf = round(sum(confidence_scores) / len(confidence_scores)) if confidence_scores else 0
 
-    speed_score = 95 if avg_response_time <= 75 else (85 if avg_response_time <= 120 else 70)
-    overall_score = round(avg_tech * 0.4 + avg_comm * 0.25 + avg_conf * 0.2 + speed_score * 0.15)
+    speed_score = 0 if not avg_response_time else (95 if avg_response_time <= 75 else (85 if avg_response_time <= 120 else 70))
+    overall_score = round(avg_tech * 0.4 + avg_comm * 0.25 + avg_conf * 0.2 + speed_score * 0.15) if any((avg_tech, avg_comm, avg_conf, speed_score)) else 0
 
     # Strengths and Weaknesses
     profile_skills = profile.get("skills") or []
-    strengths = list(dict.fromkeys(profile_skills[:4] + disc["defaultStrengths"]))[:6]
-    weaknesses = list(dict.fromkeys(disc["defaultWeaknesses"]))[:4]
+    measured_strengths = [label for label, score in (("Technical reasoning", avg_tech), ("Communication", avg_comm), ("Confidence", avg_conf)) if score >= 70]
+    strengths = list(dict.fromkeys(profile_skills[:4] + measured_strengths))[:6]
+    explicit_gaps = profile.get("skillGaps") or profile.get("weaknesses") or []
+    measured_gaps = [label for label, score in (("Technical reasoning", avg_tech), ("Communication", avg_comm), ("Confidence", avg_conf)) if 0 < score < 70]
+    curriculum_gaps = [name for name, _ in disc.get("curriculumTopics", []) if name not in profile_skills]
+    weaknesses = list(dict.fromkeys(explicit_gaps + measured_gaps + curriculum_gaps))[:6]
 
     target_role = profile.get("targetRole") or disc["roles"][0]
 
@@ -3782,7 +3835,7 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
             "concept": w,
             "topic": w,
             "domain": disc["domainName"],
-            "score": max(55, overall_score - 18 - (idx * 4)),
+            "score": max(0, overall_score - 18 - (idx * 4)),
             "diagnostic": f"Identified gap in {w}. Focus on core foundational standards and practical scenarios in {disc['domainName']}.",
             "externalResources": disc["resources"],
             "practiceQuestions": [
@@ -3798,7 +3851,7 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
     # Job readiness matching real discipline roles
     job_readiness = []
     for idx, role in enumerate(disc["roles"]):
-        role_score = max(60, min(95, overall_score - (idx * 5) + 3))
+        role_score = max(0, min(100, overall_score - (idx * 5)))
         job_readiness.append({
             "role": role,
             "readiness": role_score,
@@ -3809,8 +3862,8 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
     # Priority skill and rationale
     priority_skill = weaknesses[0] if weaknesses else (disc["curriculumTopics"][0][0] if disc["curriculumTopics"] else "Core Principles")
     why_recommended = (
-        f"Critical prerequisite for target role '{target_role}'. Required by 85% of {disc['domainName']} "
-        "employers. Mastering this competency bridges your primary evaluated skill gap and unlocks advanced milestones."
+        f"This is the highest-priority gap currently identified for the target role '{target_role}' in {disc['domainName']}. "
+        "Complete the prerequisite material and reassess the skill with evidence."
     )
 
     # Daily actionable tasks
@@ -3834,15 +3887,10 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
         history.append({
             "label": f"Session #{len(sessions) - idx}",
             "sessionId": str(s.get("_id")),
-            "score": s.get("overallScore") or s.get("technicalScore") or 80,
+            "score": s.get("overallScore") or s.get("technicalScore") or 0,
             "averageResponseTime": s.get("averageResponseTime", 65),
             "completedAt": c_str
         })
-
-    if not history:
-        history = [
-            {"label": "Baseline Assessment", "score": avg_tech, "averageResponseTime": avg_response_time, "completedAt": "Recent"}
-        ]
 
     # Competencies
     profile_dna = profile.get("skillDNA") if isinstance(profile.get("skillDNA"), dict) else {}
@@ -3852,8 +3900,9 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
             if isinstance(v, (int, float)):
                 competencies_list.append({"name": k, "score": int(v)})
     if not competencies_list:
-        for s in strengths[:4]:
-            competencies_list.append({"name": s, "score": 82})
+        for name, score in (("Technical reasoning", avg_tech), ("Communication", avg_comm), ("Confidence", avg_conf)):
+            if score:
+                competencies_list.append({"name": name, "score": score})
 
     # Practical Domain Project
     domain_key = "tech"
@@ -4003,7 +4052,7 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
             "priority": "HIGH",
             "whyRecommended": why_recommended,
             "prerequisites": [f"Foundational {disc['domainName']} Principles", f"Introductory {priority_skill} Concepts"],
-            "currentLevel": "Intermediate" if overall_score >= 70 else "Beginner",
+            "currentLevel": "Advanced" if overall_score >= 85 else ("Intermediate" if overall_score >= 70 else "Beginner"),
             "targetLevel": "Advanced",
             "actionUrl": "/learning"
         },
@@ -4021,8 +4070,8 @@ async def get_my_career_twin(current_user: dict = Depends(get_current_user)):
         "skillEngineTiers": skill_engine_tiers,
         "mentorSuggestions": [
             f"Prioritize targeted study on {priority_skill} using the recommended curriculum notes.",
-            f"Your communication score of {avg_comm}% is a significant asset in {disc['domainName']} interviews.",
-            f"Target role '{target_role}' readiness is currently {job_readiness[0]['readiness']}%. Completing the practice quiz will push you past the 85% verified benchmark."
+            f"Your measured communication score is {avg_comm}% based on completed interview answers." if avg_comm else "Complete interview answers to measure communication evidence.",
+            f"Target role '{target_role}' readiness is currently {job_readiness[0]['readiness']}%. Continue with the next evidence-based milestone."
         ],
         "generatedAt": datetime.utcnow().isoformat()
     }
@@ -4183,31 +4232,32 @@ async def create_student_certificate(
     user = await get_authenticated_user_doc(current_user)
     u_id = user["_id"]
 
-    career_path = payload.careerPath or "Software Engineering"
-    tech_score = payload.technicalScore or 80
-    comm_score = payload.communicationScore or 80
-    ps_score = payload.problemSolvingScore or 80
-    conf_score = payload.confidenceScore or 80
-    overall_score = payload.overallScore
+    if not payload.sessionId:
+        raise HTTPException(status_code=400, detail="A completed interview session is required before certificate issuance")
+    session = await question_sessions_collection.find_one({"sessionId": payload.sessionId})
+    if not session or str(session.get("studentId")) != str(u_id):
+        raise HTTPException(status_code=403, detail="Interview session is missing or not owned by the current student")
+    if session.get("status") != "Completed":
+        raise HTTPException(status_code=409, detail="Complete the interview before certificate issuance")
 
-    # If assessmentId provided, pull verified score and details
+    assessment_query = {"$or": [{"userId": u_id}, {"userId": str(u_id)}, {"studentId": u_id}, {"studentId": str(u_id)}], "assessmentType": "MCQ", "status": {"$ne": "IN_PROGRESS"}}
     if payload.assessmentId:
-        q = {"_id": ObjectId(payload.assessmentId)} if ObjectId.is_valid(payload.assessmentId) else {"assessmentId": payload.assessmentId}
-        assessment = await assessments_collection.find_one(q)
-        if assessment:
-            overall_score = assessment.get("overallScore") or assessment.get("score") or tech_score
-            tech_score = assessment.get("score") or tech_score
-            career_path = assessment.get("domain") or assessment.get("topic") or career_path
+        assessment_query["assessmentId"] = payload.assessmentId
+    assessment = await assessments_collection.find_one(assessment_query, sort=[("submittedAt", -1)])
+    if not assessment:
+        raise HTTPException(status_code=409, detail="Complete a verified domain assessment before certificate issuance")
 
-    if overall_score is None:
-        overall_score = round(tech_score * 0.4 + comm_score * 0.25 + ps_score * 0.2 + conf_score * 0.15)
-
-    # 75% minimum passing score requirement
-    if overall_score < 75:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Your verified assessment score is {overall_score}%. A minimum passing score of 75% is required to generate or claim a SkillDNA Verified Certificate."
-        )
+    competencies = session.get("competencies") or session.get("finalReport", {}).get("competencies") or {}
+    tech_score = competencies.get("technical")
+    comm_score = competencies.get("communication")
+    ps_score = competencies.get("problemSolving")
+    conf_score = competencies.get("confidence")
+    overall_score = session.get("overallScore") or session.get("finalReport", {}).get("overallScore")
+    assessment_score = assessment.get("overallScore") or assessment.get("score")
+    completion = evaluate_completion_eligibility(assessment_score, overall_score)
+    if not completion["eligible"]:
+        raise HTTPException(status_code=400, detail={"message": "Certificate requires at least 50% in both assessment and interview and a combined average of at least 70%.", "completion": completion})
+    career_path = session.get("careerDomain") or assessment.get("domain") or payload.careerPath or "Career Development"
 
     # Duplicate check: check if active approved cert already exists for this career track
     existing_cert = await certificates_collection.find_one({
@@ -4243,8 +4293,11 @@ async def create_student_certificate(
         "overallScore": overall_score,
         "passStatus": "PASS",
         "sessionsCompleted": payload.sessionsCompleted or 1,
-        "strengths": payload.strengths or ["Technical Architecture", "Structured Problem Solving"],
-        "improvements": payload.improvements or ["Distributed Edge Cases"],
+        "assessmentScore": assessment_score,
+        "interviewScore": overall_score,
+        "completion": completion,
+        "strengths": session.get("strengths") or payload.strengths or [],
+        "improvements": session.get("weaknesses") or payload.improvements or [],
         "status": "APPROVED",
         "isActive": True,
         "sharedWith": [],
