@@ -3456,9 +3456,11 @@ async def save_student_study_note(
         "updatedAt": datetime.utcnow()
     }
 
+    update_fields = {key: value for key, value in doc.items() if key != "createdAt"}
+    update_fields["updatedAt"] = datetime.utcnow()
     res = await student_notes_collection.update_one(
         {"userId": u_id, "sharedNoteId": shared_id},
-        {"$set": {**doc, "updatedAt": datetime.utcnow()}, "$setOnInsert": {"createdAt": datetime.utcnow()}},
+        {"$set": update_fields, "$setOnInsert": {"createdAt": doc["createdAt"]}},
         upsert=True,
     )
     saved = await student_notes_collection.find_one({"userId": u_id, "sharedNoteId": shared_id})

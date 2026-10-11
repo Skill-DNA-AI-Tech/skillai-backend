@@ -199,3 +199,46 @@ if __name__ == "__main__":
     print("\n======================================================================")
     print("ALL PRODUCTION-READINESS VERIFICATION TESTS PASSED SUCCESSFULLY!")
     print("======================================================================")
+
+
+def test_student_note_save_does_not_conflict_on_created_at():
+    """Canonical shared notes save without MongoDB $set/$setOnInsert path conflicts."""
+    from routes import admin_ops
+
+    user_id = ObjectId("65f1a2b3c4d5e6f7a8b9c0d3")
+    shared_id = ObjectId("65f1a2b3c4d5e6f7a8b9c0d4")
+    saved_id = ObjectId("65f1a2b3c4d5e6f7a8b9c0d5")
+    shared = {
+        "_id": shared_id,
+        "status": "Published",
+        "canonicalKey": "computer-science|data-structures|general|en|v1",
+        "topic": "Data Structures",
+        "domain": "Computer Science & Software Systems",
+        "curriculumVersion": "v1",
+        "summary": "Summary",
+        "detailedNotes": "Detailed notes",
+        "keyPoints": ["Point"],
+        "quickRevision": ["Revise"],
+        "questions": [],
+        "flashcards": [],
+        "quiz": [],
+    }
+    saved = {**shared, "_id": saved_id, "userId": user_id, "sharedNoteId": str(shared_id)}
+    app.dependency_overrides[get_current_user] = lambda: {
+        "email": "student.save@skilldna.ai", "id": str(user_id), "role": "student"
+    }
+    with patch.object(admin_ops.users_collection, "find_one", AsyncMock(return_value={"_id": user_id, "email": "student.save@skilldna.ai", "role": "student"})), \
+         patch.object(admin_ops.admins_collection, "find_one", AsyncMock(return_value=None)), \
+         patch.object(admin_ops.topic_notes_collection, "find_one", AsyncMock(return_value=shared)), \
+         patch.object(admin_ops.student_notes_collection, "update_one", AsyncMock()) as update_note, \
+         patch.object(admin_ops.student_notes_collection, "find_one", AsyncMock(return_value=saved)), \
+         patch.object(admin_ops.student_note_progress_collection, "update_one", AsyncMock()):
+        res = client.post(
+            "/api/learning/notes/save",
+            json={"topic": "Data Structures", "domain": "Computer Science & Software Systems", "sharedNoteId": str(shared_id)},
+        )
+    app.dependency_overrides.clear()
+    assert res.status_code == 200, res.text
+    update_doc = update_note.await_args.args[1]
+    assert "createdAt" not in update_doc["$set"]
+    assert "createdAt" in update_doc["$setOnInsert"]
