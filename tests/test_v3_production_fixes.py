@@ -242,3 +242,27 @@ def test_student_note_save_does_not_conflict_on_created_at():
     update_doc = update_note.await_args.args[1]
     assert "createdAt" not in update_doc["$set"]
     assert "createdAt" in update_doc["$setOnInsert"]
+
+
+def test_private_certificate_routes_enforce_owner_access():
+    """Students cannot read or download another student's certificate by ID."""
+    from routes import admin_ops
+
+    student_id = ObjectId("65f1a2b3c4d5e6f7a8b9c0e1")
+    other_id = ObjectId("65f1a2b3c4d5e6f7a8b9c0e2")
+    app.dependency_overrides[get_current_user] = lambda: {
+        "email": "owner@skilldna.ai", "id": str(student_id), "role": "student"
+    }
+    cert = {
+        "_id": ObjectId("65f1a2b3c4d5e6f7a8b9c0e3"),
+        "certificateId": "SDNA-PRIVATE-1", "studentId": other_id,
+        "studentEmail": "other@skilldna.ai", "status": "APPROVED", "isActive": True,
+    }
+    with patch.object(admin_ops.users_collection, "find_one", AsyncMock(return_value={"_id": student_id, "email": "owner@skilldna.ai", "role": "student"})), \
+         patch.object(admin_ops.admins_collection, "find_one", AsyncMock(return_value=None)), \
+         patch.object(admin_ops.certificates_collection, "find_one", AsyncMock(return_value=cert)):
+        details = client.get("/api/certificates/SDNA-PRIVATE-1")
+        pdf = client.get("/api/certificates/SDNA-PRIVATE-1/pdf")
+    app.dependency_overrides.clear()
+    assert details.status_code == 403
+    assert pdf.status_code == 403

@@ -2020,13 +2020,28 @@ async def get_student_certificates(student_id: str, current_user: dict = Depends
     return [serialize_doc(c) for c in certs]
 
 @router.get("/certificates/{certificate_id}")
-async def get_certificate_details(certificate_id: str):
-    """Retrieve details for a single certificate (Public / Authenticated)."""
+async def get_certificate_details(
+    certificate_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Retrieve private certificate details for its owner or an authorized admin."""
+    user = await get_authenticated_user_doc(current_user)
     query = {"certificateId": certificate_id}
     if ObjectId.is_valid(certificate_id):
         query = {"$or": [{"certificateId": certificate_id}, {"_id": ObjectId(certificate_id)}]}
     cert = await certificates_collection.find_one(query)
     if not cert:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    is_admin = str(user.get("role", "")).upper() in {"ADMIN", "MAIN_ADMIN", "SUPERADMIN"} or bool(user.get("isAdmin"))
+    is_owner = (
+        str(cert.get("studentId")) == str(user.get("_id"))
+        or str(cert.get("userId")) == str(user.get("_id"))
+        or cert.get("studentEmail") == user.get("email")
+        or cert.get("email") == user.get("email")
+    )
+    if not is_owner and not is_admin:
+        raise HTTPException(status_code=403, detail="You can only access your own certificates")
+    if not is_admin and (cert.get("status") != "APPROVED" or cert.get("isActive") is False or cert.get("isRevoked") is True):
         raise HTTPException(status_code=404, detail="Certificate not found")
     return serialize_doc(cert)
 
@@ -2076,10 +2091,25 @@ async def share_student_certificate(
     }
 
 @router.get("/certificates/{certificate_id}/pdf")
-async def download_certificate_pdf(certificate_id: str):
-    """Return the authoritative certificate record as a real PDF document."""
+async def download_certificate_pdf(
+    certificate_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the authoritative certificate PDF to its owner or an authorized admin."""
+    user = await get_authenticated_user_doc(current_user)
     cert = await certificates_collection.find_one({"certificateId": certificate_id})
     if not cert:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    is_admin = str(user.get("role", "")).upper() in {"ADMIN", "MAIN_ADMIN", "SUPERADMIN"} or bool(user.get("isAdmin"))
+    is_owner = (
+        str(cert.get("studentId")) == str(user.get("_id"))
+        or str(cert.get("userId")) == str(user.get("_id"))
+        or cert.get("studentEmail") == user.get("email")
+        or cert.get("email") == user.get("email")
+    )
+    if not is_owner and not is_admin:
+        raise HTTPException(status_code=403, detail="You can only download your own certificates")
+    if not is_admin and (cert.get("status") != "APPROVED" or cert.get("isActive") is False or cert.get("isRevoked") is True):
         raise HTTPException(status_code=404, detail="Certificate not found")
 
     verify_url = canonical_certificate_url(certificate_id)
