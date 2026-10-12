@@ -266,3 +266,44 @@ def test_private_certificate_routes_enforce_owner_access():
     app.dependency_overrides.clear()
     assert details.status_code == 403
     assert pdf.status_code == 403
+
+
+def test_certificate_visibility_scores_and_admin_audit():
+    """Published visibility is scoped, public scores are evidence-backed, and admin actions audit."""
+    from routes import admin_ops
+
+    owner_id = ObjectId("65f1a2b3c4d5e6f7a8b9c0f1")
+    other_id = ObjectId("65f1a2b3c4d5e6f7a8b9c0f2")
+    app.dependency_overrides[get_current_user] = lambda: {
+        "email": "owner@skilldna.ai", "id": str(owner_id), "role": "student"
+    }
+    with patch.object(admin_ops.users_collection, "find_one", AsyncMock(return_value={"_id": owner_id, "email": "owner@skilldna.ai", "role": "student"})):
+        res = client.get(f"/api/certificates/student/{other_id}")
+    app.dependency_overrides.clear()
+    assert res.status_code == 403
+
+    public_cert = {
+        "_id": ObjectId("65f1a2b3c4d5e6f7a8b9c0f3"),
+        "certificateId": "SDNA-NO-SYNTHETIC-SCORES",
+        "studentName": "Verified Learner", "careerPath": "Data Science",
+        "status": "APPROVED", "isActive": True, "isCurrentVersion": True,
+    }
+    with patch.object(admin_ops.certificates_collection, "find_one", AsyncMock(return_value=public_cert)), \
+         patch.object(admin_ops.certificates_collection, "update_one", AsyncMock()):
+        res = client.get("/api/public/certificates/verify/SDNA-NO-SYNTHETIC-SCORES")
+    assert res.status_code == 200
+    assert res.json().get("scores") == {}
+
+    app.dependency_overrides[get_current_admin] = lambda: {
+        "email": "admin@skilldna.ai", "id": "admin-1", "role": "ADMIN"
+    }
+    with patch.object(admin_ops.certificates_collection, "update_one", AsyncMock(return_value=MagicMock(matched_count=1))), \
+         patch.object(admin_ops.certificates_collection, "update_many", AsyncMock(return_value=MagicMock(matched_count=1))), \
+         patch.object(admin_ops.audit_logs_collection, "insert_one", AsyncMock()) as audit:
+        approve = client.post("/api/certificates/admin/approve/SDNA-TEST-AUDIT")
+        revoke = client.post("/api/certificates/admin/revoke/SDNA-TEST-AUDIT")
+    app.dependency_overrides.clear()
+    assert approve.status_code == 200
+    assert revoke.status_code == 200
+    actions = [call.args[0]["action"] for call in audit.await_args_list]
+    assert actions == ["CERTIFICATE_PUBLISHED", "CERTIFICATE_REVOKED"]

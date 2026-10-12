@@ -1149,6 +1149,29 @@ async def create_certificate_template(
     new_template["_id"] = res.inserted_id
     return serialize_doc(new_template)
 
+@router.post("/certificates/admin/templates/upload")
+async def upload_certificate_template(
+    file: UploadFile = File(...),
+    current_admin: dict = Depends(get_current_admin),
+):
+    """Upload an HTML certificate template for admin preview and activation."""
+    filename = (file.filename or "").lower()
+    if not filename.endswith((".html", ".htm")):
+        raise HTTPException(status_code=400, detail="Certificate templates must be HTML files")
+    raw = await file.read()
+    if not raw or len(raw) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Certificate template must be between 1 byte and 2 MB")
+    try:
+        template_html = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Certificate template must be valid UTF-8 HTML")
+    now = datetime.utcnow()
+    doc = {"templateId": f"TPL-{int(now.timestamp())}-{uuid.uuid4().hex[:6].upper()}", "templateName": file.filename, "templateHtml": template_html, "contentType": "text/html", "isActive": False, "createdBy": current_admin.get("email") or current_admin.get("sub"), "createdAt": now, "updatedAt": now}
+    result = await certificate_templates_collection.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    await audit_logs_collection.insert_one({"action": "CERTIFICATE_TEMPLATE_UPLOADED", "templateId": doc["templateId"], "performedBy": current_admin.get("email") or current_admin.get("sub"), "timestamp": now})
+    return serialize_doc(doc)
+
 @router.post("/certificates/admin/templates/{id}/activate")
 async def activate_certificate_template(id: str, current_admin: dict = Depends(get_current_admin)):
     """Activate a specific certificate template (Admin only)."""
@@ -1231,14 +1254,15 @@ async def issue_admin_certificate(
         "communicationScore": competencies.get("communication"), "problemSolvingScore": competencies.get("problemSolving"),
         "confidenceScore": competencies.get("confidence"), "overallScore": interview_score,
         "assessmentScore": assessment_score, "interviewScore": interview_score, "completion": completion,
-        "passStatus": "PASS", "status": "APPROVED", "isActive": True, "sharedWith": [],
+        "passStatus": "PASS", "status": "PENDING", "isActive": False, "isCurrentVersion": True, "sharedWith": [],
         "verificationUrl": verify_url, "qrCode": qr_url, "issuer": current_admin.get("email") or "SkillDNA Admin",
         "adminRemark": payload.officialRemark or payload.adminRemark, "issueDate": datetime.utcnow(),
         "createdAt": datetime.utcnow(), "updatedAt": datetime.utcnow(),
     }
     result = await certificates_collection.insert_one(cert_doc)
     cert_doc["_id"] = result.inserted_id
-    return {"message": "Certificate issued successfully", "certificate": serialize_doc(cert_doc), "verificationUrl": verify_url, "qrCode": qr_url}
+    await audit_logs_collection.insert_one({"action": "CERTIFICATE_ISSUED_PENDING_REVIEW", "certificateId": cert_id, "targetStudentId": str(student_id), "performedBy": current_admin.get("email") or current_admin.get("sub"), "timestamp": datetime.utcnow()})
+    return {"message": "Certificate created and queued for admin review", "certificate": serialize_doc(cert_doc), "verificationUrl": verify_url, "qrCode": qr_url}
 
 @router.get("/certificates/admin/signature")
 async def get_admin_signature(current_admin: dict = Depends(get_current_admin)):
@@ -1267,30 +1291,37 @@ async def regenerate_certificate(id: str, current_admin: dict = Depends(get_curr
 
 @router.post("/certificates/admin/reject/{id}")
 async def reject_certificate(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Reject a certificate (Admin only)."""
+    """Reject a certificate during admin review."""
     try:
         obj_id = ObjectId(id)
     except Exception:
         obj_id = id
-    await certificates_collection.update_one(
+    now = datetime.utcnow()
+    result = await certificates_collection.update_one(
         {"$or": [{"certificateId": id}, {"_id": obj_id}]},
-        {"$set": {"status": "REJECTED", "updatedAt": datetime.utcnow()}}
+        {"$set": {"status": "REJECTED", "isActive": False, "updatedAt": now, "rejectedAt": now, "rejectedBy": current_admin.get("email")}},
     )
-    return {"message": f"Certificate {id} rejected"}
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Certificate not found")
+    await audit_logs_collection.insert_one({"action": "CERTIFICATE_REJECTED", "certificateId": id, "performedBy": current_admin.get("email") or current_admin.get("sub"), "timestamp": now})
+    return {"message": f"Certificate {id} rejected", "status": "REJECTED"}
 
 @router.post("/certificates/admin/approve/{id}")
 async def approve_certificate(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Approve a certificate (Admin only)."""
+    """Publish a certificate after admin validation."""
     try:
         obj_id = ObjectId(id)
     except Exception:
         obj_id = id
-    await certificates_collection.update_one(
-        {"$or": [{"certificateId": id}, {"_id": obj_id}]},
-        {"$set": {"status": "APPROVED", "updatedAt": datetime.utcnow()}}
+    now = datetime.utcnow()
+    result = await certificates_collection.update_one(
+        {"$or": [{"certificateId": id}, {"_id": obj_id}], "status": {"$in": ["PENDING", "APPROVED"]}},
+        {"$set": {"status": "APPROVED", "isActive": True, "isCurrentVersion": True, "approvedAt": now, "approvedBy": current_admin.get("email"), "updatedAt": now}},
     )
-    return {"message": f"Certificate {id} approved"}
-
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Pending certificate not found")
+    await audit_logs_collection.insert_one({"action": "CERTIFICATE_PUBLISHED", "certificateId": id, "performedBy": current_admin.get("email") or current_admin.get("sub"), "timestamp": now})
+    return {"message": f"Certificate {id} approved and published", "status": "APPROVED"}
 @router.put("/certificates/admin/{id}")
 async def edit_certificate_version(
     id: str,
@@ -1371,19 +1402,20 @@ async def edit_certificate_version(
 
 @router.post("/certificates/admin/revoke/{id}")
 async def revoke_certificate(id: str, current_admin: dict = Depends(get_current_admin)):
-    """Revoke an issued certificate (Admin only)."""
+    """Revoke a published certificate (Admin only)."""
     try:
         obj_id = ObjectId(id)
     except Exception:
         obj_id = id
-    res = await certificates_collection.update_many(
+    now = datetime.utcnow()
+    result = await certificates_collection.update_many(
         {"$or": [{"certificateId": id}, {"_id": obj_id}]},
-        {"$set": {"status": "REVOKED", "revokedAt": datetime.utcnow(), "revokedBy": current_admin.get("email"), "updatedAt": datetime.utcnow()}}
+        {"$set": {"status": "REVOKED", "isActive": False, "revokedAt": now, "revokedBy": current_admin.get("email"), "updatedAt": now}},
     )
-    if res.matched_count == 0:
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Certificate not found")
+    await audit_logs_collection.insert_one({"action": "CERTIFICATE_REVOKED", "certificateId": id, "performedBy": current_admin.get("email") or current_admin.get("sub"), "timestamp": now})
     return {"message": f"Certificate {id} revoked successfully", "status": "REVOKED"}
-
 # ==========================================
 # 10. QUESTIONS MANAGEMENT SUITE
 # ==========================================
@@ -1917,8 +1949,8 @@ async def verify_certificate_public(certificate_id: str):
     issue_date_val = cert.get("issueDate") or cert.get("createdAt")
     issue_date_str = issue_date_val.strftime("%B %d, %Y") if isinstance(issue_date_val, datetime) else str(issue_date_val or "")
 
-    # Check Revocation
-    if cert_status in ["REVOKED", "REJECTED"]:
+    # Draft, rejected, and revoked credentials are never publicly valid.
+    if cert_status != "APPROVED" or cert.get("isActive") is False or cert.get("isCurrentVersion") is False:
         return PublicCertificateVerifyResponse(
             valid=False,
             verificationStatus="REVOKED",
@@ -1932,7 +1964,7 @@ async def verify_certificate_public(certificate_id: str):
             seal=seal,
             verificationUrl=verify_url,
             qrCode=qr_url,
-            message="This certificate was officially REVOKED by the issuing authority and is no longer valid."
+            message="This certificate is not currently published by the issuing authority."
         )
 
     # Check Expiration
@@ -1955,13 +1987,8 @@ async def verify_certificate_public(certificate_id: str):
         )
 
     # Valid Verified Certificate
-    scores = {
-        "overall": cert.get("overallScore") or cert.get("technicalScore", 85),
-        "technical": cert.get("technicalScore", 85),
-        "communication": cert.get("communicationScore", 80),
-        "problemSolving": cert.get("problemSolvingScore", 80),
-        "confidence": cert.get("confidenceScore", 80),
-    }
+    score_fields = {"overall": cert.get("overallScore"), "technical": cert.get("technicalScore"), "communication": cert.get("communicationScore"), "problemSolving": cert.get("problemSolvingScore"), "confidence": cert.get("confidenceScore")}
+    scores = {key: value for key, value in score_fields.items() if value is not None}
 
     return PublicCertificateVerifyResponse(
         valid=True,
@@ -1994,22 +2021,28 @@ async def get_my_certificates(current_user: dict = Depends(get_current_user)):
             {"studentEmail": user.get("email")},
             {"email": user.get("email")}
         ],
-        "isActive": {"$ne": False},
-        "status": {"$ne": "REVOKED"}
+        "isActive": True,
+        "status": "APPROVED",
+        "isCurrentVersion": {"$ne": False}
     }
     certs = await certificates_collection.find(query).sort("issueDate", -1).to_list(100)
     return [serialize_doc(c) for c in certs]
 
 @router.get("/certificates/student/{student_id}")
 async def get_student_certificates(student_id: str, current_user: dict = Depends(get_current_user)):
-    """Retrieve certificates for a specific student (Authenticated user)."""
+    """Retrieve published certificates for the authenticated student or an admin."""
+    user = await get_authenticated_user_doc(current_user)
+    is_admin = str(user.get("role", "")).upper() in {"ADMIN", "MAIN_ADMIN", "SUPERADMIN"} or bool(user.get("isAdmin"))
+    if not is_admin and str(user.get("_id")) != str(student_id):
+        raise HTTPException(status_code=403, detail="You can only access your own certificates")
     query = {
         "$or": [
             {"studentId": student_id},
             {"userId": student_id}
         ],
-        "isActive": {"$ne": False},
-        "status": {"$ne": "REVOKED"}
+        "isActive": True,
+        "status": "APPROVED",
+        "isCurrentVersion": {"$ne": False}
     }
     if ObjectId.is_valid(student_id):
         query["$or"].extend([
@@ -3345,7 +3378,8 @@ async def generate_ai_study_notes(
         "careerTwin": {k: memory.get(k) for k in ("overallScore", "technicalScore", "communicationScore", "weaknesses", "strengths") if memory.get(k) is not None},
         "curriculumTopics": disc.get("curriculumTopics", []),
     }
-    prompt = f"""You are SkillDNA AI's expert instructional designer. Create genuinely educational, domain-specific notes, not generic motivational text and not a template. Determine the most appropriate subtopics, prerequisites, sequence, and difficulty from the learner context.
+    prompt = f"""You are SkillDNA AI's senior instructional designer and subject-matter educator. Produce an original, deeply explained learning chapter for one student. Do not produce generic motivational text, a shallow summary, or a reusable template. Infer the best prerequisites, subtopics, sequence, and difficulty from the learner context, target role, skill gaps, and curriculum.
+
 Learner context JSON: {json.dumps(context, default=str)}
 Requested topic: {topic}
 Domain: {domain}
@@ -3353,9 +3387,14 @@ Requested level: {level}
 Optional learner source text: {source or '(none)'}
 
 Return ONLY valid JSON with exactly these keys:
-summary (string), detailedNotes (string with headings and explanations), keyPoints (array of strings), quickRevision (array of strings), questions (array of objects with question and answer), flashcards (array of objects with front and back), quiz (array of objects with id, question, options, correctAnswer integer, explanation), objectives (array), prerequisites (array), subtopics (array of strings), difficulty (string), sequenceRationale (string), examples (array of objects with title, context, explanation), realWorldCases (array of objects with case, decision, lesson), practicalApplications (array of strings), commonMistakes (array of objects with mistake and correction), assessmentRubric (array of strings).
+summary (string), detailedNotes (string with Markdown-style headings), keyPoints (array of strings), quickRevision (array of strings), questions (array of objects with question and answer), flashcards (array of objects with front and back), quiz (array of objects with id, question, options, correctAnswer integer, explanation), objectives (array), prerequisites (array), subtopics (array of strings), difficulty (string), sequenceRationale (string), examples (array of objects with title, context, explanation), realWorldCases (array of objects with case, decision, lesson), practicalApplications (array of strings), commonMistakes (array of objects with mistake and correction), assessmentRubric (array of strings).
 
-Requirements: explain why concepts work; use terminology and examples specific to the domain; include multiple contextual examples and real-world cases; compare alternatives and trade-offs; include practical applications, common mistakes, revision, practice and assessment; sequence from prerequisites to advanced material; do not invent citations, credentials, or facts presented as verified."""
+Depth and teaching requirements:
+- detailedNotes must be a coherent 1,800–2,600 word chapter. Use clear headings, short paragraphs, numbered steps, and bullet lists. Define every important term in plain language before using it, explain cause-and-effect and why each technique works, then build from prerequisite to advanced application.
+- Include at least 6 domain-specific examples, at least 4 original real-world-style cases, at least 5 practical applications or project tasks, at least 5 common mistakes with corrections, at least 8 key points, at least 8 revision items, at least 6 questions with model answers, at least 8 flashcards, and at least 8 quiz questions. Make examples concrete for the learner's field and target role, not generic placeholders.
+- Compare relevant alternatives or approaches, explain trade-offs, and state when each is appropriate. Include an assessment rubric with observable criteria and a small practice sequence.
+- Use warm, easy-to-follow language while retaining correct domain terminology. When technical, include concise pseudocode or code only when it helps the requested domain.
+- Write entirely original instructional wording. Do not copy or closely imitate books, articles, courses, documentation, copyrighted examples, lyrics, or other source-specific text. Do not include quotations, fabricated citations, unverifiable claims, credentials, or facts presented as verified. Explain established concepts in your own words and label illustrative cases as examples."""
 
     try:
         import requests
@@ -3365,7 +3404,8 @@ Requirements: explain why concepts work; use terminology and examples specific t
             json={
                 "model": settings.groq_model,
                 "messages": [{"role": "system", "content": "Return only valid JSON. Do not include markdown fences."}, {"role": "user", "content": prompt}],
-                "temperature": 0.55,
+                "temperature": 0.65,
+                "max_tokens": 7000,
                 "response_format": {"type": "json_object"},
             },
             timeout=45,
@@ -3383,11 +3423,26 @@ Requirements: explain why concepts work; use terminology and examples specific t
         await topic_notes_collection.delete_one({"canonicalKey": canonical_key, "status": "Generating"})
         raise HTTPException(status_code=502, detail="AI notes provider returned invalid content.")
 
-    required = ["summary", "detailedNotes", "keyPoints", "quickRevision", "questions", "flashcards", "quiz", "objectives", "prerequisites"]
+    required = [
+        "summary", "detailedNotes", "keyPoints", "quickRevision", "questions", "flashcards", "quiz",
+        "objectives", "prerequisites", "subtopics", "sequenceRationale", "examples", "realWorldCases",
+        "practicalApplications", "commonMistakes", "assessmentRubric",
+    ]
     missing = [key for key in required if not generated.get(key)]
-    if missing:
+    minimums = {
+        "summary": 250, "detailedNotes": 900, "sequenceRationale": 120,
+    }
+    too_short = [key for key, minimum in minimums.items() if not isinstance(generated.get(key), str) or len(generated[key].strip()) < minimum]
+    list_minimums = {
+        "keyPoints": 8, "quickRevision": 8, "questions": 6, "flashcards": 8, "quiz": 8,
+        "objectives": 4, "prerequisites": 3, "subtopics": 4, "examples": 6, "realWorldCases": 4,
+        "practicalApplications": 5, "commonMistakes": 5, "assessmentRubric": 4,
+    }
+    insufficient = [key for key, minimum in list_minimums.items() if not isinstance(generated.get(key), list) or len(generated[key]) < minimum]
+    invalid = missing + [f"{key} (too short)" for key in too_short] + [f"{key} (needs at least {list_minimums[key]} items)" for key in insufficient]
+    if invalid:
         await topic_notes_collection.delete_one({"canonicalKey": canonical_key, "status": "Generating"})
-        raise HTTPException(status_code=502, detail=f"AI notes response is incomplete: {', '.join(missing)}")
+        raise HTTPException(status_code=502, detail=f"AI notes response did not meet the required educational depth: {', '.join(invalid)}")
     generated["topic"] = topic
     generated["domain"] = domain
     generated["level"] = level
