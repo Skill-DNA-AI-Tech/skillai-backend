@@ -87,6 +87,8 @@ from schemas import (
     ProfileCreateRequest,
     CareerChangeRequestCreate,
     CareerChangeReviewRequest,
+    SubjectChangeRequestCreate,
+    SubjectChangeReviewRequest,
     CertificateCreateRequest,
     AdminCertificateIssueRequest,
     CertificateShareRequest,
@@ -4433,11 +4435,40 @@ async def get_my_career_change_requests(current_user: dict = Depends(get_current
     requests = await career_change_requests_collection.find(query).sort("createdAt", -1).to_list(50)
     return [serialize_doc(r) for r in requests]
 
+
+@router.post("/subject-change-requests")
+async def create_subject_change_request(payload: SubjectChangeRequestCreate, current_user: dict = Depends(get_current_user)):
+    user = await get_authenticated_user_doc(current_user)
+    current_subject = payload.currentSubject or user.get("careerDomain") or "Current curriculum"
+    request = {
+        "userId": user.get("_id"), "student": user.get("_id"), "studentName": user.get("name", "Student"),
+        "email": user.get("email"), "requestType": "SUBJECT_CHANGE", "fromRole": current_subject,
+        "toRole": payload.targetSubject, "currentSubject": current_subject, "targetSubject": payload.targetSubject,
+        "reason": payload.reason.strip(), "status": "PENDING", "createdAt": datetime.utcnow(), "updatedAt": datetime.utcnow()
+    }
+    result = await career_change_requests_collection.insert_one(request)
+    request["_id"] = result.inserted_id
+    return serialize_doc(request)
+
+
+@router.get("/subject-change-requests/my")
+async def get_my_subject_change_requests(current_user: dict = Depends(get_current_user)):
+    user = await get_authenticated_user_doc(current_user)
+    query = {"$or": [{"userId": user.get("_id")}, {"userId": str(user.get("_id"))}, {"email": user.get("email")}], "requestType": "SUBJECT_CHANGE"}
+    requests = await career_change_requests_collection.find(query).sort("createdAt", -1).to_list(50)
+    return [serialize_doc(item) for item in requests]
+
 @router.get("/career-change-requests")
-async def get_career_change_requests(current_user: dict = Depends(get_current_user)):
-    """List career change requests (Authenticated user / HR / Admin)."""
+async def get_career_change_requests(current_user: dict = Depends(get_current_admin)):
+    """List career and subject change requests (Admin only)."""
     items = await career_change_requests_collection.find({}).sort("createdAt", -1).to_list(100)
     return [serialize_doc(i) for i in items]
+
+
+@router.get("/admin/subject-change-requests")
+async def get_subject_change_requests(current_admin: dict = Depends(get_current_admin)):
+    items = await career_change_requests_collection.find({"requestType": "SUBJECT_CHANGE"}).sort("createdAt", -1).to_list(100)
+    return [serialize_doc(item) for item in items]
 
 @router.put("/career-change-requests/{id}/review")
 async def review_career_change_request(
@@ -4484,6 +4515,15 @@ async def review_career_change_request(
             )
 
     return {"status": "success", "message": f"Career change request {status_val.lower()}"}
+
+
+@router.put("/admin/subject-change-requests/{id}/review")
+async def review_subject_change_request(id: str, payload: SubjectChangeReviewRequest, current_admin: dict = Depends(get_current_admin)):
+    query = {"_id": ObjectId(id)} if ObjectId.is_valid(id) else {"_id": id}
+    request = await career_change_requests_collection.find_one({**query, "requestType": "SUBJECT_CHANGE"})
+    if not request:
+        raise HTTPException(status_code=404, detail="Subject change request not found")
+    return await review_career_change_request(id, payload, current_admin)
 
 # ==========================================
 # 19. STUDENT CERTIFICATE CREATION

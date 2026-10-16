@@ -289,6 +289,14 @@ class CareerChangeReviewRequest(BaseModel):
     status: str = Field(..., description="APPROVED or REJECTED")
     reviewNotes: Optional[str] = None
 
+class SubjectChangeRequestCreate(BaseModel):
+    currentSubject: Optional[str] = Field(None, max_length=120)
+    targetSubject: str = Field(..., min_length=2, max_length=120)
+    reason: str = Field(..., min_length=12, max_length=2000)
+
+class SubjectChangeReviewRequest(CareerChangeReviewRequest):
+    pass
+
 class CareerGapAnalysisRequest(BaseModel):
     targetCareer: str = Field(..., min_length=2, max_length=120)
     currentSkills: List[str] = Field(default_factory=list, max_length=100)
