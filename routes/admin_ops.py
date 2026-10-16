@@ -38,6 +38,7 @@ from database import (
     student_notes_collection,
     student_note_progress_collection,
     career_change_requests_collection,
+    career_gap_analyses_collection,
     topic_notes_collection,
     content_requests_collection,
     pdf_watermark_settings_collection,
@@ -111,7 +112,9 @@ from schemas import (
     PdfWatermarkSettingsRequest,
     PdfWatermarkSettingsResponse,
     NotePdfExportRequest,
+    CareerGapAnalysisRequest,
 )
+from career_gap import CAREERS, analyze_career, get_career
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Admin & Business Operations"])
@@ -3875,6 +3878,59 @@ DOMAIN_PRACTICAL_PROJECTS = {
         "deliverable": "System Architecture Blueprint & OpenAPI Specification"
     }
 }
+
+@router.get("/career-gap/catalog")
+async def get_career_gap_catalog(current_user: dict = Depends(get_current_user)):
+    """Return maintainable career categories and competency definitions."""
+    return {"careers": [{"id": c.id, "category": c.category, "title": c.title, "description": c.description, "competencies": list(c.competencies)} for c in CAREERS]}
+
+
+async def _career_gap_analysis_for_user(current_user: dict, payload: CareerGapAnalysisRequest) -> dict:
+    user = await get_authenticated_user_doc(current_user)
+    profile = await profiles_collection.find_one({"user": user.get("_id")}) or {}
+    career = get_career(payload.targetCareer)
+    assessments = await assessments_collection.find({"userId": user.get("_id")}).to_list(500)
+    answers = await student_answers_collection.find({"studentId": user.get("_id")}).to_list(500)
+    merged_profile = dict(profile)
+    merged_profile["skills"] = list(dict.fromkeys((profile.get("skills") or []) + (payload.currentSkills or [])))
+    if payload.experienceSummary:
+        merged_profile["experienceSummary"] = payload.experienceSummary
+    result = analyze_career(career, merged_profile, assessments, answers)
+    now = datetime.utcnow()
+    document = {"userId": user.get("_id"), "targetCareerId": career.id, "targetLevel": payload.targetLevel, "input": {"currentSkills": payload.currentSkills, "experienceSummary": payload.experienceSummary}, "result": result, "createdAt": now, "updatedAt": now}
+    saved = await career_gap_analyses_collection.insert_one(document)
+    result["analysisId"] = str(saved.inserted_id)
+    result["createdAt"] = now.isoformat()
+    return result
+
+
+@router.post("/career-gap/analyze")
+async def create_career_gap_analysis(payload: CareerGapAnalysisRequest, current_user: dict = Depends(get_current_user)):
+    """Create and persist an explainable analysis for the authenticated student."""
+    try:
+        return await _career_gap_analysis_for_user(current_user, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/career-gap/me")
+async def get_my_career_gap_analysis(current_user: dict = Depends(get_current_user)):
+    user = await get_authenticated_user_doc(current_user)
+    latest = await career_gap_analyses_collection.find_one({"userId": user.get("_id")}, sort=[("createdAt", -1)])
+    if not latest:
+        return {"analysis": None, "message": "No career gap analysis has been created yet."}
+    result = serialize_doc(latest.get("result") or {})
+    result["analysisId"] = str(latest.get("_id"))
+    result["createdAt"] = latest.get("createdAt")
+    return {"analysis": result}
+
+
+@router.get("/career-gap/history")
+async def get_my_career_gap_history(current_user: dict = Depends(get_current_user)):
+    user = await get_authenticated_user_doc(current_user)
+    records = await career_gap_analyses_collection.find({"userId": user.get("_id")}, {"result": 1, "createdAt": 1, "targetCareerId": 1}).sort("createdAt", -1).limit(25).to_list(25)
+    return [{"analysisId": str(record.get("_id")), "targetCareer": (record.get("result") or {}).get("targetCareer", {}), "readinessScore": (record.get("result") or {}).get("readinessScore"), "createdAt": record.get("createdAt")} for record in records]
+
 
 @router.get("/career-twin/me")
 async def get_my_career_twin(current_user: dict = Depends(get_current_user)):

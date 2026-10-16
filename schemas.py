@@ -289,6 +289,12 @@ class CareerChangeReviewRequest(BaseModel):
     status: str = Field(..., description="APPROVED or REJECTED")
     reviewNotes: Optional[str] = None
 
+class CareerGapAnalysisRequest(BaseModel):
+    targetCareer: str = Field(..., min_length=2, max_length=120)
+    currentSkills: List[str] = Field(default_factory=list, max_length=100)
+    experienceSummary: Optional[str] = Field(None, max_length=4000)
+    targetLevel: Optional[str] = Field(None, max_length=80)
+
 # ==========================================
 # 9. CERTIFICATES & QUESTION BANK SCHEMAS
 # ==========================================
