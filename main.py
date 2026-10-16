@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
@@ -8,7 +9,9 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 import uvicorn
 
 from config import settings
-from database import init_db
+from database import init_db, question_batches_collection, audit_logs_collection, job_locks_collection
+from career_gap import CAREERS
+from question_batches import run_monthly_batch_job
 from routes.auth import router as student_auth_router
 from routes.admin import router as admin_auth_router
 from routes.admin_ops import router as admin_ops_router
@@ -26,7 +29,20 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up SkillDNA Tech AI Unified Backend API...")
     # Initialize DB indexes and seed default records
     await init_db()
+    async def monthly_question_loop():
+        while True:
+            try:
+                await run_monthly_batch_job(question_batches_collection, audit_logs_collection, job_locks_collection, CAREERS, owner=f"api-{id(app)}")
+            except Exception:
+                logger.exception("Monthly question batch job failed; existing batches remain intact")
+            await asyncio.sleep(86400)
+    scheduler_task = asyncio.create_task(monthly_question_loop())
     yield
+    scheduler_task.cancel()
+    try:
+        await scheduler_task
+    except asyncio.CancelledError:
+        pass
     logger.info("Shutting down SkillDNA Tech AI Unified Backend API...")
 
 app = FastAPI(

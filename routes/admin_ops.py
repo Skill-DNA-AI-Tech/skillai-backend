@@ -37,9 +37,13 @@ from database import (
     helpdesk_tickets_collection,
     student_notes_collection,
     student_note_progress_collection,
+    student_note_versions_collection,
+    note_regeneration_requests_collection,
     career_change_requests_collection,
     career_gap_analyses_collection,
     topic_notes_collection,
+    question_batches_collection,
+    question_attempts_collection,
     content_requests_collection,
     pdf_watermark_settings_collection,
 )
@@ -105,6 +109,9 @@ from schemas import (
     StudentNoteSaveRequest,
     StudentNoteUpdateRequest,
     NoteQuizSubmitRequest,
+    NoteRegenerationRequestCreate,
+    NoteRegenerationDecisionRequest,
+    QuestionBatchAttemptRequest,
     TopicNoteCreateRequest,
     TopicNoteUpdateRequest,
     TopicNoteAiGenerateRequest,
@@ -115,6 +122,7 @@ from schemas import (
     CareerGapAnalysisRequest,
 )
 from career_gap import CAREERS, analyze_career, get_career
+from question_batches import build_batch, public_question
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Admin & Business Operations"])
@@ -1573,6 +1581,66 @@ async def generate_and_add_questions(
         generated.append(serialize_doc(doc))
 
     return {"message": f"Generated {len(generated)} questions", "questions": generated}
+
+
+@router.post("/admin/question-batches/generate")
+async def generate_question_batch(
+    payload: Dict[str, Any],
+    current_admin: dict = Depends(get_current_admin),
+):
+    career_id = str(payload.get("careerId") or payload.get("curriculumId") or "software-engineer")
+    try:
+        career = get_career(career_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    curriculum_id = career.id
+    latest = await question_batches_collection.find_one({"curriculumId": curriculum_id}, sort=[("batchNumber", -1)])
+    batch_number = int((latest or {}).get("batchNumber") or 0) + 1
+    existing = await question_batches_collection.find_one({"curriculumId": curriculum_id, "batchNumber": batch_number})
+    if existing:
+        return serialize_doc(existing)
+    batch = build_batch(curriculum_id, {"title": career.title, "competencies": list(career.competencies)}, batch_number)
+    try:
+        await question_batches_collection.insert_one(batch)
+    except Exception as exc:
+        if "duplicate" not in str(exc).lower() and "e11000" not in str(exc).lower():
+            raise
+        batch = await question_batches_collection.find_one({"curriculumId": curriculum_id, "batchNumber": batch_number})
+    await audit_logs_collection.insert_one({"action": "QUESTION_BATCH_GENERATED", "performedBy": current_admin.get("email") or current_admin.get("sub"), "entityId": batch.get("batchId"), "timestamp": datetime.utcnow()})
+    return serialize_doc(batch)
+
+
+@router.get("/learning/question-batches")
+async def list_question_batches(current_user: dict = Depends(get_current_user)):
+    user = await get_authenticated_user_doc(current_user)
+    profile = await profiles_collection.find_one({"$or": [{"user": user.get("_id")}, {"userId": user.get("_id")}, {"userId": str(user.get("_id"))}]}) or {}
+    career_name = profile.get("career") or profile.get("targetRole") or "software-engineer"
+    try:
+        career = get_career(career_name)
+    except ValueError:
+        career = CAREERS[0]
+    batches = await question_batches_collection.find({"curriculumId": career.id}).sort("batchNumber", -1).to_list(25)
+    now = datetime.utcnow()
+    response = []
+    for batch in batches:
+        released = bool(batch.get("answerKeyAvailableAt") and batch["answerKeyAvailableAt"] <= now)
+        response.append({"batchId": batch.get("batchId"), "curriculumId": batch.get("curriculumId"), "career": batch.get("career"), "batchNumber": batch.get("batchNumber"), "status": batch.get("status"), "questionCount": batch.get("questionCount"), "difficultyDistribution": batch.get("difficultyDistribution"), "publishedAt": batch.get("publishedAt"), "answerKeyAvailableAt": batch.get("answerKeyAvailableAt"), "answerKeyReleased": released, "questions": [public_question(q, released) for q in batch.get("questions", [])]})
+    return {"batches": response}
+
+
+@router.post("/learning/question-batches/{batch_id}/attempt")
+async def submit_question_batch_attempt(batch_id: str, payload: QuestionBatchAttemptRequest, current_user: dict = Depends(get_current_user)):
+    user = await get_authenticated_user_doc(current_user)
+    batch = await question_batches_collection.find_one({"batchId": batch_id})
+    if not batch:
+        raise HTTPException(status_code=404, detail="Question batch not found")
+    answers = payload.answers or {}
+    released = bool(batch.get("answerKeyAvailableAt") and batch["answerKeyAvailableAt"] <= datetime.utcnow())
+    correct = sum(1 for question in batch.get("questions", []) if answers.get(question.get("questionId")) == question.get("expectedAnswer"))
+    attempt = {"userId": user.get("_id"), "batchId": batch_id, "answers": answers, "score": round(correct / max(1, len(batch.get("questions", []))) * 100, 1), "answerKeyAvailable": released, "createdAt": datetime.utcnow()}
+    result = await question_attempts_collection.insert_one(attempt)
+    attempt["_id"] = result.inserted_id
+    return {"attempt": serialize_doc(attempt), "message": "Attempt saved. Explanations are available after the answer-key release date." if not released else "Attempt saved with released answer-key explanations."}
 
 @router.delete("/questions/admin/{id}")
 async def delete_question(id: str, current_admin: dict = Depends(get_current_admin)):
@@ -3544,6 +3612,9 @@ async def save_student_study_note(
         "updatedAt": datetime.utcnow()
     }
 
+    existing_saved = await student_notes_collection.find_one({"userId": u_id, "sharedNoteId": shared_id})
+    doc["version"] = int((existing_saved or {}).get("version") or 1)
+    doc["generationStatus"] = "SAVED"
     update_fields = {key: value for key, value in doc.items() if key != "createdAt"}
     update_fields["updatedAt"] = datetime.utcnow()
     res = await student_notes_collection.update_one(
@@ -3553,6 +3624,8 @@ async def save_student_study_note(
     )
     saved = await student_notes_collection.find_one({"userId": u_id, "sharedNoteId": shared_id})
     doc = saved or doc
+    if not existing_saved:
+        await student_note_versions_collection.insert_one({**doc, "savedNoteId": doc.get("_id"), "createdAt": datetime.utcnow(), "version": 1})
     await student_note_progress_collection.update_one(
         {"userId": u_id, "noteId": shared_id},
         {"$setOnInsert": {"userId": u_id, "noteId": shared_id, "createdAt": datetime.utcnow()}, "$set": {"updatedAt": datetime.utcnow()}},
@@ -3565,6 +3638,33 @@ async def save_student_study_note(
     serialized["sharedContent"] = shared_note_response(shared_note)
     return serialized
 
+
+@router.get("/learning/notes/regeneration-requests")
+async def list_my_note_regeneration_requests(current_user: dict = Depends(get_current_user)):
+    user = await get_authenticated_user_doc(current_user)
+    requests = await note_regeneration_requests_collection.find({"userId": user.get("_id")}).sort("createdAt", -1).to_list(100)
+    return [serialize_doc(item) for item in requests]
+
+
+@router.post("/learning/notes/regeneration-requests")
+async def request_note_regeneration(payload: NoteRegenerationRequestCreate, current_user: dict = Depends(get_current_user)):
+    user = await get_authenticated_user_doc(current_user)
+    try:
+        note_id = ObjectId(payload.noteId)
+    except Exception:
+        note_id = payload.noteId
+    note = await student_notes_collection.find_one({"_id": note_id, "userId": user.get("_id")})
+    if not note:
+        raise HTTPException(status_code=404, detail="Saved note not found or unauthorized")
+    pending = await note_regeneration_requests_collection.find_one({"userId": user.get("_id"), "noteId": str(note.get("_id")), "status": "PENDING"})
+    if pending:
+        return serialize_doc(pending)
+    request = {"userId": user.get("_id"), "noteId": str(note.get("_id")), "topic": note.get("topic"), "currentVersion": note.get("version", 1), "reason": payload.reason.strip(), "status": "PENDING", "createdAt": datetime.utcnow(), "updatedAt": datetime.utcnow()}
+    result = await note_regeneration_requests_collection.insert_one(request)
+    request["_id"] = result.inserted_id
+    await audit_logs_collection.insert_one({"action": "NOTE_REGENERATION_REQUESTED", "performedBy": str(user.get("_id")), "entityId": str(result.inserted_id), "timestamp": datetime.utcnow()})
+    return serialize_doc(request)
+
 @router.get("/learning/notes/my")
 async def get_my_study_notes(current_user: dict = Depends(get_current_user)):
     """Retrieve all study notes saved by the logged-in student (Authenticated user)."""
@@ -3576,6 +3676,7 @@ async def get_my_study_notes(current_user: dict = Depends(get_current_user)):
             shared = await topic_notes_collection.find_one({"_id": ObjectId(note["sharedNoteId"]) if ObjectId.is_valid(str(note["sharedNoteId"])) else note["sharedNoteId"]})
             if shared:
                 merged = shared_note_response(shared)
+                merged.update(serialize_doc(note))
                 merged.update({"_id": str(note.get("_id")), "id": str(note.get("_id")), "sharedNoteId": note.get("sharedNoteId"), "savedAt": note.get("updatedAt")})
                 result.append(merged)
                 continue
@@ -5203,3 +5304,56 @@ async def fulfill_content_request(
         "message": "Content request marked as fulfilled.",
         "request": serialize_doc(res)
     }
+
+
+@router.get("/admin/notes/regeneration-requests")
+async def list_note_regeneration_requests(
+    status: Optional[str] = Query(None),
+    current_admin: dict = Depends(get_current_admin),
+):
+    query: Dict[str, Any] = {}
+    if status and status.upper() != "ALL":
+        query["status"] = status.upper()
+    rows = await note_regeneration_requests_collection.find(query).sort("createdAt", -1).to_list(100)
+    return {"requests": [serialize_doc(row) for row in rows], "total": len(rows)}
+
+
+@router.post("/admin/notes/regeneration-requests/{request_id}/decision")
+async def decide_note_regeneration_request(
+    request_id: str,
+    payload: NoteRegenerationDecisionRequest,
+    current_admin: dict = Depends(get_current_admin),
+):
+    try:
+        request_obj_id = ObjectId(request_id)
+    except Exception:
+        request_obj_id = request_id
+    request = await note_regeneration_requests_collection.find_one({"_id": request_obj_id})
+    if not request:
+        raise HTTPException(status_code=404, detail="Regeneration request not found")
+    if request.get("status") != "PENDING":
+        raise HTTPException(status_code=409, detail="This regeneration request has already been decided")
+    decision = payload.decision.upper()
+    update = {"status": decision, "decisionNotes": (payload.decisionNotes or "").strip(), "decidedBy": current_admin.get("email") or current_admin.get("sub"), "decidedAt": datetime.utcnow(), "updatedAt": datetime.utcnow()}
+    if decision == "APPROVED":
+        try:
+            note_obj_id = ObjectId(str(request.get("noteId")))
+        except Exception:
+            note_obj_id = request.get("noteId")
+        note = await student_notes_collection.find_one({"_id": note_obj_id, "userId": request.get("userId")})
+        if not note:
+            raise HTTPException(status_code=404, detail="The saved note no longer exists or is not owned by the requesting student")
+        previous_version = int(note.get("version") or 1)
+        new_version = previous_version + 1
+        reason = request.get("reason", "requested a clearer explanation")
+        improved_detail = f"\n\n## Revision focus\nThis version was regenerated after the learner requested: {reason}\n\n### Targeted practice\nReview the examples, explain the core trade-offs in your own words, and complete a fresh assessment for {note.get('topic', 'this topic')}."
+        improved_note = {**note, "version": new_version, "generationStatus": "REGENERATED", "detailedNotes": f"{note.get('detailedNotes', '')}{improved_detail}", "updatedAt": datetime.utcnow(), "regeneratedFromVersion": previous_version, "regenerationReason": reason}
+        improved_note.pop("_id", None)
+        await student_note_versions_collection.insert_one({**improved_note, "savedNoteId": note_obj_id, "createdAt": datetime.utcnow()})
+        await student_notes_collection.update_one({"_id": note_obj_id, "userId": request.get("userId")}, {"$set": {key: value for key, value in improved_note.items() if key not in {"userId", "savedNoteId", "createdAt"}}})
+        update["newVersion"] = new_version
+        update["status"] = "APPROVED"
+    await note_regeneration_requests_collection.update_one({"_id": request_obj_id}, {"$set": update})
+    await audit_logs_collection.insert_one({"action": f"NOTE_REGENERATION_{decision}", "performedBy": current_admin.get("email") or current_admin.get("sub"), "entityId": str(request_id), "timestamp": datetime.utcnow(), "details": update})
+    request.update(update)
+    return {"message": f"Note regeneration request {decision.lower()}.", "request": serialize_doc(request)}

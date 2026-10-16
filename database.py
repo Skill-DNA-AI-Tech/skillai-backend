@@ -66,9 +66,14 @@ assessments_collection = db["assessments"]
 helpdesk_tickets_collection = db["helpdesk_tickets"]
 student_notes_collection = db["student_notes"]
 student_note_progress_collection = db["student_note_progress"]
+student_note_versions_collection = db["student_note_versions"]
+note_regeneration_requests_collection = db["note_regeneration_requests"]
 career_change_requests_collection = db["career_change_requests"]
 career_gap_analyses_collection = db["career_gap_analyses"]
 topic_notes_collection = db["topic_notes"]
+question_batches_collection = db["question_batches"]
+question_attempts_collection = db["question_attempts"]
+job_locks_collection = db["job_locks"]
 content_requests_collection = db["contentrequests"]
 pdf_watermark_settings_collection = db["pdf_watermark_settings"]
 
@@ -100,7 +105,11 @@ async def init_db():
         # A student may save/bookmark a canonical note once; progress is always separate from content.
         await student_notes_collection.create_index([("userId", 1), ("sharedNoteId", 1)], unique=True, partialFilterExpression={"sharedNoteId": {"$exists": True}})
         await student_note_progress_collection.create_index([("userId", 1), ("noteId", 1)], unique=True)
+        await student_note_versions_collection.create_index([("userId", 1), ("topic", 1), ("version", -1)])
+        await note_regeneration_requests_collection.create_index([("userId", 1), ("createdAt", -1)])
         await career_gap_analyses_collection.create_index([("userId", 1), ("createdAt", -1)])
+        await question_batches_collection.create_index([("curriculumId", 1), ("batchNumber", -1)], unique=True)
+        await question_attempts_collection.create_index([("userId", 1), ("batchId", 1), ("createdAt", -1)])
         logger.info("MongoDB indexes created successfully on unified database: %s", db_name)
 
         from auth_handler import get_password_hash

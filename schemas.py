@@ -498,6 +498,17 @@ class StudentNoteUpdateRequest(BaseModel):
 class NoteQuizSubmitRequest(BaseModel):
     answers: Dict[str, Any]
 
+class NoteRegenerationRequestCreate(BaseModel):
+    noteId: str = Field(..., min_length=1, max_length=120)
+    reason: str = Field(..., min_length=12, max_length=2000)
+
+class NoteRegenerationDecisionRequest(BaseModel):
+    decision: str = Field(..., pattern="^(APPROVED|REJECTED)$")
+    decisionNotes: Optional[str] = Field(None, max_length=2000)
+
+class QuestionBatchAttemptRequest(BaseModel):
+    answers: Dict[str, Any] = Field(default_factory=dict)
+
 # ==========================================
 # 14. ADMIN TOPIC NOTES & CURRICULUM SCHEMAS
 # ==========================================
