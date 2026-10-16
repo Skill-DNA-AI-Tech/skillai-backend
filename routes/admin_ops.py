@@ -1634,6 +1634,9 @@ async def submit_question_batch_attempt(batch_id: str, payload: QuestionBatchAtt
     batch = await question_batches_collection.find_one({"batchId": batch_id})
     if not batch:
         raise HTTPException(status_code=404, detail="Question batch not found")
+    existing_attempt = await question_attempts_collection.find_one({"userId": user.get("_id"), "batchId": batch_id})
+    if existing_attempt:
+        raise HTTPException(status_code=409, detail="You have already submitted this question batch. View the saved attempt instead of submitting it again.")
     answers = payload.answers or {}
     released = bool(batch.get("answerKeyAvailableAt") and batch["answerKeyAvailableAt"] <= datetime.utcnow())
     correct = sum(1 for question in batch.get("questions", []) if answers.get(question.get("questionId")) == question.get("expectedAnswer"))
@@ -1641,6 +1644,13 @@ async def submit_question_batch_attempt(batch_id: str, payload: QuestionBatchAtt
     result = await question_attempts_collection.insert_one(attempt)
     attempt["_id"] = result.inserted_id
     return {"attempt": serialize_doc(attempt), "message": "Attempt saved. Explanations are available after the answer-key release date." if not released else "Attempt saved with released answer-key explanations."}
+
+
+@router.get("/learning/question-batches/{batch_id}/attempts")
+async def get_question_batch_attempts(batch_id: str, current_user: dict = Depends(get_current_user)):
+    user = await get_authenticated_user_doc(current_user)
+    attempts = await question_attempts_collection.find({"userId": user.get("_id"), "batchId": batch_id}).sort("createdAt", -1).to_list(20)
+    return {"attempts": [serialize_doc(attempt) for attempt in attempts]}
 
 @router.delete("/questions/admin/{id}")
 async def delete_question(id: str, current_admin: dict = Depends(get_current_admin)):

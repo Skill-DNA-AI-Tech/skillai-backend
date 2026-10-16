@@ -24,3 +24,11 @@ def test_batch_release_is_thirty_days_after_publication():
     published = datetime.utcnow()
     batch = build_batch("software-engineer", {"title": "Software Engineer", "competencies": ["Testing"]}, 2, published)
     assert batch["answerKeyAvailableAt"] == published + timedelta(days=30)
+
+
+def test_question_batch_api_requires_authentication():
+    from fastapi.testclient import TestClient
+    from main import app
+
+    response = TestClient(app).get("/api/learning/question-batches")
+    assert response.status_code == 401
