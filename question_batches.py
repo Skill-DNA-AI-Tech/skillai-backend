@@ -24,12 +24,12 @@ def build_batch(curriculum_id: str, career: dict[str, Any], batch_number: int, n
         "python": "You inherit a Python component that works locally but fails under real input variation. Use {topic_name} to explain a {difficulty} fix and the evidence that would prove it safe.",
         "data structure": "A feature needs predictable performance as its dataset grows. Compare options using {topic_name} and justify the {difficulty} choice with time/space reasoning.",
     }
-    def question_text(topic_name: str, difficulty: str) -> str:
+    def question_text(topic_name: str, difficulty: str, variant: int) -> str:
         lowered = topic_name.lower()
         for key, template in prompt_templates.items():
             if key in lowered:
-                return template.format(difficulty=difficulty.lower(), topic_name=topic_name)
-        return f"For a realistic {career.get('title', 'curriculum')} project, apply {topic_name} to solve a concrete problem. Give the steps, one trade-off, and the evidence you would use to verify the {difficulty.lower()} solution."
+                return template.format(difficulty=difficulty.lower(), topic_name=topic_name) + f" Compare your approach with alternative {variant} and state when that alternative is preferable."
+        return f"For a realistic {career.get('title', 'curriculum')} project, apply {topic_name} to solve a concrete problem (scenario {variant}). Give the steps, one trade-off, and the evidence you would use to verify the {difficulty.lower()} solution."
     for difficulty, count in (("Easy", 4), ("Medium", 7), ("Hard", 4)):
         for _ in range(count):
             topic = topics[index % len(topics)]
@@ -39,13 +39,35 @@ def build_batch(curriculum_id: str, career: dict[str, Any], batch_number: int, n
                 "topic": topic_name,
                 "difficulty": difficulty,
                 "type": "theory",
-                "question": question_text(topic_name, difficulty),
+                "question": question_text(topic_name, difficulty, index + 1),
                 "options": [],
                 "expectedAnswer": f"A strong answer defines {topic_name}, applies it to the stated project scenario, explains the trade-off, and names concrete verification evidence.",
                 "explanation": f"The question tests application rather than recall: define {topic_name}, connect the choice to the scenario, explain the {difficulty.lower()} trade-off, and identify how the result would be validated.",
             })
             index += 1
-    return {"batchId": batch_id, "curriculumId": curriculum_id, "career": career.get("title"), "batchNumber": batch_number, "status": "PUBLISHED", "questions": questions, "questionCount": len(questions), "difficultyDistribution": {"Easy": 4, "Medium": 7, "Hard": 4}, "publishedAt": now, "answerKeyAvailableAt": now + timedelta(days=30), "createdAt": now, "updatedAt": now, "generation": {"method": "deterministic curriculum seed", "validated": True}}
+    return {"batchId": batch_id, "curriculumId": curriculum_id, "career": career.get("title"), "batchNumber": batch_number, "status": "PENDING_APPROVAL", "questions": questions, "questionCount": len(questions), "difficultyDistribution": {"Easy": 4, "Medium": 7, "Hard": 4}, "publishedAt": None, "answerKeyAvailableAt": now + timedelta(days=30), "generatedAt": now, "createdAt": now, "updatedAt": now, "generation": {"method": "deterministic curriculum seed", "validated": True}}
+
+
+def validate_batch(batch: dict[str, Any]) -> list[str]:
+    errors = []
+    questions = batch.get("questions") or []
+    if len(questions) != 15:
+        errors.append("batch must contain exactly 15 questions")
+    expected = {"Easy": 4, "Medium": 7, "Hard": 4}
+    actual = {level: sum(1 for question in questions if question.get("difficulty") == level) for level in expected}
+    if actual != expected:
+        errors.append(f"difficulty distribution must be 4/7/4, received {actual}")
+    ids = [question.get("questionId") for question in questions]
+    if len(ids) != len(set(ids)):
+        errors.append("question IDs must be unique")
+    texts = [str(question.get("question", "")).strip().lower() for question in questions]
+    if len(texts) != len(set(texts)):
+        errors.append("duplicate question text is not allowed")
+    for index, question in enumerate(questions, 1):
+        for field in ("questionId", "topic", "question", "expectedAnswer", "explanation"):
+            if not str(question.get(field, "")).strip():
+                errors.append(f"question {index} is missing {field}")
+    return errors
 
 
 def public_question(question: dict[str, Any], answer_key_available: bool) -> dict[str, Any]:
@@ -76,8 +98,9 @@ async def run_monthly_batch_job(question_batches_collection, audit_logs_collecti
         try:
             await question_batches_collection.insert_one(batch)
             generated += 1
-        except Exception:
-            continue
+        except Exception as exc:
+            await audit_logs_collection.insert_one({"action": "QUESTION_BATCH_MONTHLY_JOB_FAILED", "curriculumId": career.id, "error": str(exc)[:500], "performedBy": owner, "timestamp": now})
+            raise
     await lock_collection.update_one({"_id": "monthly-question-batches", "owner": owner}, {"$set": {"lastRunAt": now, "leaseUntil": now}})
     await audit_logs_collection.insert_one({"action": "QUESTION_BATCH_MONTHLY_JOB", "performedBy": owner, "generated": generated, "timestamp": now})
     return {"generated": generated, "ranAt": now}

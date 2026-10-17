@@ -124,7 +124,7 @@ from schemas import (
     CareerGapAnalysisRequest,
 )
 from career_gap import CAREERS, analyze_career, get_career
-from question_batches import build_batch, public_question
+from question_batches import build_batch, public_question, validate_batch
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Admin & Business Operations"])
@@ -1602,6 +1602,9 @@ async def generate_question_batch(
     if existing:
         return serialize_doc(existing)
     batch = build_batch(curriculum_id, {"title": career.title, "competencies": list(career.competencies)}, batch_number)
+    validation_errors = validate_batch(batch)
+    if validation_errors:
+        raise HTTPException(status_code=422, detail={"message": "Generated batch failed validation", "errors": validation_errors})
     try:
         await question_batches_collection.insert_one(batch)
     except Exception as exc:
@@ -1609,6 +1612,30 @@ async def generate_question_batch(
             raise
         batch = await question_batches_collection.find_one({"curriculumId": curriculum_id, "batchNumber": batch_number})
     await audit_logs_collection.insert_one({"action": "QUESTION_BATCH_GENERATED", "performedBy": current_admin.get("email") or current_admin.get("sub"), "entityId": batch.get("batchId"), "timestamp": datetime.utcnow()})
+    return serialize_doc(batch)
+
+
+@router.get("/admin/question-batches")
+async def list_admin_question_batches(current_admin: dict = Depends(get_current_admin)):
+    batches = await question_batches_collection.find({}).sort("createdAt", -1).to_list(100)
+    return {"batches": [serialize_doc(batch) for batch in batches], "total": len(batches)}
+
+
+@router.post("/admin/question-batches/{batch_id}/publish")
+async def publish_question_batch(batch_id: str, current_admin: dict = Depends(get_current_admin)):
+    batch = await question_batches_collection.find_one({"batchId": batch_id})
+    if not batch:
+        raise HTTPException(status_code=404, detail="Question batch not found")
+    validation_errors = validate_batch(batch)
+    if validation_errors:
+        raise HTTPException(status_code=422, detail={"message": "Batch failed publication validation", "errors": validation_errors})
+    if batch.get("status") == "PUBLISHED":
+        return serialize_doc(batch)
+    now = datetime.utcnow()
+    update = {"status": "PUBLISHED", "publishedAt": now, "answerKeyAvailableAt": now + timedelta(days=30), "publishedBy": current_admin.get("email") or current_admin.get("sub"), "updatedAt": now}
+    await question_batches_collection.update_one({"batchId": batch_id}, {"$set": update})
+    batch.update(update)
+    await audit_logs_collection.insert_one({"action": "QUESTION_BATCH_PUBLISHED", "performedBy": current_admin.get("email") or current_admin.get("sub"), "entityId": batch_id, "timestamp": now})
     return serialize_doc(batch)
 
 
@@ -1621,7 +1648,7 @@ async def list_question_batches(current_user: dict = Depends(get_current_user)):
         career = get_career(career_name)
     except ValueError:
         career = CAREERS[0]
-    batches = await question_batches_collection.find({"curriculumId": career.id}).sort("batchNumber", -1).to_list(25)
+    batches = await question_batches_collection.find({"curriculumId": career.id, "status": "PUBLISHED"}).sort("batchNumber", -1).to_list(25)
     now = datetime.utcnow()
     response = []
     for batch in batches:
@@ -1636,6 +1663,8 @@ async def submit_question_batch_attempt(batch_id: str, payload: QuestionBatchAtt
     batch = await question_batches_collection.find_one({"batchId": batch_id})
     if not batch:
         raise HTTPException(status_code=404, detail="Question batch not found")
+    if batch.get("status") != "PUBLISHED":
+        raise HTTPException(status_code=409, detail="This monthly batch is awaiting Admin approval and is not available yet.")
     existing_attempt = await question_attempts_collection.find_one({"userId": user.get("_id"), "batchId": batch_id})
     if existing_attempt:
         raise HTTPException(status_code=409, detail="You have already submitted this question batch. View the saved attempt instead of submitting it again.")

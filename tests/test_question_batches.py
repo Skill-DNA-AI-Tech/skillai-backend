@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from question_batches import build_batch, public_question
+from question_batches import build_batch, public_question, validate_batch
 
 
 def test_question_batch_has_exact_distribution_and_valid_ids():
@@ -9,6 +9,8 @@ def test_question_batch_has_exact_distribution_and_valid_ids():
     assert batch["difficultyDistribution"] == {"Easy": 4, "Medium": 7, "Hard": 4}
     assert len({question["questionId"] for question in batch["questions"]}) == 15
     assert all(question["question"] and question["expectedAnswer"] and question["explanation"] for question in batch["questions"])
+    assert batch["status"] == "PENDING_APPROVAL"
+    assert validate_batch(batch) == []
 
 
 def test_question_answer_key_is_hidden_before_release():
