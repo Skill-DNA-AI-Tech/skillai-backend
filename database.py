@@ -136,4 +136,6 @@ async def init_db():
                     )
                 logger.info(f"Verified existing super admin account (credentials preserved): {super_email}")
     except Exception as e:
-        logger.error(f"Error initializing database indexes / seeding super admin: {e}")
+        logger.exception("MongoDB index initialization or super-admin seeding failed")
+        if is_prod:
+            raise RuntimeError("MongoDB initialization failed; refusing to start without verified indexes") from e

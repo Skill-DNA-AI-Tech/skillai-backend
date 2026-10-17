@@ -17,6 +17,19 @@ def build_batch(curriculum_id: str, career: dict[str, Any], batch_number: int, n
     batch_id = f"{curriculum_id}:batch:{batch_number}"
     questions = []
     index = 0
+    prompt_templates = {
+        "testing": "A release is passing happy-path checks but regressions keep reaching users. Design a {difficulty} testing strategy around {topic_name}, including what evidence you would collect and why.",
+        "api": "A client needs a stable contract while the service evolves. Using {topic_name}, explain the {difficulty} design you would choose, the failure case it prevents, and how you would test it.",
+        "sql": "A reporting query over growing transactional data has become slow. Apply {topic_name} to propose a {difficulty} diagnosis and improvement, including the trade-off.",
+        "python": "You inherit a Python component that works locally but fails under real input variation. Use {topic_name} to explain a {difficulty} fix and the evidence that would prove it safe.",
+        "data structure": "A feature needs predictable performance as its dataset grows. Compare options using {topic_name} and justify the {difficulty} choice with time/space reasoning.",
+    }
+    def question_text(topic_name: str, difficulty: str) -> str:
+        lowered = topic_name.lower()
+        for key, template in prompt_templates.items():
+            if key in lowered:
+                return template.format(difficulty=difficulty.lower(), topic_name=topic_name)
+        return f"For a realistic {career.get('title', 'curriculum')} project, apply {topic_name} to solve a concrete problem. Give the steps, one trade-off, and the evidence you would use to verify the {difficulty.lower()} solution."
     for difficulty, count in (("Easy", 4), ("Medium", 7), ("Hard", 4)):
         for _ in range(count):
             topic = topics[index % len(topics)]
@@ -26,10 +39,10 @@ def build_batch(curriculum_id: str, career: dict[str, Any], batch_number: int, n
                 "topic": topic_name,
                 "difficulty": difficulty,
                 "type": "theory",
-                "question": f"Explain the core idea of {topic_name} and give one situation where it matters in {career.get('title', 'this curriculum')}.",
+                "question": question_text(topic_name, difficulty),
                 "options": [],
-                "expectedAnswer": f"A clear explanation of {topic_name}, its purpose, and an appropriate example.",
-                "explanation": f"A strong answer defines {topic_name}, explains why it is used, and connects it to a realistic scenario.",
+                "expectedAnswer": f"A strong answer defines {topic_name}, applies it to the stated project scenario, explains the trade-off, and names concrete verification evidence.",
+                "explanation": f"The question tests application rather than recall: define {topic_name}, connect the choice to the scenario, explain the {difficulty.lower()} trade-off, and identify how the result would be validated.",
             })
             index += 1
     return {"batchId": batch_id, "curriculumId": curriculum_id, "career": career.get("title"), "batchNumber": batch_number, "status": "PUBLISHED", "questions": questions, "questionCount": len(questions), "difficultyDistribution": {"Easy": 4, "Medium": 7, "Hard": 4}, "publishedAt": now, "answerKeyAvailableAt": now + timedelta(days=30), "createdAt": now, "updatedAt": now, "generation": {"method": "deterministic curriculum seed", "validated": True}}

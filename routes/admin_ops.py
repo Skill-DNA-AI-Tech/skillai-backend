@@ -5368,6 +5368,32 @@ async def list_note_regeneration_requests(
     return {"requests": [serialize_doc(row) for row in rows], "total": len(rows)}
 
 
+def _regenerate_note_with_provider(note: dict, reason: str) -> dict:
+    """Regenerate through the configured provider; never fabricate approval output."""
+    groq_key = getattr(settings, "groq_api_key", None) or os.getenv("GROQ_API_KEY")
+    if not groq_key:
+        raise HTTPException(status_code=503, detail="Note regeneration is unavailable: GROQ_API_KEY is not configured.")
+    import requests
+    current = {key: note.get(key) for key in ("summary", "detailedNotes", "keyPoints", "quickRevision", "questions", "flashcards", "quiz")}
+    prompt = ("Improve this learner study note. Preserve correct content, deepen weak explanations, and add concrete subject-specific examples. "
+              "Return only JSON with keys summary, detailedNotes, keyPoints, quickRevision, questions, flashcards, quiz. "
+              f"Topic: {note.get('topic')}. Domain: {note.get('domain')}. Revision reason: {reason}. Current note JSON: {json.dumps(current, default=str)}")
+    try:
+        response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}, json={"model": settings.groq_model, "messages": [{"role": "system", "content": "Return only valid JSON."}, {"role": "user", "content": prompt}], "temperature": 0.55, "max_tokens": 7000, "response_format": {"type": "json_object"}}, timeout=45)
+        if response.status_code != 200:
+            logger.error("Groq note regeneration failed: %s", response.text[:500])
+            raise HTTPException(status_code=502, detail="AI notes provider failed to regenerate this note.")
+        generated = json.loads(response.json().get("choices", [{}])[0].get("message", {}).get("content", ""))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("AI note regeneration returned invalid content")
+        raise HTTPException(status_code=502, detail="AI notes provider returned invalid regenerated content.")
+    if not isinstance(generated.get("summary"), str) or len(generated["summary"].strip()) < 120 or not isinstance(generated.get("detailedNotes"), str) or len(generated["detailedNotes"].strip()) < 500:
+        raise HTTPException(status_code=502, detail="AI notes provider returned regenerated content that failed quality validation.")
+    return generated
+
+
 @router.post("/admin/notes/regeneration-requests/{request_id}/decision")
 async def decide_note_regeneration_request(
     request_id: str,
@@ -5396,8 +5422,8 @@ async def decide_note_regeneration_request(
         previous_version = int(note.get("version") or 1)
         new_version = previous_version + 1
         reason = request.get("reason", "requested a clearer explanation")
-        improved_detail = f"\n\n## Revision focus\nThis version was regenerated after the learner requested: {reason}\n\n### Targeted practice\nReview the examples, explain the core trade-offs in your own words, and complete a fresh assessment for {note.get('topic', 'this topic')}."
-        improved_note = {**note, "version": new_version, "generationStatus": "REGENERATED", "detailedNotes": f"{note.get('detailedNotes', '')}{improved_detail}", "updatedAt": datetime.utcnow(), "regeneratedFromVersion": previous_version, "regenerationReason": reason}
+        regenerated = _regenerate_note_with_provider(note, reason)
+        improved_note = {**note, **regenerated, "version": new_version, "generationStatus": "REGENERATED", "updatedAt": datetime.utcnow(), "regeneratedFromVersion": previous_version, "regenerationReason": reason}
         improved_note.pop("_id", None)
         await student_note_versions_collection.insert_one({**improved_note, "savedNoteId": note_obj_id, "createdAt": datetime.utcnow()})
         await student_notes_collection.update_one({"_id": note_obj_id, "userId": request.get("userId")}, {"$set": {key: value for key, value in improved_note.items() if key not in {"userId", "savedNoteId", "createdAt"}}})
