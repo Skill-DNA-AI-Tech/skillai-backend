@@ -283,35 +283,23 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
     Authenticate student via Google OAuth ID token.
     Creates account automatically if user does not exist, then issues JWT.
     """
-    id_token = payload.id_token
+    id_token = payload.id_token.strip()
+    if not settings.google_client_id:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Google sign-in is not configured on this server.")
     ip_address = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
 
-    # Verify ID token with Google API
-    google_verify_url = f"https://oauth2.googleapis.com/tokeninfo?id_token={id_token}"
     try:
-        response = await run_in_threadpool(requests.get, google_verify_url, timeout=10)
-        if response.status_code != 200:
-            logger.error(f"Google token validation returned {response.status_code}: {response.text}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid Google OAuth token."
-            )
-        token_info = response.json()
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token as google_id_token
+        token_info = await run_in_threadpool(google_id_token.verify_oauth2_token, id_token, google_requests.Request(), settings.google_client_id)
+        if token_info.get("iss") not in {"accounts.google.com", "https://accounts.google.com"} or not token_info.get("email_verified", False):
+            raise ValueError("Google issuer or email verification failed")
     except Exception as e:
         logger.error(f"Exception during Google token verification: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Failed to verify Google login token."
-        )
-
-    # Verify audience matches client ID
-    aud = token_info.get("aud")
-    if aud != settings.google_client_id:
-        logger.error(f"Google token aud mismatch: expected {settings.google_client_id}, got {aud}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token audience verification failed."
+            detail="Invalid or expired Google login token."
         )
 
     email = token_info.get("email").lower()
@@ -323,7 +311,9 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
     user = await users_collection.find_one({"email": email})
     admin_doc = await admins_collection.find_one({"email": email})
     
-    if not user and not admin_doc:
+    if admin_doc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Google sign-in is available for student accounts only. Use the Admin Portal for administrator access.")
+    if not user:
         # Create user automatically
         user = {
             "name": name,
@@ -340,17 +330,6 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
         result = await users_collection.insert_one(user)
         user["_id"] = result.inserted_id
         logger.info(f"Automatically registered Google user: {email}")
-    elif not user and admin_doc:
-        user = {
-            "_id": admin_doc["_id"],
-            "name": admin_doc.get("name") or admin_doc.get("full_name") or name,
-            "email": admin_doc["email"],
-            "role": admin_doc.get("role", "MAIN_ADMIN"),
-            "is_verified": True,
-            "isTestUser": False,
-            "isPreProductionUser": False,
-            "created_at": admin_doc.get("created_at") or datetime.utcnow()
-        }
     else:
         # User exists; verify/link Google ID and ensure is_verified is True
         update_fields = {}
@@ -369,6 +348,8 @@ async def google_login(payload: GoogleLoginRequest, request: Request):
             logger.info(f"Updated Google credentials/verification for user: {email}")
 
     user_role = user.get("role", "student")
+    if str(user_role).upper() in {"ADMIN", "MAIN_ADMIN", "SUPER_ADMIN", "SUPPORT_TEAM"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Google sign-in cannot grant administrator access.")
 
     # Generate JWT
     token_data = {
@@ -605,4 +586,3 @@ async def refresh_session_token(request: Request):
         created_at=user.get("created_at")
     )
     return TokenResponse(access_token=new_access_token, refreshToken=new_refresh_token, role=user_role, user=user_response)
-

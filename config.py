@@ -94,7 +94,7 @@ class Settings(BaseSettings):
         default_factory=lambda: os.getenv("SECONDARY_JWT_SECRETS", "")
     )
     google_client_id: str = Field(
-        default_factory=lambda: os.getenv("GOOGLE_CLIENT_ID", "849754791910-kvubjul5bnqi8un3c38on96bdengsn37.apps.googleusercontent.com")
+        default_factory=lambda: os.getenv("GOOGLE_CLIENT_ID", "")
     )
     resend_api_key: str = Field(
         default_factory=lambda: os.getenv("RESEND_API_KEY", "")
