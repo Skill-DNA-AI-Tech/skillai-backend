@@ -1639,6 +1639,38 @@ async def publish_question_batch(batch_id: str, current_admin: dict = Depends(ge
     return serialize_doc(batch)
 
 
+@router.put("/admin/question-batches/{batch_id}")
+async def update_question_batch(batch_id: str, payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
+    batch = await question_batches_collection.find_one({"batchId": batch_id})
+    if not batch:
+        raise HTTPException(status_code=404, detail="Question batch not found")
+    questions = payload.get("questions")
+    if not isinstance(questions, list):
+        raise HTTPException(status_code=422, detail="questions must be an array")
+    candidate = {**batch, "questions": questions, "questionCount": len(questions), "difficultyDistribution": {level: sum(1 for q in questions if q.get("difficulty") == level) for level in ("Easy", "Medium", "Hard")}}
+    errors = validate_batch(candidate)
+    if errors:
+        raise HTTPException(status_code=422, detail={"message": "Batch failed validation", "errors": errors})
+    now = datetime.utcnow()
+    history_entry = {"action": "EDITED", "by": current_admin.get("email") or current_admin.get("sub"), "at": now, "questionCount": len(questions)}
+    update = {"questions": questions, "questionCount": len(questions), "difficultyDistribution": candidate["difficultyDistribution"], "status": "PENDING_APPROVAL", "updatedAt": now, "updatedBy": current_admin.get("email") or current_admin.get("sub"), "reviewHistory": [*(batch.get("reviewHistory") or []), history_entry]}
+    await question_batches_collection.update_one({"batchId": batch_id}, {"$set": update})
+    batch.update(update)
+    return serialize_doc(batch)
+
+
+@router.post("/admin/question-batches/{batch_id}/reject")
+async def reject_question_batch(batch_id: str, payload: Dict[str, Any], current_admin: dict = Depends(get_current_admin)):
+    batch = await question_batches_collection.find_one({"batchId": batch_id})
+    if not batch:
+        raise HTTPException(status_code=404, detail="Question batch not found")
+    now = datetime.utcnow()
+    update = {"status": "REJECTED", "rejectionReason": str(payload.get("reason") or "Rejected during Admin review").strip(), "updatedAt": now, "reviewHistory": [*(batch.get("reviewHistory") or []), {"action": "REJECTED", "by": current_admin.get("email") or current_admin.get("sub"), "at": now, "reason": str(payload.get("reason") or "Rejected during Admin review").strip()}]}
+    await question_batches_collection.update_one({"batchId": batch_id}, {"$set": update})
+    batch.update(update)
+    return serialize_doc(batch)
+
+
 @router.get("/learning/question-batches")
 async def list_question_batches(current_user: dict = Depends(get_current_user)):
     user = await get_authenticated_user_doc(current_user)
